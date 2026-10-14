@@ -97,9 +97,8 @@ jobs:
             if (-not (Select-String -Path $hangLog -Pattern 'abandoned=1' -Quiet)) { throw "expected abandoned=1 on hang-finalize" }
             if (Test-Path $hangOut) { throw "incomplete hang.mp4 should have been deleted" }
             if (Test-Path "$hangOut.part.mp4") { throw "leftover hang.part.mp4" }
-            $p2 = Start-Process $exe.FullName -ArgumentList "--record 1 --encoder software --allow-synthetic --out `"$PWD\rec\after-hang.mp4`" --log `"$PWD\rec\after-hang.txt`"" -Wait -PassThru
-            Get-Content "$PWD\rec\after-hang.txt" -ErrorAction SilentlyContinue
-            if (Select-String -Path "$PWD\rec\after-hang.txt" -Pattern '^ok=1' -Quiet) { throw "second start after abandon should be refused" }
+            if (-not (Select-String -Path $hangLog -Pattern '^state=idle' -Quiet)) { throw "UI/recorder did not return to Idle" }
+            if (-not (Select-String -Path $hangLog -Pattern '^second_start=refused' -Quiet)) { throw "second start after abandon should be refused" }
             $pR = Start-Process $exe.FullName -ArgumentList "--render-ui `"$PWD\rec\ui-idle.bmp`" --ui-state idle --log `"$PWD\rec\ui.txt`"" -Wait -PassThru
             if (-not (Test-Path "$PWD\rec\ui-idle.bmp")) { throw "ui-idle.bmp missing" }
           }
