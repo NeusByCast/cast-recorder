@@ -1135,14 +1135,20 @@ int runCli(int argc, wchar_t** argv) {
     if (!r.waitUntilIdle(waitMs)) r.abort();
     r.waitUntilIdle(2000);
     for (int i = 0; i < 100 && abandonedFinalizeLive() > 0; ++i) Sleep(50);
-    const RecordResult& res = r.result();
+    const RecordResult res = r.result();
+    std::string extra = "state=" + std::string(toString(r.state())) + "\n";
+    if (res.abandoned) {  // same process: MF is poisoned, a second session must be refused
+        bool again = r.start(o);
+        extra += again ? "second_start=accepted\n" : "second_start=refused\n";
+        if (again) { r.stop(); r.waitUntilIdle(5000); }
+    }
     char summary[4096];
     snprintf(summary, sizeof summary,
              "ok=%d frames=%llu duplicated=%llu late=%llu dropped=%llu abandoned=%d\ncapture=%s\nencoder=%s\npath=%s\nfile=%s\nmessage=%s\n",
              res.ok ? 1 : 0, res.frames, res.duplicated, res.late, res.dropped, res.abandoned ? 1 : 0,
              U(res.captureUsed).c_str(), U(res.encoderUsed).c_str(), U(res.pathLog).c_str(),
              U(res.file).c_str(), U(res.message).c_str());
-    emit(summary, stdout);
+    emit(std::string(summary) + extra, stdout);
     return res.ok ? 0 : 1;
 }
 
