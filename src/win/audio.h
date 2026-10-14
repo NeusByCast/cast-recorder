@@ -15,19 +15,38 @@ namespace cr {
 
 struct AudioDevice { std::wstring id, name; };
 std::vector<AudioDevice> listMicrophones();
+std::vector<AudioDevice> listOutputDevices();
+
+// Process-wide live audio controls + meters (UI thread writes, capture threads read).
+struct AudioFx {
+    std::atomic<float> micGain{1.0f};        // 0..2
+    std::atomic<bool> noiseSuppression{false};
+    std::atomic<float> gateDb{-42.0f};       // <= -79.5: off
+    std::atomic<bool> pushToTalk{false}, pttDown{false};
+    std::atomic<bool> micMuted{false}, systemMuted{false};
+    std::atomic<bool> monitoring{false};     // play the processed mic on the default output
+    std::atomic<float> levelMic{0}, levelSys{0};  // peak (linear) since the UI last read it
+    static float take(std::atomic<float>& a) { return a.exchange(0.f); }
+};
+AudioFx& audioFx();
 
 struct AudioSource;
 struct DeviceNotifier;
 
+struct MicChain;
 class AudioMixer {
 public:
     static constexpr int kRate = 48000, kChannels = 2;
     AudioMixer();
     ~AudioMixer();
     // Any combination; testTone adds a synthetic 440 Hz source (CI, no audio hardware). Returns true if >=1 source.
-    bool start(bool system, bool mic, const std::wstring& micId, bool testTone, std::wstring& log);
+    // sysId empty = default output via process loopback (excludes our own sounds); otherwise loopback of that device.
+    // testMic: a synthetic noisy tone-burst microphone run through the real mic chain (CI).
+    bool start(bool system, bool mic, const std::wstring& micId, bool testTone, std::wstring& log,
+               const std::wstring& sysId = L"", bool testMic = false, bool allowMonitor = false);
     void stop();
-    bool active() const { return !sources_.empty() || tone_; }
+    bool active() const { return !sources_.empty() || tone_ || testMic_; }
+    int channels = 2;  // 1 = mono downmix in produce() (set before recording)
     // Media-time zero as a QPC value (the first video frame's QPC; shifted by pauses). Audio is mapped against it.
     void setOrigin(long long qpcTicks, long long qpcFreq);
     void setPaused(bool p);
@@ -55,7 +74,11 @@ private:
     bool tone_ = false;
     long long pos_ = 0;  // frames produced
     unsigned long long toneFrames_ = 0, produced_ = 0;
-    double phase_ = 0;
+    double phase_ = 0, micPhase_ = 0;
+    bool testMic_ = false;
+    std::unique_ptr<MicChain> testChain_;
+    unsigned long long tmFrames_ = 0, rng_ = 0x9E3779B97F4A7C15ULL;
+    double tmNoiseIn_ = 0, tmNoiseOut_ = 0; unsigned long long tmNoiseN_ = 0;
     struct Mute { long long from, to; bool sys; };
     std::mutex muteM_;
     std::vector<Mute> mutes_;

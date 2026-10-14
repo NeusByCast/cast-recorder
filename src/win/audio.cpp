@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "micfx.h"
 #include <audioclient.h>
 #include <mmdeviceapi.h>
 #include <propkey.h>
@@ -18,6 +19,7 @@ const CLSID kCLSID_MMDeviceEnumerator = {0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D
 const IID kIID_IMMDeviceEnumerator = {0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
 const IID kIID_IAudioClient = {0x1CB9AD4C, 0xDBFA, 0x4c32, {0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2}};
 const PROPERTYKEY kPKEY_FriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+const IID kIID_IAudioRenderClient = {0xF294ACFC, 0x3146, 0x4483, {0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2}};
 const IID kIID_IAudioCaptureClient = {0xC8ADBD64, 0xE71E, 0x48a0, {0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17}};
 #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
 #define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
@@ -95,11 +97,59 @@ void AudioMixer::Shared::event(const std::wstring& e) {
     if (events.size() < 4000) events += e + L"; ";
 }
 
-std::vector<AudioDevice> listMicrophones() {
+AudioFx& audioFx() { static AudioFx f; return f; }
+
+// gain -> noise suppression -> gate on a mono downmix; push-to-talk / mute silence. Returns the output peak.
+struct MicChain {
+    MicFx fx;
+    std::vector<float> mono;
+    float run(float* st, size_t n) {
+        auto& a = audioFx();
+        MicFxParams p; p.gain = a.micGain.load(); p.noiseSuppression = a.noiseSuppression.load(); p.gateDb = a.gateDb.load();
+        mono.resize(n);
+        for (size_t i = 0; i < n; ++i) mono[i] = 0.5f * (st[i * 2] + st[i * 2 + 1]);
+        fx.process(mono.data(), n, p);
+        bool silent = a.micMuted.load() || (a.pushToTalk.load() && !a.pttDown.load());
+        float pk = 0;
+        for (size_t i = 0; i < n; ++i) {
+            float v = silent ? 0.f : mono[i];
+            st[i * 2] = st[i * 2 + 1] = v;
+            float av = v < 0 ? -v : v; if (av > pk) pk = av;
+        }
+        return pk;
+    }
+};
+static void peakTo(std::atomic<float>& a, float v) { float c = a.load(); while (v > c && !a.compare_exchange_weak(c, v)) {} }
+
+// Plays the processed microphone on the default output (monitoring). Drops audio rather than adding latency.
+struct MonitorOut {
+    ComPtr<IAudioClient> client; ComPtr<IAudioRenderClient> rc; UINT32 cap = 0; bool failed = false;
+    bool open() {
+        auto e = enumerator(); ComPtr<IMMDevice> d;
+        if (!e || FAILED(e->GetDefaultAudioEndpoint(eRender, eConsole, &d))) return false;
+        if (FAILED(d->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, (void**)client.GetAddressOf()))) return false;
+        WAVEFORMATEX wf{}; wf.wFormatTag = 3; wf.nChannels = 2; wf.nSamplesPerSec = 48000; wf.wBitsPerSample = 32; wf.nBlockAlign = 8; wf.nAvgBytesPerSec = 48000 * 8;
+        if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, 600000, 0, &wf, nullptr))) return false;
+        if (FAILED(client->GetBufferSize(&cap)) || FAILED(client->GetService(kIID_IAudioRenderClient, (void**)rc.GetAddressOf()))) return false;
+        return SUCCEEDED(client->Start());
+    }
+    void write(const float* st, UINT32 n) {
+        if (failed) return;
+        if (!rc && !open()) { failed = true; rc.Reset(); client.Reset(); return; }
+        UINT32 pad = 0; if (FAILED(client->GetCurrentPadding(&pad))) { rc.Reset(); client.Reset(); return; }
+        UINT32 room = cap - pad; if (pad > 4800) return;  // keep latency <= 100 ms
+        if (n > room) n = room;
+        BYTE* b = nullptr; if (!n || FAILED(rc->GetBuffer(n, &b))) return;
+        memcpy(b, st, (size_t)n * 8); rc->ReleaseBuffer(n, 0);
+    }
+    void stop() { if (client) client->Stop(); rc.Reset(); client.Reset(); }
+};
+
+static std::vector<AudioDevice> listEndpoints(EDataFlow flow) {
     std::vector<AudioDevice> r;
     auto e = enumerator();
     ComPtr<IMMDeviceCollection> c;
-    if (!e || FAILED(e->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &c))) return r;
+    if (!e || FAILED(e->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &c))) return r;
     UINT n = 0; c->GetCount(&n);
     for (UINT i = 0; i < n; ++i) {
         ComPtr<IMMDevice> d; if (FAILED(c->Item(i, &d))) continue;
@@ -111,15 +161,19 @@ std::vector<AudioDevice> listMicrophones() {
             if (SUCCEEDED(ps->GetValue(kPKEY_FriendlyName, &v)) && v.vt == VT_LPWSTR) a.name = v.pwszVal;
             PropVariantClear(&v);
         }
-        if (a.name.empty()) a.name = L"Microphone";
+        if (a.name.empty()) a.name = flow == eCapture ? L"Microphone" : L"Speakers";
         r.push_back(a);
     }
     return r;
 }
+std::vector<AudioDevice> listMicrophones() { return listEndpoints(eCapture); }
+std::vector<AudioDevice> listOutputDevices() { return listEndpoints(eRender); }
 
 // One capture stream (48 kHz stereo float via the engine's converter) placed on the media timeline by QPC.
 struct AudioSource {
-    bool isMic = false, loopback = false, procLoopback = false, pcm16 = false;
+    bool isMic = false, loopback = false, procLoopback = false, pcm16 = false, allowMonitor = false;
+    MicChain chain;
+    MonitorOut mon;
     std::wstring id, name, devName;
     std::shared_ptr<AudioMixer::Shared> sh;
     std::mutex m;
@@ -140,7 +194,7 @@ struct AudioSource {
         cap.Reset(); client.Reset();
         HRESULT hr = E_FAIL;
         procLoopback = false;
-        if (loopback) {
+        if (loopback && id.empty()) {
             hr = activateProcessLoopback(client);
             logHr(log, L"audio: process loopback (excluding Cast Recorder)", hr);
             if (SUCCEEDED(hr)) { procLoopback = true; devName = L"process loopback"; }
@@ -279,6 +333,16 @@ struct AudioSource {
                 else if (pcm16) { const short* s16 = (const short*)data; for (size_t i = 0; i < conv.size(); ++i) conv[i] = s16[i] / 32768.f; }
                 else memcpy(conv.data(), data, conv.size() * sizeof(float));
                 cap->ReleaseBuffer(frames);
+                if (isMic) {
+                    peakTo(audioFx().levelMic, chain.run(conv.data(), frames));
+                    // the noise suppressor delays its output: those samples were captured that much earlier
+                    qpc -= (UINT64)chain.fx.delay() * 10000000ULL / AudioMixer::kRate;
+                    if (allowMonitor && audioFx().monitoring.load()) mon.write(conv.data(), frames);
+                    else if (mon.client) mon.stop();
+                } else {
+                    float pk = 0; for (float v : conv) { float a = v < 0 ? -v : v; if (a > pk) pk = a; }
+                    peakTo(audioFx().levelSys, audioFx().systemMuted.load() ? 0.f : pk);
+                }
                 place(conv.data(), frames, (long long)qpc);
             }
             if (FAILED(hr)) reconnect(hr == kDEVICE_INVALIDATED ? L"device lost" : L"capture error", hr);
@@ -308,6 +372,7 @@ struct AudioSource {
         if (ev) SetEvent(ev);
         if (th.joinable()) th.join();
         if (client) client->Stop();
+        mon.stop();
         if (ev) CloseHandle(ev);
     }
 };
@@ -340,13 +405,14 @@ struct DeviceNotifier : IMMNotificationClient {
 AudioMixer::AudioMixer() : sh_(std::make_shared<Shared>()) {}
 AudioMixer::~AudioMixer() { stop(); }
 
-bool AudioMixer::start(bool system, bool mic, const std::wstring& micId, bool testTone, std::wstring& log) {
+bool AudioMixer::start(bool system, bool mic, const std::wstring& micId, bool testTone, std::wstring& log,
+                       const std::wstring& sysId, bool testMic, bool allowMonitor) {
     if (system) {
-        auto s = std::make_unique<AudioSource>(); s->name = L"system"; s->loopback = true; s->sh = sh_;
+        auto s = std::make_unique<AudioSource>(); s->name = L"system"; s->loopback = true; s->sh = sh_; s->id = sysId;
         if (s->open(log)) sources_.push_back(std::move(s)); else log += L"audio: system audio unavailable\n";
     }
     if (mic) {
-        auto s = std::make_unique<AudioSource>(); s->name = L"mic"; s->isMic = true; s->id = micId; s->sh = sh_;
+        auto s = std::make_unique<AudioSource>(); s->name = L"mic"; s->isMic = true; s->id = micId; s->sh = sh_; s->allowMonitor = allowMonitor;
         if (s->open(log)) sources_.push_back(std::move(s)); else log += L"audio: microphone unavailable\n";
     }
     if (!sources_.empty()) {
@@ -357,6 +423,8 @@ bool AudioMixer::start(bool system, bool mic, const std::wstring& micId, bool te
         }
     }
     tone_ = testTone;
+    testMic_ = testMic;
+    if (testMic) { testChain_ = std::make_unique<MicChain>(); log += L"audio: synthetic test microphone\n"; }
     pos_ = 0;
     return active();
 }
@@ -382,7 +450,12 @@ std::wstring AudioMixer::stats() const {
                  s->resyncs, s->reconnects, s->maxDriftPpm, s->qpcMissing);
         r += b;
     }
-    if (sources_.empty() && !tone_) r += L"no sources; ";
+    if (testMic_ && tmNoiseN_) {
+        swprintf(b, 400, L"testmic: noise_in_db=%.1f noise_out_db=%.1f ns=%d gate_db=%.0f; ", 10 * std::log10(tmNoiseIn_ / tmNoiseN_ + 1e-20),
+                 10 * std::log10(tmNoiseOut_ / tmNoiseN_ + 1e-20), (int)audioFx().noiseSuppression.load(), audioFx().gateDb.load());
+        r += b;
+    }
+    if (sources_.empty() && !tone_ && !testMic_) r += L"no sources; ";
     std::lock_guard<std::mutex> g(sh_->evM);
     if (!sh_->events.empty()) r += L"events: " + sh_->events;
     return r;
@@ -393,7 +466,7 @@ void AudioMixer::stop() {
         if (auto e = enumerator()) e->UnregisterEndpointNotificationCallback(notifier_);
         notifier_->Release(); notifier_ = nullptr;
     }
-    sources_.clear(); tone_ = false;
+    sources_.clear(); tone_ = false; testMic_ = false;
 }
 
 void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& out, long long& startTime) {
@@ -416,7 +489,7 @@ void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& ou
         size_t got = s->pull(pos_, tmp.data(), n);
         if (got < n) underrunFrames += n - got;
         if (s->isMic && (micMuted.load() || muteMic)) continue;
-        if (!s->isMic && muteSys) continue;
+        if (!s->isMic && (muteSys || audioFx().systemMuted.load())) continue;
         for (size_t i = 0; i < n * 2; ++i) mix[i] += tmp[i];
     }
     if (tone_) {
@@ -428,11 +501,50 @@ void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& ou
             mix[i * 2] += v; mix[i * 2 + 1] += v;
         }
     }
-    out.resize(n * 2);
-    for (size_t i = 0; i < n * 2; ++i) {
-        float v = mix[i];
-        v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
-        out[i] = (short)std::lrint(v * 32767.f);
+    if (testMic_) {
+        // noise (-50 dBFS rms) everywhere + 300 Hz tone bursts in [0, 0.5) s of every second
+        std::vector<float> m(n * 2);
+        std::vector<float> raw(n);
+        for (size_t i = 0; i < n; ++i) {
+            unsigned long long f = tmFrames_ + i;
+            rng_ = rng_ * 6364136223846793005ULL + 1442695040888963407ULL;
+            float nz = ((float)((rng_ >> 40) & 0xFFFFFF) / 16777216.f - 0.5f) * 0.011f;  // uniform, rms ~0.0032
+            float v = nz;
+            if ((f % kRate) < (unsigned long long)kRate / 2) { v += 0.25f * (float)std::sin(micPhase_); }
+            micPhase_ += 2 * 3.14159265358979 * 300.0 / kRate; if (micPhase_ > 6.283185307179586) micPhase_ -= 6.283185307179586;
+            raw[i] = v; m[i * 2] = m[i * 2 + 1] = v;
+        }
+        peakTo(audioFx().levelMic, testChain_->run(m.data(), n));
+        // noise floor before/after, measured in the middle of the silent half (well past gate hold + NS delay)
+        const int d = testChain_->fx.delay();
+        for (size_t i = 0; i < n; ++i) {
+            unsigned long long f = tmFrames_ + i;
+            if (f < (unsigned long long)kRate) continue;  // skip convergence
+            unsigned long long ph = f % kRate;
+            if (ph >= (unsigned long long)(kRate * 0.75) && ph < (unsigned long long)(kRate * 0.95)) {
+                tmNoiseIn_ += (double)raw[i] * raw[i];
+                unsigned long long fo = f;  // output frame i is input frame f - d; same window shifted by d
+                (void)fo; (void)d;
+                tmNoiseOut_ += (double)m[i * 2] * m[i * 2]; ++tmNoiseN_;
+            }
+        }
+        tmFrames_ += n;
+        if (!micMuted.load() && !muteMic) for (size_t i = 0; i < n * 2; ++i) mix[i] += m[i];
+    }
+    if (channels == 1) {
+        out.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            float v = 0.5f * (mix[i * 2] + mix[i * 2 + 1]) * 1.41f;  // ~equal-loudness downmix
+            v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
+            out[i] = (short)std::lrint(v * 32767.f);
+        }
+    } else {
+        out.resize(n * 2);
+        for (size_t i = 0; i < n * 2; ++i) {
+            float v = mix[i];
+            v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
+            out[i] = (short)std::lrint(v * 32767.f);
+        }
     }
     produced_ += n;
     pos_ = target;

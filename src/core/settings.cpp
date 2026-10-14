@@ -244,6 +244,20 @@ std::string toJson(const Settings& s) {
       << "  \"gpuIndex\": " << s.gpuIndex << ",\n"
       << "  \"gpuName\": \"" << esc(s.gpuName) << "\",\n"
       << "  \"pauseTones\": " << (s.pauseTones ? "true" : "false") << ",\n"
+      << "  \"sourceKind\": \"" << esc(s.sourceKind) << "\",\n"
+      << "  \"sourceMonitor\": \"" << esc(s.sourceMonitor) << "\",\n"
+      << "  \"sourceExe\": \"" << esc(s.sourceExe) << "\",\n"
+      << "  \"sourceTitle\": \"" << esc(s.sourceTitle) << "\",\n"
+      << "  \"systemDevice\": \"" << esc(s.systemDevice) << "\",\n"
+      << "  \"systemMuted\": " << (s.systemMuted ? "true" : "false") << ",\n"
+      << "  \"micMuted\": " << (s.micMuted ? "true" : "false") << ",\n"
+      << "  \"micVolume\": " << s.micVolume << ",\n"
+      << "  \"noiseSuppression\": " << (s.noiseSuppression ? "true" : "false") << ",\n"
+      << "  \"noiseGateDb\": " << s.noiseGateDb << ",\n"
+      << "  \"monitoring\": " << (s.monitoring ? "true" : "false") << ",\n"
+      << "  \"pushToTalk\": " << (s.pushToTalk ? "true" : "false") << ",\n"
+      << "  \"hotkeyPushToTalk\": \"" << esc(format(s.pttKey)) << "\",\n"
+      << "  \"channels\": " << s.channels << ",\n"
       << "  \"bitrateCap\": " << s.bitrateCap << "\n"
       << "}\n";
     return o.str();
@@ -289,6 +303,19 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     boo("maximized", s.maximized);
     str("gpuName", s.gpuName);
     boo("pauseTones", s.pauseTones);
+    if (str("sourceKind", v) && (v == "all" || v == "monitor" || v == "window")) s.sourceKind = v;
+    str("sourceMonitor", s.sourceMonitor); str("sourceExe", s.sourceExe); str("sourceTitle", s.sourceTitle);
+    str("systemDevice", s.systemDevice);
+    boo("systemMuted", s.systemMuted); boo("micMuted", s.micMuted);
+    boo("noiseSuppression", s.noiseSuppression); boo("monitoring", s.monitoring); boo("pushToTalk", s.pushToTalk);
+    auto num = [&](const char* k, int lo, int hi, int& dst) {
+        auto i2 = m.find(k);
+        if (i2 != m.end() && i2->second.t == Value::Num && std::isfinite(i2->second.n) && i2->second.n >= lo && i2->second.n <= hi) dst = (int)std::lround(i2->second.n);
+    };
+    num("micVolume", 0, 200, s.micVolume);
+    num("noiseGateDb", -80, 0, s.noiseGateDb);
+    num("channels", 1, 2, s.channels);
+    if (str("hotkeyPushToTalk", v) && parse(v, hk)) s.pttKey = hk;
     if (str("scale", v)) fromString(v, s.scale);
     auto git = m.find("gpuIndex");
     if (git != m.end() && git->second.t == Value::Num && std::isfinite(git->second.n) && git->second.n >= -1 && git->second.n <= 32)

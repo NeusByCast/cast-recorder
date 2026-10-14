@@ -31,3 +31,4 @@ END
 IDR_SND_START WAVE "sounds/start.wav"
 IDR_SND_STOP WAVE "sounds/stop.wav"
 IDR_SND_TICK WAVE "sounds/tick.wav"
+#include "icons.rc2"

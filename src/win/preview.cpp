@@ -3,7 +3,10 @@
 #include <d3d10.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <algorithm>
+#include <climits>
 #include <string>
+#include <vector>
 #include "capture_wgc.h"
 
 using Microsoft::WRL::ComPtr;
@@ -71,16 +74,57 @@ void GpuPreview::run(bool cursor) {
         if (FAILED(dev.As(&dxd)) || FAILED(dxd->GetAdapter(&ad)) || FAILED(ad->GetParent(IID_PPV_ARGS(&fac)))) return;
         dxd->SetMaximumFrameLatency(1);
 
-        HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
-        WgcCapture cap;  // WGC delivers frames on our device even if another GPU scans out the monitor
-        std::wstring err;
-        if (!cap.start(dev.Get(), mon, cursor, err)) return;
+        struct Cap { std::unique_ptr<WgcCapture> c; int x = 0, y = 0; };
+        std::vector<Cap> caps;
         D3D11_TEXTURE2D_DESC td{};
-        td.Width = cap.width(); td.Height = cap.height(); td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         ComPtr<ID3D11Texture2D> frame;
-        if (FAILED(dev->CreateTexture2D(&td, nullptr, &frame))) return;
+        ComPtr<ID3D11RenderTargetView> frameRtv;
+        unsigned gen = 0;
+        bool windowTarget = false;
+        // (Re)open the captures for the current target. Black frame while a window is minimized/unavailable.
+        auto openTarget = [&]() -> bool {
+            CaptureTarget t; { std::lock_guard<std::mutex> g(tm_); t = target_; }
+            gen = targetGen_.load();
+            caps.clear(); windowTarget = t.kind == CaptureTarget::Window;
+            std::wstring err;
+            UINT W = 0, H = 0;
+            if (t.kind == CaptureTarget::Window) {
+                Cap c; c.c = std::make_unique<WgcCapture>();
+                if (!t.hwnd || !c.c->startWindow(dev.Get(), t.hwnd, cursor, err)) return false;
+                W = c.c->width(); H = c.c->height(); caps.push_back(std::move(c));
+            } else if (t.kind == CaptureTarget::AllDisplays) {
+                auto ds = listDisplays();
+                RECT u{INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+                for (auto& d : ds) { u.left = std::min(u.left, d.rect.left); u.top = std::min(u.top, d.rect.top); u.right = std::max(u.right, d.rect.right); u.bottom = std::max(u.bottom, d.rect.bottom); }
+                for (auto& d : ds) {
+                    Cap c; c.c = std::make_unique<WgcCapture>();
+                    if (!c.c->start(dev.Get(), d.mon, cursor, err)) continue;
+                    c.x = d.rect.left - u.left; c.y = d.rect.top - u.top; caps.push_back(std::move(c));
+                }
+                if (caps.empty()) return false;
+                W = (UINT)(u.right - u.left); H = (UINT)(u.bottom - u.top);
+            } else {
+                HMONITOR mon = t.mon ? t.mon : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+                Cap c; c.c = std::make_unique<WgcCapture>();
+                if (!c.c->start(dev.Get(), mon, cursor, err)) return false;
+                W = c.c->width(); H = c.c->height(); caps.push_back(std::move(c));
+            }
+            td = {};
+            td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            frame.Reset(); frameRtv.Reset();
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, &frame))) return false;
+            dev->CreateRenderTargetView(frame.Get(), nullptr, &frameRtv);
+            const float k[4] = {0, 0, 0, 1};
+            if (frameRtv) ctx->ClearRenderTargetView(frameRtv.Get(), k);
+            srcW_ = W; srcH_ = H;
+            return true;
+        };
+        if (!openTarget()) {  // e.g. saved window gone: fall back to the primary monitor
+            { std::lock_guard<std::mutex> g(tm_); target_ = CaptureTarget{}; }
+            if (!openTarget()) return;
+        }
 
         RECT cr{}; GetClientRect(child_, &cr);
         UINT bw = cr.right > 16 ? (UINT)cr.right : 16, bh = cr.bottom > 16 ? (UINT)cr.bottom : 16;
@@ -124,6 +168,7 @@ void GpuPreview::run(bool cursor) {
             return true;
         };
         if (!buildVp(bw, bh)) return;
+        int fpsCount = 0; LARGE_INTEGER fpsT{};
 
         bool shown = false;
         LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
@@ -133,11 +178,32 @@ void GpuPreview::run(bool cursor) {
             const bool rec = recording_.load();
             SetThreadPriority(GetCurrentThread(), rec ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL);
             if (!visible_.load()) { Sleep(50); continue; }
+            bool retarget = gen != targetGen_.load();
+            if (retarget) {
+                ctx->ClearState(); ctx->Flush();
+                if (!openTarget()) {  // target unavailable (window closed): tell the UI, show the primary monitor
+                    PostMessageW(GetParent(child_), WM_APP + 44, 0, 0);
+                    { std::lock_guard<std::mutex> g(tm_); target_ = CaptureTarget{}; }
+                    if (!openTarget()) { failed_ = true; break; }
+                }
+            }
             bool got = false;
-            if (!cap.copyLatest(ctx.Get(), frame.Get(), 16, got)) { failed_ = true; break; }
+            bool ok = true;
+            for (size_t i = 0; i < caps.size(); ++i) {
+                bool g = false;
+                ok &= caps[i].c->copyLatest(ctx.Get(), frame.Get(), i == 0 ? 16 : 0, g, caps[i].x, caps[i].y);
+                got |= g;
+            }
+            if (!ok) { failed_ = true; break; }
+            if (windowTarget && caps.size() == 1 && caps[0].c->closed()) {
+                PostMessageW(GetParent(child_), WM_APP + 44, 1, 0);  // captured window closed
+                { std::lock_guard<std::mutex> g(tm_); target_ = CaptureTarget{}; }
+                ++targetGen_;
+                continue;
+            }
             RECT c2{}; GetClientRect(child_, &c2);
             UINT nw = c2.right > 16 ? (UINT)c2.right : 16, nh = c2.bottom > 16 ? (UINT)c2.bottom : 16;
-            bool resized = nw != vpW || nh != vpH;
+            bool resized = nw != vpW || nh != vpH || retarget;
             if (resized) {
                 ctx->ClearState(); ctx->Flush();
                 if (FAILED(sc->ResizeBuffers(0, nw, nh, DXGI_FORMAT_UNKNOWN, 0)) || !buildVp(nw, nh)) { failed_ = true; break; }
@@ -161,6 +227,9 @@ void GpuPreview::run(bool cursor) {
             HRESULT ph = sc->Present(0, 0);
             if (FAILED(ph)) { failed_ = true; break; }
             QueryPerformanceCounter(&last);
+            ++fpsCount;
+            if (!fpsT.QuadPart) fpsT = last;
+            else if (last.QuadPart - fpsT.QuadPart >= freq.QuadPart) { fps_ = fpsCount * (double)freq.QuadPart / (double)(last.QuadPart - fpsT.QuadPart); fpsCount = 0; fpsT = last; }
             if (!shown) { shown = true; live_ = true; PostMessageW(GetParent(child_), WM_APP + 41, 1, 0); }
         }
     }();

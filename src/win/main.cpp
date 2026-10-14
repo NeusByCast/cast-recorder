@@ -14,6 +14,17 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <functional>
+#include <algorithm>
+#include <cwctype>
+#include <objidl.h>
+#include <shlwapi.h>
+namespace Gdiplus { using std::min; using std::max; }
+#include <gdiplus.h>
 #include "../core/hotkey.h"
 #include "../core/settings.h"
 #include "recorder.h"
@@ -27,6 +38,7 @@
 #include <mmsystem.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "gdiplus.lib")
 #endif
 
 using namespace cr;
@@ -75,17 +87,18 @@ const COLORREF C_BG = hex(0x0E1014), C_SURFACE = hex(0x161A20), C_ELEV = hex(0x1
                C_CLOSE_H = hex(0xE81123), C_GRID = hex(0x1D2229);
 
 enum Hit {
-    H_NONE = 0, H_MIN, H_CLOSE, H_RECORD, H_PAUSE, H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT,
-    H_DD_SYS, H_DD_MIC, H_BROWSE, H_PATH, H_HK0, H_HK1, H_HK2, H_MAX, H_MIC, H_LOG, H_ITEM0 = 100
+    H_NONE = 0, H_MIN, H_MAX, H_CLOSE, H_TAB_REC, H_TAB_SET, H_SRC, H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT,
+    H_DD_SYSDEV, H_DD_MICDEV, H_MICCHIP, H_MICICON, H_SYSCHIP, H_PAUSE, H_RECORD, H_STATUSLOG, H_HK0, H_HK1, H_HK2, H_HKPTT,
+    H_PATH, H_FOLDERICON, H_BROWSE, H_LOG, H_TG_SYS, H_TG_MIC, H_TG_NS, H_TG_MON, H_TG_PTT, H_SL_VOL, H_SL_GATE, H_CH_MONO, H_CH_STEREO,
+    P_BASE = 1000, P_SEARCH = 2000, P_MUTE, P_SL_VOL, P_PAD
 };
-struct Region { RECT rc; int id; };
+bool g_renderOnly = false;  // --render-ui: no windows, no animations
 
 const int kFps[] = {15, 30, 60};
 const wchar_t* kFpsL[] = {L"15 FPS", L"30 FPS", L"60 FPS"};
 const Quality kQual[] = {Quality::Low, Quality::Medium, Quality::High, Quality::Ultra};
 const wchar_t* kQualL[] = {L"Low", L"Medium", L"High", L"Ultra"};
 const Encoder kEnc[] = {Encoder::Auto, Encoder::NVENC, Encoder::AMF, Encoder::QSV, Encoder::Software};
-const wchar_t* kEncL[] = {L"Auto", L"NVENC", L"AMF", L"QuickSync", L"Software"};
 const OutputScale kRes[] = {OutputScale::Native, OutputScale::P1080, OutputScale::P720};
 const wchar_t* kResL[] = {L"Native", L"1080p", L"720p"};
 const Container kCont[] = {Container::MP4, Container::MKV, Container::MOV};
@@ -93,11 +106,10 @@ const wchar_t* kContL[] = {L"MP4", L"MKV", L"MOV"};
 
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3, HK_MIC = 4;
-constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2, TIMER_SELFTEST = 3;
-constexpr int BASE_W = 820, BASE_H = 600, MIN_W = 680, MIN_H = 540;
+constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2, TIMER_SELFTEST = 3, TIMER_FRAME = 6;
+constexpr int BASE_W = 1100, BASE_H = 700, MIN_W = 960, MIN_H = 620;  // v2 SPEC: Window
 // UI watchdog > worst-case teardown: capture Close 2 s + Finalize (8000/2) + remux (8000/2) + 3 s margin.
 constexpr ULONGLONG kWatchdogMs = 2000 + 8000 / 2 + 8000 / 2 + 3000;
-constexpr int TB_H = 40, PAD = 16, GAP = 12, PANEL_W = 280, HK_H = 48, BAR_H = 56;
 
 struct App {
     HINSTANCE inst{};
@@ -108,11 +120,12 @@ struct App {
     Settings s;
     std::wstring settingsFile;
     Recorder rec;
-    std::vector<Region> regions;
     int hover = H_NONE, pressed = H_NONE;
     int capturing = -1;         // hotkey field being edited (0 start/stop, 1 pause), -1 none
     UINT liveMods = 0;
     std::wstring hkMsg[3];
+    std::vector<AudioDevice> outs;  // output devices for system audio (index+1 in the dropdown; 0 = default)
+    CaptureTarget target;
     COLORREF hkMsgColor[3]{};
     std::vector<AudioDevice> mics;  // index+2 in the Microphone dropdown (0 Off, 1 Default)
     bool micMuted = false;
@@ -122,8 +135,6 @@ struct App {
     Recorder warm;  // startup warm-up: fills the encoder probe cache and loads MF/AAC so Record starts fast
     std::wstring status;
     COLORREF statusColor = C_TEXT2;
-    int openDrop = H_NONE;      // dropdown whose list is open
-    RECT dropRc{};
     std::vector<std::wstring> gpus;  // adapter descriptions, index = DXGI ordinal
     // preview (GDI desktop thumbnail; ~2 fps when idle, frozen while recording)
     HBITMAP prevBmp{};
@@ -294,11 +305,13 @@ void playTone(int id) {
 // ---------- preview ----------
 // Cheap GDI thumbnail of the primary monitor into a small DIB. Runs at ~2 fps idle and is frozen while
 // recording so it never competes with the capture/encode path or a game for GPU time.
+RECT previewSourceRect();
 void updatePreview() {
     if (g.rec.running() || g.gprev.live()) return;
-    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    RECT src = previewSourceRect();
+    int sw = src.right - src.left, sh = src.bottom - src.top;
     if (sw <= 0 || sh <= 0) return;
-    int tw = S(400), th = tw * 9 / 16;
+    int tw = S(640), th = tw * 9 / 16;
     HDC screen = GetDC(nullptr);
     if (!g.prevBmp || g.prevW != tw || g.prevH != th) {
         if (g.prevBmp) DeleteObject(g.prevBmp);
@@ -314,11 +327,20 @@ void updatePreview() {
     int dw = tw, dh = th, dx = 0, dy = 0;
     if (sa > ta) { dh = (int)(tw / sa); dy = (th - dh) / 2; } else { dw = (int)(th * sa); dx = (tw - dw) / 2; }
     RECT all{0, 0, tw, th};
-    HBRUSH b = CreateSolidBrush(C_INPUT); FillRect(mem, &all, b); DeleteObject(b);
-    g.prevLive = StretchBlt(mem, dx, dy, dw, dh, screen, 0, 0, sw, sh, SRCCOPY | CAPTUREBLT) != 0;
+    HBRUSH b = CreateSolidBrush(RGB(0, 0, 0)); FillRect(mem, &all, b); DeleteObject(b);
+    g.prevLive = StretchBlt(mem, dx, dy, dw, dh, screen, src.left, src.top, sw, sh, SRCCOPY | CAPTUREBLT) != 0;
     SelectObject(mem, old);
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+}
+
+RECT previewSourceRect() {
+    if (g.target.kind == CaptureTarget::Window && g.target.hwnd && IsWindow(g.target.hwnd)) { RECT r{}; GetWindowRect(g.target.hwnd, &r); return r; }
+    if (g.target.kind == CaptureTarget::Monitor) { MONITORINFO mi{sizeof mi}; if (g.target.mon && GetMonitorInfoW(g.target.mon, &mi)) return mi.rcMonitor; }
+    if (g.target.kind == CaptureTarget::AllDisplays)
+        return RECT{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+    return RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
 }
 
 // ---------- recording ----------
@@ -337,6 +359,10 @@ RecordOptions optionsFromSettings() {
     o.captureCursor = g.s.captureCursor; o.scale = g.s.scale; o.gpuIndex = g.s.gpuIndex; o.bitrateCap = g.s.bitrateCap;
     o.pauseTones = g.s.pauseTones;
     o.systemAudio = g.s.systemAudio; o.mic = g.s.micEnabled; o.micId = W(g.s.micDevice);
+    o.systemId = W(g.s.systemDevice); o.channels = g.s.channels;
+    o.allDisplays = g.target.kind == CaptureTarget::AllDisplays;
+    o.monitor = g.target.kind == CaptureTarget::Monitor ? g.target.mon : nullptr;
+    o.window = g.target.kind == CaptureTarget::Window ? g.target.hwnd : nullptr;
     return o;
 }
 // Background warm-up (startup and when encoder-relevant settings change): same device/capture/encoder
@@ -346,6 +372,7 @@ void startWarmup() {
     g.warmLogged = false;
     RecordOptions o = optionsFromSettings();
     o.warmupOnly = true; o.systemAudio = false; o.mic = false; o.notify = g.hwnd;
+    if (o.window && !IsWindow(o.window)) o.window = nullptr;
     wchar_t tp[MAX_PATH]; GetTempPathW(MAX_PATH, tp);
     o.outputPath = std::wstring(tp) + L"castrec-warmup" + std::to_wstring(GetCurrentProcessId()) + W(extension(g.s.container));
     LARGE_INTEGER q; QueryPerformanceCounter(&q); o.pressQpc = q.QuadPart;
@@ -385,6 +412,7 @@ void startRecording() {
     // No waiting on the launch warm-up: capture starts now and frames are buffered while the encoder (whose
     // probe verdict the warm-up is producing) finishes initialising.
     RecordOptions o = optionsFromSettings();
+    if (g.target.kind == CaptureTarget::Window && (!o.window || !IsWindow(o.window))) { setStatus(L"Window closed – pick a source", C_WARN); return; }
     o.pressQpc = pq.QuadPart;
     o.notify = g.hwnd;
     o.outputPath = dir + L"\\" + name + W(extension(g.s.container));
@@ -418,12 +446,7 @@ void togglePause() {
         trayUpdate(NIM_MODIFY);
     }
 }
-void toggleMic() {
-    g.micMuted = !g.micMuted;
-    g.rec.setMicMuted(g.micMuted);
-    if (!g.s.micEnabled) setStatus(L"Microphone is off (choose one in Microphone)", C_TEXT2);
-    else setStatus(g.micMuted ? L"Mic muted" : L"Mic on", g.micMuted ? C_WARN : C_OK);
-}
+void toggleMic();
 void openFolder() {
     std::wstring d = outputDir();
     SHCreateDirectoryExW(nullptr, d.c_str(), nullptr);
@@ -457,99 +480,13 @@ void pickFolder() {
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-// ---------- painting primitives ----------
-void fill(HDC dc, const RECT& r, COLORREF c) { HBRUSH b = CreateSolidBrush(c); FillRect(dc, &r, b); DeleteObject(b); }
-void round(HDC dc, const RECT& r, COLORREF fillC, COLORREF border, int rad, int penW = 1) {
-    HBRUSH b = CreateSolidBrush(fillC);
-    HPEN p = CreatePen(PS_SOLID, penW, border);
-    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, S(rad) * 2, S(rad) * 2);
-    SelectObject(dc, ob); SelectObject(dc, op);
-    DeleteObject(b); DeleteObject(p);
-}
-void ring(HDC dc, const RECT& r, COLORREF c, int rad, int w) {
-    HPEN p = CreatePen(PS_INSIDEFRAME, w, c);
-    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH)), op = SelectObject(dc, p);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, S(rad) * 2, S(rad) * 2);
-    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(p);
-}
-void dot(HDC dc, int cx, int cy, int r, COLORREF c) {
-    HBRUSH b = CreateSolidBrush(c);
-    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, GetStockObject(NULL_PEN));
-    Ellipse(dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
-    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b);
-}
-void line(HDC dc, int x0, int y0, int x1, int y1, COLORREF c, int w) {
-    HPEN p = CreatePen(PS_SOLID, w, c); HGDIOBJ op = SelectObject(dc, p);
-    MoveToEx(dc, x0, y0, nullptr); LineTo(dc, x1, y1);
-    SelectObject(dc, op); DeleteObject(p);
-}
-void text(HDC dc, const std::wstring& t, RECT r, HFONT f, COLORREF c, UINT fmt = DT_LEFT | DT_VCENTER | DT_SINGLELINE) {
-    SelectObject(dc, f);
-    SetTextColor(dc, c);
-    DrawTextW(dc, t.c_str(), (int)t.size(), &r, fmt | DT_NOPREFIX);
-}
-int textW(HDC dc, const std::wstring& t, HFONT f) { SelectObject(dc, f); SIZE z{}; GetTextExtentPoint32W(dc, t.c_str(), (int)t.size(), &z); return z.cx; }
-void addRegion(RECT r, int id) { g.regions.push_back({r, id}); }
-void chevron(HDC dc, int cx, int cy, COLORREF c) {
-    int s = S(4);
-    line(dc, cx - s, cy - s / 2, cx, cy + s / 2, c, S(1) + 1 > 2 ? 2 : S(1) + 1);
-    line(dc, cx, cy + s / 2, cx + s, cy - s / 2, c, S(1) + 1 > 2 ? 2 : S(1) + 1);
-}
-
 std::wstring modsText(UINT m) {
     std::wstring s;
-    if (m & MOD_CTRL_) s += L"Ctrl+";
-    if (m & MOD_ALT_) s += L"Alt+";
-    if (m & MOD_SHIFT_) s += L"Shift+";
-    if (m & MOD_WIN_) s += L"Win+";
+    if (m & MOD_CTRL_) s += L"Ctrl + ";
+    if (m & MOD_ALT_) s += L"Alt + ";
+    if (m & MOD_SHIFT_) s += L"Shift + ";
+    if (m & MOD_WIN_) s += L"Win + ";
     return s;
-}
-
-// ---------- dropdown model ----------
-int ddCount(int id) {
-    switch (id) {
-        case H_DD_FPS: return 3; case H_DD_QUAL: return 4; case H_DD_ENC: return 5;
-        case H_DD_GPU: return 1 + (int)g.gpus.size(); case H_DD_RES: return 3; case H_DD_CONT: return 3;
-        case H_DD_SYS: return 2; case H_DD_MIC: return 2 + (int)g.mics.size();
-    }
-    return 0;
-}
-std::wstring ddItem(int id, int i) {
-    switch (id) {
-        case H_DD_FPS: return kFpsL[i]; case H_DD_QUAL: return kQualL[i]; case H_DD_ENC: return kEncL[i];
-        case H_DD_GPU: return i == 0 ? std::wstring(L"Auto (monitor's GPU)") : g.gpus[i - 1];
-        case H_DD_RES: return kResL[i]; case H_DD_CONT: return kContL[i];
-        case H_DD_SYS: return i ? L"On" : L"Off";
-        case H_DD_MIC: return i == 0 ? std::wstring(L"Off") : i == 1 ? std::wstring(L"Default") : g.mics[i - 2].name;
-    }
-    return L"";
-}
-int ddSel(int id) {
-    switch (id) {
-        case H_DD_FPS: return g.s.fps == 15 ? 0 : g.s.fps == 30 ? 1 : 2;
-        case H_DD_QUAL: return (int)g.s.quality; case H_DD_ENC: return (int)g.s.encoder;
-        case H_DD_GPU: return g.s.gpuIndex < 0 || g.s.gpuIndex >= (int)g.gpus.size() ? 0 : g.s.gpuIndex + 1;
-        case H_DD_RES: return (int)g.s.scale; case H_DD_CONT: return (int)g.s.container;
-        case H_DD_SYS: return g.s.systemAudio ? 1 : 0;
-        case H_DD_MIC: {
-            if (!g.s.micEnabled) return 0;
-            for (size_t k = 0; k < g.mics.size(); ++k) if (U(g.mics[k].id) == g.s.micDevice) return (int)k + 2;
-            return 1;
-        }
-    }
-    return 0;
-}
-void ddSet(int id, int i) {
-    switch (id) {
-        case H_DD_FPS: g.s.fps = kFps[i]; break; case H_DD_QUAL: g.s.quality = kQual[i]; break;
-        case H_DD_ENC: g.s.encoder = kEnc[i]; break; case H_DD_GPU: g.s.gpuIndex = i - 1; g.s.gpuName = i > 0 ? U(g.gpus[i - 1]) : std::string(); break;
-        case H_DD_RES: g.s.scale = kRes[i]; break; case H_DD_CONT: g.s.container = kCont[i]; break;
-        case H_DD_SYS: g.s.systemAudio = i == 1; break;
-        case H_DD_MIC: g.s.micEnabled = i > 0; g.s.micDevice = i >= 2 ? U(g.mics[i - 2].id) : std::string(); break;
-    }
-    save();
-    if (id == H_DD_FPS || id == H_DD_ENC || id == H_DD_GPU || id == H_DD_RES || id == H_DD_CONT) startWarmup();
 }
 void openLog() {
     std::wstring p = cr::appLogPath();
@@ -563,331 +500,1295 @@ void openLog() {
     ShellExecuteW(g.hwnd, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     setStatus(L"Log path copied: " + p, C_TEXT2);
 }
-bool ddLocked(int id) { return g.rec.running() && id != H_NONE; }  // settings lock while a session is live
+void endCapture();
+void selftestSettings();
+void paintToNull();
+// ===================== v2 UI (Vey, cast-recorder-ui/v2/SPEC.md + tokens.json) =====================
+// Everything is drawn with GDI+ in logical 96-DPI units under a world scale transform. Popups (dropdown lists,
+// source picker, mic popover) are layered top-level windows (UpdateLayeredWindow) so they float above the GPU
+// preview's swapchain child; the preview's chips are small layered child windows over it.
+namespace gp = Gdiplus;
 
-// ---------- keyboard focus (Tab / Shift+Tab, arrows, Enter/Space) ----------
-const int kFocusOrder[] = {H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT, H_DD_SYS, H_DD_MIC, H_PATH, H_BROWSE, H_HK0, H_HK1, H_HK2, H_MIC, H_PAUSE, H_RECORD};
+const unsigned T_BG = 0x0E1014, T_SURF = 0x161A20, T_ELEV = 0x1C2128, T_PREV = 0x0A0C0F, T_INPUT = 0x1A1F27, T_INPUT_H = 0x222832,
+               T_TEXT = 0xF2F3F5, T_TEXT2 = 0xA8ADB7, T_MUTED = 0x6B7280, T_DIS = 0x4B5563, T_ACC = 0xE5243B, T_ACC_B = 0xFF6B6B,
+               T_ACC_H = 0xF0354A, T_ACC_P = 0xC41E33, T_OK = 0x22C55E, T_WARN = 0xF59E0B, T_ERR = 0xEF4444, T_LISTH = 0x232A34,
+               T_TRACK = 0x2A303A, T_CLOSEH = 0xE81123;
+gp::Color C(unsigned rgb, int a = 255) { return gp::Color((BYTE)a, (BYTE)((rgb >> 16) & 255), (BYTE)((rgb >> 8) & 255), (BYTE)(rgb & 255)); }
+gp::Color WA(int a) { return gp::Color((BYTE)a, 255, 255, 255); }  // #FFFFFFxx overlays/borders
+const int A_SUBTLE = 0x14, A_DEFAULT = 0x1F, A_STRONG = 0x33, A_HOVER = 0x0A, A_PRESSED = 0x14;
+COLORREF toRef(unsigned rgb) { return RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255); }
+unsigned fromRef(COLORREF c) { return ((unsigned)GetRValue(c) << 16) | ((unsigned)GetGValue(c) << 8) | GetBValue(c); }
+
+float scale() { return g.dpi / 96.f; }
+using RF = gp::RectF;
+RF inflate(RF r, float d) { return RF(r.X - d, r.Y - d, r.Width + 2 * d, r.Height + 2 * d); }
+bool inRF(const RF& r, float x, float y) { return x >= r.X && y >= r.Y && x < r.X + r.Width && y < r.Y + r.Height; }
+
+// ---------- fonts (Segoe UI; Semibold via its own family) ----------
+struct Fonts { gp::Font *title = nullptr, *body = nullptr, *label = nullptr, *caption = nullptr, *section = nullptr, *btn = nullptr,
+               *btnP = nullptr, *status = nullptr, *hotkey = nullptr, *tiny = nullptr; } F;
+gp::FontFamily* g_ff = nullptr; gp::FontFamily* g_ffSb = nullptr;
+void makeUiFonts() {
+    for (gp::Font* f : {F.title, F.body, F.label, F.caption, F.section, F.btn, F.btnP, F.status, F.hotkey, F.tiny}) delete f;
+    if (!g_ff) {
+        for (const wchar_t* face : {L"Segoe UI", L"Segoe UI Variable", L"Arial"}) {
+            g_ff = new gp::FontFamily(face);
+            if (g_ff->IsAvailable() && g_ff->GetLastStatus() == gp::Ok) break;
+            delete g_ff; g_ff = nullptr;
+        }
+        if (!g_ff) g_ff = gp::FontFamily::GenericSansSerif()->Clone();
+        g_ffSb = new gp::FontFamily(L"Segoe UI Semibold");
+        if (!g_ffSb->IsAvailable()) { delete g_ffSb; g_ffSb = nullptr; }
+    }
+    auto sb = [](float px) { return g_ffSb ? new gp::Font(g_ffSb, px, gp::FontStyleRegular, gp::UnitPixel) : new gp::Font(g_ff, px, gp::FontStyleBold, gp::UnitPixel); };
+    auto rg = [](float px) { return new gp::Font(g_ff, px, gp::FontStyleRegular, gp::UnitPixel); };
+    F.title = sb(13); F.body = rg(13); F.label = rg(12); F.caption = rg(11); F.section = sb(11); F.btn = sb(13); F.btnP = sb(14);
+    F.status = rg(12); F.hotkey = rg(12); F.tiny = sb(10);
+}
+
+// ---------- drawing helpers ----------
+void rrPath(gp::GraphicsPath& p, RF r, float rad) {
+    if (rad <= 0.01f) { p.AddRectangle(r); return; }
+    float d = std::min(rad * 2, std::min(r.Width, r.Height));
+    p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90); p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p.CloseFigure();
+}
+void fillRR(gp::Graphics& gr, RF r, float rad, gp::Color c) { gp::GraphicsPath p; rrPath(p, r, rad); gp::SolidBrush b(c); gr.FillPath(&b, &p); }
+void strokeRR(gp::Graphics& gr, RF r, float rad, gp::Color c, float w = 1.f) {
+    RF q(r.X + w / 2, r.Y + w / 2, r.Width - w, r.Height - w);
+    gp::GraphicsPath p; rrPath(p, q, std::max(0.f, rad - w / 2)); gp::Pen pen(c, w); gr.DrawPath(&pen, &p);
+}
+void card(gp::Graphics& gr, RF r, float rad, gp::Color bg, gp::Color border) { fillRR(gr, r, rad, bg); strokeRR(gr, r, rad, border); }
+void fillCircle(gp::Graphics& gr, float cx, float cy, float rad, gp::Color c) { gp::SolidBrush b(c); gr.FillEllipse(&b, cx - rad, cy - rad, rad * 2, rad * 2); }
+void hline(gp::Graphics& gr, float x0, float x1, float y, gp::Color c) { gp::SolidBrush b(c); gr.FillRectangle(&b, x0, y, x1 - x0, 1.f); }
+enum { AL_L = 0, AL_C = 1, AL_R = 2 };
+void txt(gp::Graphics& gr, const std::wstring& s, RF r, gp::Font* f, gp::Color c, int align = AL_L, bool ellipsis = true, bool path = false) {
+    gp::StringFormat sf(gp::StringFormat::GenericTypographic());
+    sf.SetAlignment(align == AL_L ? gp::StringAlignmentNear : align == AL_C ? gp::StringAlignmentCenter : gp::StringAlignmentFar);
+    sf.SetLineAlignment(gp::StringAlignmentCenter);
+    sf.SetFormatFlags(sf.GetFormatFlags() | gp::StringFormatFlagsNoWrap | gp::StringFormatFlagsMeasureTrailingSpaces);
+    sf.SetTrimming(path ? gp::StringTrimmingEllipsisPath : ellipsis ? gp::StringTrimmingEllipsisCharacter : gp::StringTrimmingNone);
+    gp::SolidBrush b(c);
+    gr.DrawString(s.c_str(), (INT)s.size(), f, r, &sf, &b);
+}
+float txtW(gp::Graphics& gr, const std::wstring& s, gp::Font* f) {
+    gp::StringFormat sf(gp::StringFormat::GenericTypographic());
+    sf.SetFormatFlags(sf.GetFormatFlags() | gp::StringFormatFlagsMeasureTrailingSpaces);
+    RF out; gr.MeasureString(s.c_str(), (INT)s.size(), f, gp::PointF(0, 0), &sf, &out);
+    return out.Width;
+}
+
+// ---------- icons (embedded PNGs, white; tinted at draw time) ----------
+enum Glyph { G_RECORD, G_PAUSE, G_STOP, G_MIC, G_MICMUTED, G_SYS, G_SYSMUTED, G_FOLDER, G_LOG, G_SETTINGS, G_MINIMIZE, G_MAXIMIZE,
+             G_RESTORE, G_CLOSE, G_CHEVRON, G_CHECK, G_MONITOR, G_WINDOW, G_FULLSCREEN, G_COUNT };
+gp::Bitmap* g_icons[G_COUNT][4] = {};
+gp::Bitmap* loadPngResource(int id) {
+    HRSRC r = FindResourceW(g.inst, MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10) /* RT_RCDATA */);
+    if (!r) return nullptr;
+    HGLOBAL h = LoadResource(g.inst, r); DWORD n = SizeofResource(g.inst, r);
+    const void* data = LockResource(h);
+    if (!data || !n) return nullptr;
+    IStream* s = SHCreateMemStream((const BYTE*)data, n);
+    if (!s) return nullptr;
+    gp::Bitmap* tmp = gp::Bitmap::FromStream(s);
+    gp::Bitmap* out = nullptr;
+    if (tmp && tmp->GetLastStatus() == gp::Ok) {  // decode now: the stream goes away
+        out = new gp::Bitmap(tmp->GetWidth(), tmp->GetHeight(), PixelFormat32bppPARGB);
+        gp::Graphics gg(out); gg.DrawImage(tmp, 0, 0, (INT)tmp->GetWidth(), (INT)tmp->GetHeight());
+    }
+    delete tmp; s->Release();
+    return out;
+}
+void loadUiIcons() {
+    for (int i = 0; i < G_COUNT; ++i)
+        for (int k = 0; k < 4; ++k) if (!g_icons[i][k]) g_icons[i][k] = loadPngResource(1000 + i * 4 + k);
+}
+// 16 px glyphs: 16 below 125 %, 20 at 125 %, 24 at 150 %, 32 at 200 %+ (SPEC: Window / DPI)
+int iconIndex(float logicalSize) {
+    float px = logicalSize * scale();
+    return px < 19.5f ? 0 : px < 23.5f ? 1 : px < 31.5f ? 2 : 3;
+}
+void icon(gp::Graphics& gr, int glyph, float x, float y, float size, gp::Color tint, float rotateDeg = 0) {
+    gp::Bitmap* b = g_icons[glyph][iconIndex(size)];
+    if (!b) return;
+    gp::ColorMatrix m = {{{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, tint.GetA() / 255.f, 0},
+                          {tint.GetR() / 255.f, tint.GetG() / 255.f, tint.GetB() / 255.f, 0, 1}}};
+    gp::ImageAttributes ia; ia.SetColorMatrix(&m);
+    gp::GraphicsState st = gr.Save();
+    if (rotateDeg != 0) { gr.TranslateTransform(x + size / 2, y + size / 2); gr.RotateTransform(rotateDeg); gr.TranslateTransform(-(x + size / 2), -(y + size / 2)); }
+    gr.SetInterpolationMode(gp::InterpolationModeHighQualityBicubic);
+    gr.DrawImage(b, RF(x, y, size, size), 0, 0, (gp::REAL)b->GetWidth(), (gp::REAL)b->GetHeight(), gp::UnitPixel, &ia);
+    gr.Restore(st);
+}
+// Window icons for the source list (HICON -> premultiplied bitmap, cached per HICON)
+std::vector<std::pair<HICON, gp::Bitmap*>> g_winIcons;
+gp::Bitmap* winIcon(HICON ic) {
+    if (!ic) return nullptr;
+    for (auto& p : g_winIcons) if (p.first == ic) return p.second;
+    const int n = 32;
+    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = n; bi.bmiHeader.biHeight = -n;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP hb = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    gp::Bitmap* out = nullptr;
+    if (hb) {
+        HGDIOBJ o = SelectObject(dc, hb);
+        memset(bits, 0, n * n * 4);
+        DrawIconEx(dc, 0, 0, ic, n, n, 0, nullptr, DI_NORMAL);
+        GdiFlush();
+        uint32_t* px = (uint32_t*)bits; bool anyA = false;
+        for (int i = 0; i < n * n; ++i) if (px[i] >> 24) { anyA = true; break; }
+        if (!anyA) for (int i = 0; i < n * n; ++i) if (px[i]) px[i] |= 0xFF000000u;  // legacy icons without alpha
+        out = new gp::Bitmap(n, n, PixelFormat32bppPARGB);
+        gp::BitmapData bd; gp::Rect lr(0, 0, n, n);
+        if (out->LockBits(&lr, gp::ImageLockModeWrite, PixelFormat32bppPARGB, &bd) == gp::Ok) {
+            for (int y = 0; y < n; ++y) memcpy((BYTE*)bd.Scan0 + y * bd.Stride, px + y * n, n * 4);
+            out->UnlockBits(&bd);
+        }
+        SelectObject(dc, o); DeleteObject(hb);
+    }
+    DeleteDC(dc);
+    if (g_winIcons.size() > 200) { for (auto& p : g_winIcons) delete p.second; g_winIcons.clear(); }
+    g_winIcons.push_back({ic, out});
+    return out;
+}
+void drawWinIcon(gp::Graphics& gr, HICON ic, float x, float y, float size) {
+    if (gp::Bitmap* b = winIcon(ic)) {
+        gr.SetInterpolationMode(gp::InterpolationModeHighQualityBicubic);
+        gr.DrawImage(b, RF(x, y, size, size));
+    } else icon(gr, G_WINDOW, x, y, size, C(T_TEXT2));
+}
+
+// ---------- motion (SPEC: Motion; tokens.json motion) ----------
+double nowMs() { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); LARGE_INTEGER q; QueryPerformanceCounter(&q); return (double)q.QuadPart * 1000.0 / (double)f.QuadPart; }
+double cubicBezier(double x1, double y1, double x2, double y2, double t) {
+    if (t <= 0) return 0; if (t >= 1) return 1;
+    auto bx = [&](double s) { return 3 * (1 - s) * (1 - s) * s * x1 + 3 * (1 - s) * s * s * x2 + s * s * s; };
+    auto by = [&](double s) { return 3 * (1 - s) * (1 - s) * s * y1 + 3 * (1 - s) * s * s * y2 + s * s * s; };
+    double lo = 0, hi = 1, s = t;
+    for (int i = 0; i < 40; ++i) { s = (lo + hi) / 2; if (bx(s) < t) lo = s; else hi = s; }
+    return by(s);
+}
+enum Ease { E_LINEAR, E_OUTEXPO, E_IN, E_STD, E_OUT, E_INOUT };
+double ease(int e, double t) {
+    switch (e) {
+        case E_OUTEXPO: return cubicBezier(0.16, 1, 0.3, 1, t);
+        case E_IN: return cubicBezier(0.4, 0, 1, 1, t);
+        case E_STD: return cubicBezier(0.2, 0, 0, 1, t);
+        case E_OUT: return cubicBezier(0, 0, 0.58, 1, t);
+        case E_INOUT: return cubicBezier(0.42, 0, 0.58, 1, t);
+    }
+    return t < 0 ? 0 : t > 1 ? 1 : t;
+}
+bool animationsOn() {
+    BOOL on = TRUE;
+    if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0)) on = TRUE;
+    return on != FALSE && !g_renderOnly;
+}
+void kickAnim();
+struct Anim {
+    float from = 0, to = 0; double t0 = 0; int ms = 0, e = E_LINEAR;
+    void set(float v) { from = to = v; ms = 0; }
+    void go(float v, int dur, int easing) {
+        if (v == to && !active()) { from = to; ms = 0; return; }
+        from = value(); to = v; t0 = nowMs(); e = easing; ms = animationsOn() ? dur : 0;
+        if (ms) kickAnim();
+    }
+    double progress() const { return ms ? std::min(1.0, (nowMs() - t0) / ms) : 1.0; }
+    float value() const { return ms ? from + (to - from) * (float)ease(e, progress()) : to; }
+    bool active() const { return ms && nowMs() - t0 < ms; }
+};
+// ---------- UI state ----------
+struct Region { RF r; int id; };
+std::vector<Region> g_regs;          // main window hit regions (logical px), rebuilt every paint
+std::vector<RF> g_meterRects;        // repainted on level changes
+RF g_recordRect, g_statusRect;
+std::map<int, Anim> g_hov, g_tog;    // hover overlays (100 ms) / toggle knobs (140 ms)
+Anim g_view, g_chan;                 // view switch (150 ms) / channels thumb (160 ms)
+int g_viewIdx = 0;                   // 0 Record, 1 Settings
 int g_focus = H_NONE;
-int g_dropKb = -1;      // keyboard-highlighted item in the open dropdown  // keyboard focus; shown as a brighter border once Tab is used
-bool kbFocused(int id) { return g_focus == id; }
-bool focusable(int id) { return id != H_PAUSE || g.rec.isActive(); }
-void moveFocus(int dir) {
-    const int n = (int)(sizeof kFocusOrder / sizeof *kFocusOrder);
-    int i = 0;
-    for (; i < n && kFocusOrder[i] != g_focus; ++i) {}
-    for (int k = 0; k < n; ++k) {
-        i = g_focus == H_NONE && k == 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n;
-        if (focusable(kFocusOrder[i])) { g_focus = kFocusOrder[i]; return; }
+bool g_kbUsed = false;               // focus rings only after Tab is used
+int g_drag = H_NONE;                 // slider being dragged (main window)
+float g_meter[2] = {0, 0};           // displayed level 0..1 (mic, system), 300 ms decay
+double g_meterT = 0;
+bool g_fakeRec = false, g_fakePaused = false;  // --render-ui recording state
+std::vector<DisplayInfo> g_displays;
+
+float hovA(int id) { auto it = g_hov.find(id); return it == g_hov.end() ? 0.f : it->second.value(); }
+void addReg(RF r, int id) { g_regs.push_back({r, id}); }
+gp::Color mix(unsigned a, unsigned b, float t) {
+    auto ch = [&](int s) { return (BYTE)std::lround(((a >> s) & 255) * (1 - t) + ((b >> s) & 255) * t); };
+    return gp::Color(255, ch(16), ch(8), ch(0));
+}
+bool uiActive() { return g_fakeRec || g.rec.isActive(); }
+bool uiPaused() { return g_fakePaused || g.rec.isPaused(); }
+bool uiBusy() { return g_fakeRec || g.rec.running(); }
+std::wstring hkText(const Hotkey& h) {
+    std::wstring s = W(format(h)), o;
+    for (wchar_t c : s) { if (c == L'+') o += L" + "; else o += c; }
+    return o;
+}
+
+// ---------- sources ----------
+struct SrcRow { int kind = 0; std::wstring label, right; HMONITOR mon = nullptr; HWND hwnd = nullptr; HICON ic = nullptr; std::wstring exe, device; float y = 0, h = 0; };
+enum { SR_ALL = 0, SR_MON = 1, SR_WIN = 2, SR_DIV = 10, SR_SEARCH = 11, SR_CAPTION = 12 };
+std::wstring dims(int w, int h) { return std::to_wstring(w) + L" \u00d7 " + std::to_wstring(h); }
+RECT virtualRect() {
+    RECT u{0, 0, 0, 0}; bool first = true;
+    for (auto& d : g_displays) { if (first) { u = d.rect; first = false; } else { u.left = std::min(u.left, d.rect.left); u.top = std::min(u.top, d.rect.top); u.right = std::max(u.right, d.rect.right); u.bottom = std::max(u.bottom, d.rect.bottom); } }
+    return u;
+}
+const DisplayInfo* displayFor(HMONITOR m) {
+    for (auto& d : g_displays) if (d.mon == m) return &d;
+    for (auto& d : g_displays) if (d.primary) return &d;
+    return g_displays.empty() ? nullptr : &g_displays[0];
+}
+std::wstring g_srcTitle;  // window title for the field
+HICON g_srcIcon = nullptr;
+std::wstring sourceText() {
+    if (g.target.kind == CaptureTarget::Window) return g_srcTitle.empty() ? L"Window" : g_srcTitle;
+    if (g.target.kind == CaptureTarget::AllDisplays) { RECT u = virtualRect(); return L"Full screen \u00b7 " + dims(u.right - u.left, u.bottom - u.top); }
+    const DisplayInfo* d = displayFor(g.target.mon);
+    return d ? L"Monitor " + std::to_wstring(d->index) + L" \u00b7 " + dims(d->rect.right - d->rect.left, d->rect.bottom - d->rect.top) : L"Monitor";
+}
+void sourceSize(int& w, int& h) {
+    w = h = 0;
+    if (g.target.kind == CaptureTarget::Window) { RECT r{}; if (g.target.hwnd && GetWindowRect(g.target.hwnd, &r)) { w = r.right - r.left; h = r.bottom - r.top; } }
+    else if (g.target.kind == CaptureTarget::AllDisplays) { RECT u = virtualRect(); w = u.right - u.left; h = u.bottom - u.top; }
+    else if (const DisplayInfo* d = displayFor(g.target.mon)) { w = d->rect.right - d->rect.left; h = d->rect.bottom - d->rect.top; }
+    if (g.gprev.live() && g.gprev.sourceWidth()) { w = (int)g.gprev.sourceWidth(); h = (int)g.gprev.sourceHeight(); }
+}
+// Saved source -> live target. A saved window that's gone (or a monitor that's unplugged) falls back to Full
+// screen for this session without overwriting the saved choice, so it's picked up again when it's back.
+void resolveSource() {
+    g_displays = listDisplays();
+    g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays;
+    g_srcTitle.clear(); g_srcIcon = nullptr;
+    if (g.s.sourceKind == "monitor") {
+        g.target.kind = CaptureTarget::Monitor;
+        g.target.mon = nullptr;
+        for (auto& d : g_displays) if (U(d.device) == g.s.sourceMonitor) g.target.mon = d.mon;
+        if (!g.target.mon) {
+            if (!g.s.sourceMonitor.empty()) cr::appLog(L"source: saved monitor " + W(g.s.sourceMonitor) + L" not found, using the primary monitor");
+            if (const DisplayInfo* d = displayFor(nullptr)) g.target.mon = d->mon;
+        }
+    } else if (g.s.sourceKind == "window") {
+        HWND h = resolveSavedWindow(W(g.s.sourceExe), W(g.s.sourceTitle));
+        if (h) {
+            g.target.kind = CaptureTarget::Window; g.target.hwnd = h;
+            for (auto& w : listCaptureWindows()) if (w.hwnd == h) { g_srcTitle = w.title; g_srcIcon = w.icon; }
+        } else {
+            cr::appLog(L"source: saved window " + W(g.s.sourceExe) + L" \"" + W(g.s.sourceTitle) + L"\" not found, using Full screen");
+            setStatus(L"Saved window isn't open \u2013 using Full screen", toRef(T_TEXT2));
+        }
+    }
+    g.gprev.setTarget(g.target);
+}
+void selectSource(const SrcRow& r) {
+    if (r.kind == SR_ALL) { g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g.s.sourceKind = "all"; g_srcTitle.clear(); }
+    else if (r.kind == SR_MON) { g.target = CaptureTarget{}; g.target.kind = CaptureTarget::Monitor; g.target.mon = r.mon; g.s.sourceKind = "monitor"; g.s.sourceMonitor = U(r.device); g_srcTitle.clear(); }
+    else if (r.kind == SR_WIN) {
+        g.target = CaptureTarget{}; g.target.kind = CaptureTarget::Window; g.target.hwnd = r.hwnd;
+        g.s.sourceKind = "window"; g.s.sourceExe = U(r.exe); g.s.sourceTitle = U(r.label); g_srcTitle = r.label; g_srcIcon = r.ic;
+    } else return;
+    g.gprev.setTarget(g.target);
+    save();
+    setStatus(L"Ready", toRef(T_TEXT2));
+    startWarmup();
+}
+bool rowSelected(const SrcRow& r) {
+    if (r.kind == SR_ALL) return g.target.kind == CaptureTarget::AllDisplays;
+    if (r.kind == SR_MON) return g.target.kind == CaptureTarget::Monitor && g.target.mon == r.mon;
+    if (r.kind == SR_WIN) return g.target.kind == CaptureTarget::Window && g.target.hwnd == r.hwnd;
+    return false;
+}
+
+// ---------- dropdown model ----------
+const wchar_t* kEncV2[] = {L"Auto", L"H.264 \u00b7 NVENC", L"H.264 \u00b7 AMF", L"H.264 \u00b7 Quick Sync", L"H.264 \u00b7 Software"};
+int ddCount(int id) {
+    switch (id) {
+        case H_DD_FPS: return 3; case H_DD_QUAL: return 4; case H_DD_ENC: return 5;
+        case H_DD_GPU: return 1 + (int)g.gpus.size(); case H_DD_RES: return 3; case H_DD_CONT: return 3;
+        case H_DD_SYSDEV: return 1 + (int)g.outs.size(); case H_DD_MICDEV: return 1 + (int)g.mics.size();
+    }
+    return 0;
+}
+std::wstring ddItem(int id, int i) {
+    switch (id) {
+        case H_DD_FPS: return kFpsL[i]; case H_DD_QUAL: return kQualL[i]; case H_DD_ENC: return kEncV2[i];
+        case H_DD_GPU: return i == 0 ? std::wstring(L"Auto (display's GPU)") : g.gpus[i - 1];
+        case H_DD_RES: { if (i) return kResL[i]; int w, h; sourceSize(w, h); return w ? L"Native (" + dims(w, h) + L")" : std::wstring(L"Native"); }
+        case H_DD_CONT: return kContL[i];
+        case H_DD_SYSDEV: return i == 0 ? std::wstring(L"Default output") : g.outs[i - 1].name;
+        case H_DD_MICDEV: return i == 0 ? std::wstring(L"Default microphone") : g.mics[i - 1].name;
+    }
+    return L"";
+}
+int ddSel(int id) {
+    switch (id) {
+        case H_DD_FPS: return g.s.fps == 15 ? 0 : g.s.fps == 30 ? 1 : 2;
+        case H_DD_QUAL: return (int)g.s.quality; case H_DD_ENC: return (int)g.s.encoder;
+        case H_DD_GPU: return g.s.gpuIndex < 0 || g.s.gpuIndex >= (int)g.gpus.size() ? 0 : g.s.gpuIndex + 1;
+        case H_DD_RES: return (int)g.s.scale; case H_DD_CONT: return (int)g.s.container;
+        case H_DD_SYSDEV: for (size_t k = 0; k < g.outs.size(); ++k) if (U(g.outs[k].id) == g.s.systemDevice) return (int)k + 1; return 0;
+        case H_DD_MICDEV: for (size_t k = 0; k < g.mics.size(); ++k) if (U(g.mics[k].id) == g.s.micDevice) return (int)k + 1; return 0;
+    }
+    return 0;
+}
+void restartMeter();
+void applyAudioFx() {
+    auto& a = audioFx();
+    a.micGain = g.s.micVolume / 100.f; a.noiseSuppression = g.s.noiseSuppression;
+    a.gateDb = (float)g.s.noiseGateDb; a.pushToTalk = g.s.pushToTalk; a.monitoring = g.s.monitoring;
+    a.micMuted = g.s.micMuted; a.systemMuted = g.s.systemMuted;
+}
+void ddSet(int id, int i) {
+    switch (id) {
+        case H_DD_FPS: g.s.fps = kFps[i]; break; case H_DD_QUAL: g.s.quality = kQual[i]; break;
+        case H_DD_ENC: g.s.encoder = kEnc[i]; break; case H_DD_GPU: g.s.gpuIndex = i - 1; g.s.gpuName = i > 0 ? U(g.gpus[i - 1]) : std::string(); break;
+        case H_DD_RES: g.s.scale = kRes[i]; break; case H_DD_CONT: g.s.container = kCont[i]; break;
+        case H_DD_SYSDEV: g.s.systemDevice = i > 0 ? U(g.outs[i - 1].id) : std::string(); break;
+        case H_DD_MICDEV: g.s.micDevice = i > 0 ? U(g.mics[i - 1].id) : std::string(); break;
+    }
+    save();
+    if (id == H_DD_SYSDEV || id == H_DD_MICDEV) restartMeter();
+    if (id == H_DD_FPS || id == H_DD_ENC || id == H_DD_GPU || id == H_DD_RES || id == H_DD_CONT) startWarmup();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+// While recording: source, encoder, container and resolution (SPEC: App states), plus the audio devices/routing,
+// which only apply to the next recording. Volume, noise suppression/gate, monitoring and PTT apply live.
+bool locked(int id) {
+    if (!uiBusy()) return false;
+    switch (id) {
+        case H_SRC: case H_DD_ENC: case H_DD_CONT: case H_DD_RES: case H_DD_GPU: case H_DD_SYSDEV: case H_DD_MICDEV:
+        case H_TG_SYS: case H_TG_MIC: case H_CH_MONO: case H_CH_STEREO: case H_HK0: case H_HK1: case H_HK2: case H_HKPTT: case H_BROWSE:
+            return true;
+    }
+    return false;
+}
+
+// ---------- popup (layered window: dropdown lists, source picker, mic popover) ----------
+enum PopKind { PK_NONE, PK_LIST, PK_SOURCE, PK_MIC };
+struct Popup {
+    HWND hwnd = nullptr;
+    int kind = PK_NONE, dd = H_NONE;
+    RF anchor;                 // field rect, logical client coords
+    float x = 0, y = 0, w = 0, h = 0;  // card rect, logical client coords
+    float contentH = 0, scroll = 0;
+    bool above = false, closing = false;
+    Anim open, close;
+    std::vector<Region> regs;
+    int hover = -1, kb = -1, pressed = -1;
+    std::map<int, Anim> hov;
+    std::wstring search;
+    std::vector<SrcRow> rows;
+    bool dragVol = false;
+} P;
+const float kShadow = 18.f;   // logical margin around the card for the shadow
+void renderPopup();
+int popupIndexOf(int id) { return id >= P_BASE && id < P_BASE + 900 ? id - P_BASE : -1; }
+std::vector<int> selectableRows() {
+    std::vector<int> v;
+    if (P.kind == PK_LIST) { for (int i = 0; i < ddCount(P.dd); ++i) v.push_back(i); }
+    else if (P.kind == PK_SOURCE) { for (size_t i = 0; i < P.rows.size(); ++i) if (P.rows[i].kind <= SR_WIN) v.push_back((int)i); }
+    return v;
+}
+std::wstring lowerW(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
+void buildSourceRows() {
+    P.rows.clear();
+    g_displays = listDisplays();
+    RECT u = virtualRect();
+    float y = 6;
+    auto add = [&](SrcRow r, float h, float gapAfter) { r.y = y; r.h = h; y += h + gapAfter; P.rows.push_back(r); };
+    SrcRow all; all.kind = SR_ALL; all.label = L"Full screen"; all.right = L"All displays \u00b7 " + dims(u.right - u.left, u.bottom - u.top);
+    add(all, 32, 2);
+    for (auto& d : g_displays) {
+        SrcRow m; m.kind = SR_MON; m.mon = d.mon; m.device = d.device; m.label = L"Monitor " + std::to_wstring(d.index);
+        m.right = dims(d.rect.right - d.rect.left, d.rect.bottom - d.rect.top) + (d.primary ? L" \u00b7 Primary" : L"");
+        add(m, 32, 2);
+    }
+    SrcRow dv; dv.kind = SR_DIV; add(dv, 17, 0);
+    SrcRow se; se.kind = SR_SEARCH; add(se, 30, 6);
+    SrcRow ca; ca.kind = SR_CAPTION; ca.label = L"WINDOWS"; add(ca, 20, 2);
+    std::wstring q = lowerW(P.search);
+    int n = 0;
+    for (auto& w : listCaptureWindows()) {
+        if (!q.empty() && lowerW(w.title).find(q) == std::wstring::npos && lowerW(w.exe).find(q) == std::wstring::npos) continue;
+        SrcRow r; r.kind = SR_WIN; r.hwnd = w.hwnd; r.ic = w.icon; r.exe = w.exe; r.label = w.title;
+        add(r, 34, 0); ++n;
+    }
+    if (!n) { SrcRow none; none.kind = SR_CAPTION; none.label = q.empty() ? L"No windows" : L"No matching windows"; add(none, 30, 0); }
+    P.contentH = y + 6;
+}
+void layoutPopup() {
+    RECT c{}; if (g.hwnd) GetClientRect(g.hwnd, &c); else c = RECT{0, 0, (LONG)(1100 * scale()), (LONG)(700 * scale())};
+    const float CH = c.bottom / scale();
+    if (P.kind == PK_MIC) {
+        P.w = 280; P.h = 168;
+        P.x = P.anchor.X + P.anchor.Width / 2 - P.w / 2; P.y = P.anchor.Y - 12 - P.h;
+        P.above = true; return;
+    }
+    if (P.kind == PK_LIST) { P.w = P.anchor.Width; P.contentH = 8.f + ddCount(P.dd) * 32.f; }
+    else { P.w = 420; buildSourceRows(); }
+    P.h = std::min(440.f, P.contentH);
+    P.x = P.anchor.X; P.y = P.anchor.Y + P.anchor.Height + 4;
+    P.above = false;
+    if (P.y + P.h > CH - 8 && P.anchor.Y - 4 - P.h > 48) { P.y = P.anchor.Y - 4 - P.h; P.above = true; }
+    P.scroll = std::max(0.f, std::min(P.scroll, P.contentH - P.h));
+}
+void ensurePopupWindow();
+void openPopup(int kind, int dd, RF anchor) {
+    ensurePopupWindow();
+    P.kind = kind; P.dd = dd; P.anchor = anchor; P.closing = false; P.scroll = 0; P.hover = -1; P.pressed = -1;
+    P.search.clear(); P.hov.clear(); P.dragVol = false;
+    layoutPopup();
+    P.kb = -1;
+    if (kind == PK_LIST) P.kb = ddSel(dd);
+    else if (kind == PK_SOURCE) for (size_t i = 0; i < P.rows.size(); ++i) if (rowSelected(P.rows[i])) P.kb = (int)i;
+    P.open.set(0); P.open.go(1, 160, E_OUTEXPO);
+    if (!P.open.ms) P.open.set(1);
+    renderPopup();
+    if (P.hwnd) ShowWindow(P.hwnd, SW_SHOWNOACTIVATE);
+    kickAnim();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void closePopup(bool animated = true) {
+    if (P.kind == PK_NONE || P.closing) return;
+    if (P.dragVol) { P.dragVol = false; ReleaseCapture(); save(); }
+    P.closing = true;
+    P.close.set(0);
+    if (animated) P.close.go(1, 110, E_IN);
+    if (!P.close.active()) { if (P.hwnd) ShowWindow(P.hwnd, SW_HIDE); P.kind = PK_NONE; P.closing = false; }
+    else kickAnim();
+    if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void popupActivate(int idx) {
+    if (P.kind == PK_LIST) { int dd = P.dd; closePopup(); if (idx >= 0 && idx < ddCount(dd)) ddSet(dd, idx); }
+    else if (P.kind == PK_SOURCE) {
+        if (idx < 0 || idx >= (int)P.rows.size() || P.rows[idx].kind > SR_WIN) return;
+        SrcRow r = P.rows[idx];
+        closePopup();
+        selectSource(r);
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void popupType(const std::wstring& s) {  // search box: typing goes here while the source list is open
+    if (P.kind != PK_SOURCE) return;
+    P.search = s;
+    float keepH = P.h;
+    buildSourceRows();
+    P.h = keepH;  // the card doesn't jump while filtering
+    P.scroll = 0;
+    auto sel = selectableRows();
+    P.kb = -1;
+    for (int i : sel) if (P.rows[i].kind == SR_WIN) { P.kb = i; break; }
+    renderPopup();
+}
+void popupKey(UINT vk) {
+    if (P.kind == PK_LIST || P.kind == PK_SOURCE) {
+        auto sel = selectableRows();
+        if (sel.empty()) return;
+        int pos = -1;
+        for (size_t i = 0; i < sel.size(); ++i) if (sel[i] == P.kb) pos = (int)i;
+        if (vk == VK_DOWN) pos = pos < 0 ? 0 : std::min((int)sel.size() - 1, pos + 1);
+        else if (vk == VK_UP) pos = pos < 0 ? 0 : std::max(0, pos - 1);
+        else if (vk == VK_RETURN) { if (pos >= 0) popupActivate(sel[pos]); return; }
+        else return;
+        P.kb = sel[pos];
+        // keep it visible
+        float ry = 0, rh = 32;
+        if (P.kind == PK_LIST) ry = 4 + P.kb * 32.f; else { ry = P.rows[P.kb].y; rh = P.rows[P.kb].h; }
+        if (ry < P.scroll) P.scroll = ry - 4;
+        if (ry + rh > P.scroll + P.h) P.scroll = ry + rh - P.h + 4;
+        P.scroll = std::max(0.f, std::min(P.scroll, P.contentH - P.h));
+        renderPopup();
+    }
+}
+void setMicVolume(int v, bool persist) {
+    v = std::max(0, std::min(200, v));
+    g.s.micVolume = v; applyAudioFx();
+    if (persist) save();
+    if (P.kind == PK_MIC) renderPopup();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void toggleMic();
+void popupClick(int id, float x) {
+    if (id == P_MUTE) { toggleMic(); renderPopup(); return; }
+    if (id == P_SL_VOL) return;  // handled as a drag
+    int idx = popupIndexOf(id);
+    if (idx >= 0) popupActivate(idx);
+    (void)x;
+}
+// ---------- widgets ----------
+void focusRing(gp::Graphics& gr, RF r, float rad, int id) {
+    if (g_kbUsed && g_focus == id) strokeRR(gr, inflate(r, 3), rad + 3, C(T_TEXT2, 200), 1.5f);
+}
+float chevronAngle(int id) {
+    if (P.kind == PK_NONE || P.dd != id) return 0;
+    return P.closing ? 180.f * (1.f - (float)ease(E_IN, P.close.progress())) : 180.f * P.open.value();
+}
+bool popupOpenFor(int id) { return P.kind != PK_NONE && !P.closing && P.dd == id; }
+void ddField(gp::Graphics& gr, RF r, int id, const std::wstring& t, int glyph = -1, HICON wicon = nullptr) {
+    bool dis = locked(id), open = popupOpenFor(id);
+    float hv = dis ? 0.f : hovA(id);
+    fillRR(gr, r, 6, mix(T_INPUT, T_INPUT_H, open ? 1.f : hv));
+    strokeRR(gr, r, 6, open || (g_kbUsed && g_focus == id) ? C(T_ACC) : WA(A_DEFAULT));
+    float x = r.X + 12, cy = r.Y + r.Height / 2;
+    if (wicon) { drawWinIcon(gr, wicon, x, cy - 8, 16); x += 26; }
+    else if (glyph >= 0) { icon(gr, glyph, x, cy - 8, 16, C(dis ? T_DIS : T_TEXT2)); x += 26; }
+    txt(gr, t, RF(x, r.Y, r.X + r.Width - 36 - x, r.Height), F.body, C(dis ? T_DIS : T_TEXT));
+    icon(gr, G_CHEVRON, r.X + r.Width - 28, cy - 8, 16, C(dis ? T_DIS : T_TEXT2), chevronAngle(id));
+    addReg(r, id);
+}
+void toggleW(gp::Graphics& gr, float x, float cy, int id, bool on) {
+    RF r(x, cy - 10, 36, 20);
+    auto it = g_tog.find(id);
+    if (it == g_tog.end()) { g_tog[id].set(on ? 1.f : 0.f); it = g_tog.find(id); }
+    else if (it->second.to != (on ? 1.f : 0.f)) it->second.go(on ? 1.f : 0.f, 140, E_STD);
+    float k = it->second.value();
+    bool dis = locked(id);
+    fillRR(gr, r, 10, mix(T_ELEV, T_ACC, k));
+    if (k < 0.99f) strokeRR(gr, r, 10, WA((int)(A_STRONG * (1 - k))));
+    fillCircle(gr, x + 10 + 16 * k, cy, 7, dis ? C(T_TEXT2) : C(0xFFFFFF));
+    if (hovA(id) > 0 && !dis) fillRR(gr, r, 10, WA((int)(A_HOVER * hovA(id))));
+    focusRing(gr, r, 10, id);
+    addReg(inflate(r, 4), id);
+}
+void sliderW(gp::Graphics& gr, float x, float cy, float w, int id, float frac, bool dis = false) {
+    frac = std::max(0.f, std::min(1.f, frac));
+    fillRR(gr, RF(x, cy - 2, w, 4), 2, C(T_TRACK));
+    fillRR(gr, RF(x, cy - 2, w * frac, 4), 2, C(dis ? T_DIS : T_ACC));
+    float kx = x + w * frac;
+    float hv = std::max(hovA(id), g_drag == id || (P.dragVol && id == P_SL_VOL) ? 1.f : 0.f);
+    if (hv > 0) fillCircle(gr, kx, cy, 12, WA((int)(A_SUBTLE * hv)));
+    fillCircle(gr, kx, cy, 7, C(dis ? T_TEXT2 : 0xFFFFFF));
+    if (g_kbUsed && g_focus == id) { gp::Pen p(C(T_TEXT2, 200), 1.5f); gr.DrawEllipse(&p, kx - 10, cy - 10, 20.f, 20.f); }
+}
+// Level meter: 4 px segments, 2 px gap (tokens meterSegW/Gap); green, the top 15 % amber.
+void meterW(gp::Graphics& gr, float x, float y, float w, float h, float level, bool on) {
+    int n = (int)((w + 2) / 6);
+    int lit = on ? (int)std::lround(level * n) : 0;
+    for (int i = 0; i < n; ++i) {
+        gp::Color c = i < lit ? (i >= (int)(n * 0.85f) ? C(T_WARN) : C(T_OK)) : WA(A_SUBTLE);
+        gp::SolidBrush b(c);
+        gr.FillRectangle(&b, x + i * 6.f, y, 4.f, h);
+    }
+    g_meterRects.push_back(RF(x - 1, y - 1, w + 2, h + 2));
+}
+void buttonBg(gp::Graphics& gr, RF r, float rad, int id, unsigned bg, gp::Color border, bool dis = false) {
+    fillRR(gr, r, rad, C(bg));
+    if (!dis) {
+        float hv = hovA(id);
+        if (hv > 0) fillRR(gr, r, rad, WA((int)(A_HOVER * hv)));
+        if (g.pressed == id && g.hover == id) fillRR(gr, r, rad, WA(A_PRESSED));
+    }
+    strokeRR(gr, r, rad, border);
+    focusRing(gr, r, rad, id);
+}
+
+// ---------- title bar ----------
+RF tbBtn(float W, int k) { return RF(W - 138 + 46.f * k, 0, 46, 40); }  // 0 min, 1 max, 2 close
+void paintTitleBar(gp::Graphics& gr, float W) {
+    gp::SolidBrush bg(C(T_BG)); gr.FillRectangle(&bg, 0.f, 0.f, W, 40.f);
+    if (g.icoSmall) {  // app icon (dark tile, white C, red dot): the .ico, via GDI
+        gp::Bitmap* b = nullptr;
+        static gp::Bitmap* appIco = nullptr;
+        if (!appIco) {
+            HICON big = (HICON)LoadImageW(g.inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 32, 32, 0);
+            appIco = winIcon(big ? big : g.icoSmall);
+        }
+        b = appIco;
+        if (b) { gr.SetInterpolationMode(gp::InterpolationModeHighQualityBicubic); gr.DrawImage(b, RF(14, 12, 16, 16)); }
+    }
+    txt(gr, L"Cast Recorder", RF(40, 0, 104, 40), F.title, C(T_TEXT), AL_L, false);
+    const wchar_t* tabs[2] = {L"Record", L"Settings"};
+    const float tx[2] = {150, 222}, tw[2] = {68, 80};
+    for (int i = 0; i < 2; ++i) {
+        RF r(tx[i], 7, tw[i], 26);
+        int id = i ? H_TAB_SET : H_TAB_REC;
+        bool act = g_viewIdx == i;
+        if (act) fillRR(gr, r, 6, C(T_ELEV));
+        else if (hovA(id) > 0) fillRR(gr, r, 6, WA((int)(A_HOVER * hovA(id))));
+        txt(gr, tabs[i], r, act ? F.btn : F.body, C(act ? T_TEXT : (hovA(id) > 0.5f ? T_TEXT2 : T_MUTED)), AL_C, false);
+        focusRing(gr, r, 6, id);
+        addReg(r, id);
+    }
+    const int ids[3] = {H_MIN, H_MAX, H_CLOSE};
+    const bool zoomed = g.hwnd && IsZoomed(g.hwnd);
+    const int glyphs[3] = {G_MINIMIZE, zoomed ? G_RESTORE : G_MAXIMIZE, G_CLOSE};
+    for (int k = 0; k < 3; ++k) {
+        RF r = tbBtn(W, k);
+        float hv = hovA(ids[k]);
+        if (hv > 0) { gp::SolidBrush hb(k == 2 ? C(T_CLOSEH, (int)(255 * hv)) : WA((int)(A_SUBTLE * hv))); gr.FillRectangle(&hb, r); }
+        icon(gr, glyphs[k], r.X + 15, 12, 16, k == 2 && hv > 0.5f ? C(0xFFFFFF) : C(T_TEXT));
+        addReg(r, ids[k]);
     }
 }
 
-// ---------- layout ----------
-struct Layout { RECT title, preview, panel, hk, bar, record, pause; };
-Layout layout(RECT c) {
-    Layout L{};
-    const int pad = S(PAD), gap = S(GAP);
-    L.title = {0, 0, c.right, S(TB_H)};
-    L.bar = {pad, c.bottom - pad - S(BAR_H) + S(8), c.right - pad, c.bottom - pad};
-    L.hk = {pad, L.bar.top - gap / 2 - S(HK_H), c.right - pad, L.bar.top - gap / 2};
-    int top = L.title.bottom + pad, bottom = L.hk.top - gap;
-    int panelW = S(PANEL_W);
-    L.panel = {c.right - pad - panelW, top, c.right - pad, bottom};
-    L.preview = {pad, top, L.panel.left - gap, bottom};
-    int bh = S(40), bw = S(120);
-    L.record = {L.bar.right - bw, L.bar.top + (L.bar.bottom - L.bar.top - bh) / 2, L.bar.right, 0};
-    L.record.bottom = L.record.top + bh;
-    L.pause = {L.record.left - S(12) - S(104), L.record.top, L.record.left - S(12), L.record.bottom};
+// ---------- Record view ----------
+struct RecLayout { RF src, fps, qual, preview, surf, mic, micIcon, sys, pause, record, status; };
+RecLayout recLayout(float W, float H) {
+    RecLayout L;
+    L.src = RF(20, 56, 360, 36);
+    L.qual = RF(W - 20 - 110, 56, 110, 36);
+    L.fps = RF(L.qual.X - 8 - 104, 56, 104, 36);
+    L.preview = RF(20, 104, W - 40, H - 204);
+    RF in(L.preview.X + 12, L.preview.Y + 12, L.preview.Width - 24, L.preview.Height - 24);
+    float sw = in.Width, sh = sw * 9 / 16;
+    if (sh > in.Height) { sh = in.Height; sw = sh * 16 / 9; }
+    L.surf = RF(std::floor(in.X + (in.Width - sw) / 2), std::floor(in.Y + (in.Height - sh) / 2), std::floor(sw), std::floor(sh));
+    float cy = H - 52;
+    L.mic = RF(std::floor(W / 2 - 130), cy - 20, 136, 40);
+    L.micIcon = RF(L.mic.X, L.mic.Y, 34, 40);
+    L.sys = RF(L.mic.X + 148, cy - 20, 136, 40);
+    L.record = RF(W - 20 - 122, cy - 22, 122, 44);
+    L.pause = RF(L.record.X - 10 - 44, cy - 22, 44, 44);
+    L.status = RF(20, cy - 14, L.mic.X - 40, 28);
     return L;
 }
+RECT toPx(RF r) { float s = scale(); return RECT{(LONG)std::floor(r.X * s), (LONG)std::floor(r.Y * s), (LONG)std::ceil((r.X + r.Width) * s), (LONG)std::ceil((r.Y + r.Height) * s)}; }
+float clientW() { RECT c{}; if (g.hwnd) GetClientRect(g.hwnd, &c); else c.right = (LONG)(1100 * scale()); return c.right / scale(); }
+float clientH() { RECT c{}; if (g.hwnd) GetClientRect(g.hwnd, &c); else c.bottom = (LONG)(700 * scale()); return c.bottom / scale(); }
+RECT previewRectNow() { return toPx(recLayout(clientW(), clientH()).surf); }
 
-void dropdown(HDC dc, RECT r, int id) {
-    bool locked = ddLocked(id), open = g.openDrop == id, hov = g.hover == id && !locked;
-    round(dc, r, hov || open ? C_INPUT_H : C_INPUT, open ? C_ACCENT : kbFocused(id) ? C_BORDER_STRONG : C_BORDER, 6);
-    RECT t{r.left + S(10), r.top, r.right - S(34), r.bottom};  // clear of the arrow at any DPI
-    text(dc, ddItem(id, ddSel(id)), t, g.fBody, locked ? C_DISABLED : C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    chevron(dc, r.right - S(14), (r.top + r.bottom) / 2, locked ? C_DISABLED : C_TEXT2);
-    addRegion(r, id);
-    if (open) g.dropRc = r;
+void paintLiveChip(gp::Graphics& gr, float x, float y) {
+    std::wstring t = L"Live preview";
+    float w = txtW(gr, t, F.caption) + 30;
+    fillRR(gr, RF(x, y, w, 22), 11, C(T_PREV, 235));
+    strokeRR(gr, RF(x, y, w, 22), 11, WA(A_SUBTLE));
+    fillCircle(gr, x + 12, y + 11, 3.5f, C(g.gprev.live() || g.prevLive || g_renderOnly ? T_OK : T_MUTED));
+    txt(gr, t, RF(x + 21, y, w - 24, 22), F.caption, C(T_TEXT2), AL_L, false);
 }
-
-void paintTitle(HDC dc, const Layout& L) {
-    fill(dc, L.title, C_BG);
-    DrawIconEx(dc, S(12), S(12), g.icoSmall, S(16), S(16), 0, nullptr, DI_NORMAL);
-    text(dc, L"Cast Recorder", RECT{S(36), 0, L.title.right - S(190), L.title.bottom}, g.fTitle, C_TEXT);
-    RECT rmin{L.title.right - S(138), 0, L.title.right - S(92), S(TB_H)}, rmax{L.title.right - S(92), 0, L.title.right - S(46), S(TB_H)},
-         rclose{L.title.right - S(46), 0, L.title.right, S(TB_H)};
-    RECT rlog{L.title.right - S(184), 0, L.title.right - S(138), S(TB_H)};
-    if (g.hover == H_LOG) fill(dc, rlog, C_TB_HOVER);
-    text(dc, L"Log", rlog, g.fBody, g.hover == H_LOG ? C_TEXT : C_MUTED, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    addRegion(rlog, H_LOG);
-    if (g.hover == H_MIN) fill(dc, rmin, C_TB_HOVER);
-    if (g.hover == H_MAX) fill(dc, rmax, C_TB_HOVER);
-    {
-        int ax = (rmax.left + rmax.right) / 2, ay = (rmax.top + rmax.bottom) / 2, k2 = S(5);
-        bool zoomed = g.hwnd && IsZoomed(g.hwnd);
-        if (zoomed) {
-            ring(dc, RECT{ax - k2 + S(2), ay - k2 - S(1), ax + k2 + S(2), ay + k2 - S(1)}, C_TEXT2, 1, 1);
-            fill(dc, RECT{ax - k2, ay - k2 + S(1), ax + k2, ay + k2 + S(1)}, g.hover == H_MAX ? C_TB_HOVER : C_BG);
-        }
-        ring(dc, RECT{ax - k2, ay - k2 + (zoomed ? S(1) : 0), ax + k2, ay + k2 + (zoomed ? S(1) : 0)}, C_TEXT, 1, 1);
-        addRegion(rmax, H_MAX);
-    }
-    if (g.hover == H_CLOSE) fill(dc, rclose, C_CLOSE_H);
-    int mx = (rmin.left + rmin.right) / 2, my = (rmin.top + rmin.bottom) / 2;
-    line(dc, mx - S(5), my, mx + S(5), my, C_TEXT, 1);
-    int cx = (rclose.left + rclose.right) / 2, cy = (rclose.top + rclose.bottom) / 2, k = S(5);
-    COLORREF xc = g.hover == H_CLOSE ? RGB(255, 255, 255) : C_TEXT;
-    line(dc, cx - k, cy - k, cx + k + 1, cy + k + 1, xc, 1);
-    line(dc, cx + k, cy - k, cx - k - 1, cy + k + 1, xc, 1);
-    addRegion(rmin, H_MIN);
-    addRegion(rclose, H_CLOSE);
+std::wstring sizeFpsText() { int w, h; sourceSize(w, h); return (w ? dims(w, h) + L" \u00b7 " : L"") + std::to_wstring(g.s.fps) + L" fps"; }
+void paintSizeChip(gp::Graphics& gr, RF r) {  // right-aligned muted text with a soft backing for legibility on live content
+    std::wstring t = sizeFpsText();
+    float w = txtW(gr, t, F.caption) + 16;
+    fillRR(gr, RF(r.X + r.Width - w, r.Y, w, 22), 11, gp::Color(110, 10, 12, 15));
+    txt(gr, t, RF(r.X + r.Width - w, r.Y, w - 8, 22), F.caption, C(T_TEXT2), AL_R, false);
 }
-
-RECT previewSurf(const Layout& L) {
-    RECT in{L.preview.left + S(8), L.preview.top + S(8), L.preview.right - S(8), L.preview.bottom - S(8)};
-    int iw = in.right - in.left, ih = in.bottom - in.top;
-    int sw = iw, sh = iw * 9 / 16;
-    if (sh > ih) { sh = ih; sw = ih * 16 / 9; }
-    RECT surf{in.left + (iw - sw) / 2, in.top + (ih - sh) / 2, 0, 0};
-    surf.right = surf.left + sw; surf.bottom = surf.top + sh;
-    return surf;
-}
-RECT previewRectNow() { RECT c{}; GetClientRect(g.hwnd, &c); return previewSurf(layout(c)); }
-
-void paintPreview(HDC dc, const Layout& L) {
-    bool rec = g.rec.running(), paused = g.rec.isPaused();
-    round(dc, L.preview, C_PREVIEW, C_BORDER, 8);
-    // 16:9 surface letterboxed inside with an 8px inset
-    RECT in{L.preview.left + S(8), L.preview.top + S(8), L.preview.right - S(8), L.preview.bottom - S(8)};
-    int iw = in.right - in.left, ih = in.bottom - in.top;
-    int sw = iw, sh = iw * 9 / 16;
-    if (sh > ih) { sh = ih; sw = ih * 16 / 9; }
-    RECT surf{in.left + (iw - sw) / 2, in.top + (ih - sh) / 2, 0, 0};
-    surf.right = surf.left + sw; surf.bottom = surf.top + sh;
-    fill(dc, surf, C_INPUT);
+void paintPreviewFallback(gp::Graphics& gr, RF s) {
+    fillRR(gr, s, 4, C(0x1A1F27));
     if (g.prevBmp) {
-        HDC mem = CreateCompatibleDC(dc);
-        HGDIOBJ old = SelectObject(mem, g.prevBmp);
-        SetStretchBltMode(dc, HALFTONE);
-        SetBrushOrgEx(dc, 0, 0, nullptr);
-        StretchBlt(dc, surf.left, surf.top, sw, sh, mem, 0, 0, g.prevW, g.prevH, SRCCOPY);
-        SelectObject(mem, old); DeleteDC(mem);
+        gp::Bitmap b(g.prevBmp, nullptr);
+        gr.SetInterpolationMode(gp::InterpolationModeHighQualityBilinear);
+        float bw = (float)b.GetWidth(), bh = (float)b.GetHeight();
+        float k = std::min(s.Width / bw, s.Height / bh);
+        gr.DrawImage(&b, RF(s.X + (s.Width - bw * k) / 2, s.Y + (s.Height - bh * k) / 2, bw * k, bh * k));
     } else {
-        for (int x = surf.left + S(24); x < surf.right; x += S(24)) line(dc, x, surf.top, x, surf.bottom, C_GRID, 1);
-        for (int y = surf.top + S(24); y < surf.bottom; y += S(24)) line(dc, surf.left, y, surf.right, y, C_GRID, 1);
-        RECT win{surf.left + sw / 5, surf.top + sh / 5, surf.right - sw / 4, surf.bottom - sh / 4};
-        round(dc, win, C_ELEV, C_BORDER, 6);
-        text(dc, L"Waiting for capture\u2026", surf, g.fBody, C_MUTED, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
-    if (rec) {  // dim + freeze while recording so the preview never competes with the game/encoder
-        ring(dc, L.preview, C_ACCENT, 8, S(2));
-    }
-    // caption chip
-    std::wstring cap = rec ? (paused ? L"Preview paused" : L"Preview paused while recording") : L"Live preview";
-    int cw = textW(dc, cap, g.fSmall) + S(28);
-    RECT chip{surf.left + S(8), surf.top + S(8), surf.left + S(8) + cw, surf.top + S(30)};
-    round(dc, chip, C_PREVIEW, C_BORDER_S, 11);
-    dot(dc, chip.left + S(11), (chip.top + chip.bottom) / 2, S(3), rec ? C_MUTED : (g.prevLive ? C_OK : C_MUTED));
-    text(dc, cap, RECT{chip.left + S(20), chip.top, chip.right - S(6), chip.bottom}, g.fSmall, C_TEXT2);
-    if (rec) {  // REC / PAUSED badge top-right
-        std::wstring b = paused ? L"PAUSED" : L"REC";
-        int bw = textW(dc, b, g.fSection) + S(26);
-        RECT badge{surf.right - S(8) - bw, surf.top + S(8), surf.right - S(8), surf.top + S(30)};
-        round(dc, badge, paused ? hex(0x3A2A0A) : C_ACCENT, paused ? C_WARN : C_ACCENT, 11);
-        dot(dc, badge.left + S(11), (badge.top + badge.bottom) / 2, S(3), paused ? C_WARN : RGB(255, 255, 255));
-        text(dc, b, RECT{badge.left + S(19), badge.top, badge.right - S(6), badge.bottom}, g.fSection, paused ? C_WARN : RGB(255, 255, 255));
+        gp::SolidBrush gb(WA(0x08));
+        for (float x = s.X + 24; x < s.X + s.Width; x += 24) gr.FillRectangle(&gb, x, s.Y, 1.f, s.Height);
+        for (float y = s.Y + 24; y < s.Y + s.Height; y += 24) gr.FillRectangle(&gb, s.X, y, s.Width, 1.f);
+        txt(gr, L"Waiting for capture\u2026", s, F.body, C(T_MUTED), AL_C);
     }
 }
-
-void paintPanel(HDC dc, const Layout& L) {
-    round(dc, L.panel, C_SURFACE, C_BORDER_S, 8);
-    const int x = L.panel.left + S(16), right = L.panel.right - S(16);
-    const int labelW = S(96), ctrlX = x + labelW, rowH = S(32);
-    int avail = L.panel.bottom - L.panel.top - S(32);
-    // 9 control rows; compress the row gap on short windows
-    int gapY = (avail - 9 * rowH) / 9;
-    if (gapY > S(12)) gapY = S(12);
-    if (gapY < S(4)) gapY = S(4);
-    int y = L.panel.top + S(16);
-    auto section = [&](const wchar_t* t) { text(dc, t, RECT{x, y, right, y + S(14)}, g.fSection, C_MUTED); y += S(18); };
-    auto row = [&](const wchar_t* label, int id) {
-        text(dc, label, RECT{x, y, ctrlX - S(6), y + rowH}, g.fLabel, C_TEXT2);
-        dropdown(dc, RECT{ctrlX, y, right, y + rowH}, id);
-        y += rowH + gapY;
-    };
-    (void)section;
-    row(L"FPS", H_DD_FPS);
-    row(L"Quality", H_DD_QUAL);
-    row(L"Encoder", H_DD_ENC);
-    row(L"GPU", H_DD_GPU);
-    row(L"Resolution", H_DD_RES);
-    row(L"Container", H_DD_CONT);
-    row(L"System audio", H_DD_SYS);
-    row(L"Microphone", H_DD_MIC);
-    // Save folder: full-width path field (folder glyph + path) + Browse; the label column would clip it at 96 DPI.
-    RECT br{right - S(80), y, right, y + rowH};
-    RECT pf{x, y, br.left - S(8), y + rowH};
-    round(dc, pf, g.hover == H_PATH ? C_INPUT_H : C_INPUT, kbFocused(H_PATH) ? C_BORDER_STRONG : C_BORDER, 6);
-    {   // folder glyph
-        int gx = pf.left + S(10), gy = (pf.top + pf.bottom) / 2;
-        round(dc, RECT{gx, gy - S(4), gx + S(14), gy + S(6)}, C_TEXT2, C_TEXT2, 2);
-        fill(dc, RECT{gx, gy - S(6), gx + S(6), gy - S(3)}, C_TEXT2);
-    }
-    text(dc, outputDir(), RECT{pf.left + S(32), pf.top, pf.right - S(8), pf.bottom}, g.fSmall, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
-    addRegion(pf, H_PATH);  // click opens the folder
-    bool lock = g.rec.running();
-    round(dc, br, g.hover == H_BROWSE && !lock ? C_INPUT_H : C_ELEV, kbFocused(H_BROWSE) ? C_BORDER_STRONG : C_BORDER, 6);
-    text(dc, L"Browse…", br, g.fLabel, lock ? C_DISABLED : C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    addRegion(br, H_BROWSE);
+std::wstring timerText() {
+    int sec = g_fakeRec ? 83 : (int)g.rec.elapsedSeconds();
+    wchar_t tm[32]; swprintf(tm, 32, L"%02d:%02d:%02d", sec / 3600, sec / 60 % 60, sec % 60);
+    return tm;
 }
-
-void paintHotkeys(HDC dc, const Layout& L) {
-    round(dc, L.hk, C_SURFACE, C_BORDER_S, 8);
-    const wchar_t* labels[3] = {L"Start / Stop", L"Pause", L"Mic mute"};
-    const Hotkey* hks[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
-    const int inner = L.hk.right - L.hk.left - S(32), colGap = S(16);
-    int colW = (inner - 2 * colGap) / 3;
-    int y0 = L.hk.top + S(8), y1 = L.hk.bottom - S(8);
-    for (int i = 0; i < 3; ++i) {
-        int cx = L.hk.left + S(16) + i * (colW + colGap);
-        int lw = textW(dc, labels[i], g.fLabel) + S(10);
-        text(dc, labels[i], RECT{cx, y0, cx + lw, y1}, g.fLabel, C_TEXT2);
-        RECT f{cx + lw, y0, cx + colW, y1};
-        bool lockedHk = g.rec.running();
-        bool focus = g.capturing == i, hv = g.hover == H_HK0 + i && !lockedHk;
-        COLORREF bc = focus ? C_ACCENT : g.hkMsgColor[i] == C_ERR ? C_ERR : g.hkMsgColor[i] == C_WARN ? C_WARN
-                    : (kbFocused(H_HK0 + i) || hv) ? C_BORDER_STRONG : C_BORDER;
-        round(dc, f, focus ? C_INPUT_H : C_INPUT, bc, 6);
-        std::wstring t; COLORREF tc = C_TEXT;
-        if (focus) { t = g.liveMods ? modsText(g.liveMods) + L"\u2026" : L"Press a key\u2026"; tc = g.liveMods ? C_TEXT : C_MUTED; }
-        else if (hks[i]->empty()) { t = L"Not set"; tc = C_MUTED; }
-        else t = W(format(*hks[i]));
-        if (lockedHk && !focus) tc = C_DISABLED;
-        text(dc, t, f, g.fMono, tc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        addRegion(f, H_HK0 + i);
-    }
-}
-
-void paintBar(HDC dc, const Layout& L) {
+void paintRecordView(gp::Graphics& gr, float W, float H) {
+    RecLayout L = recLayout(W, H);
+    bool active = uiActive(), paused = uiPaused();
     RecState st = g.rec.state();
-    bool active = g.rec.isActive(), paused = g.rec.isPaused();
-    bool finishing = st == RecState::Stopping || st == RecState::Finishing;
-    int y0 = L.bar.top, y1 = L.bar.bottom;
-    int x = L.bar.left;
-    if (active) {
-        dot(dc, x + S(5), (y0 + y1) / 2, S(5), paused ? C_WARN : C_ACCENT);
-        x += S(18);
-        std::wstring lbl = paused ? L"Paused" : L"Recording\u2026";
-        text(dc, lbl, RECT{x, y0, x + S(120), y1}, g.fBtn, paused ? C_WARN : C_ACCENT_B);
-        x += textW(dc, lbl, g.fBtn) + S(12);
-        int sec = (int)g.rec.elapsedSeconds();
-        wchar_t tm[32]; swprintf(tm, 32, L"%02d:%02d:%02d", sec / 3600, sec / 60 % 60, sec % 60);
-        text(dc, tm, RECT{x, y0, x + S(100), y1}, g.fTimer, C_TEXT);
-    } else {
-        std::wstring s = finishing ? L"Finishing file\u2026" : (g.status.empty() ? L"Ready" : g.status);
-        text(dc, s, RECT{x, y0, L.record.left - S(64), y1}, g.fLabel, finishing ? C_TEXT2 : g.statusColor,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
-    // Mic mute toggle (always visible): red with a slash when muted, dim when the mic is off.
+    bool finishing = !g_fakeRec && (st == RecState::Stopping || st == RecState::Finishing);
+    // toolbar
+    int glyph = g.target.kind == CaptureTarget::AllDisplays ? G_FULLSCREEN : g.target.kind == CaptureTarget::Monitor ? G_MONITOR : G_WINDOW;
+    ddField(gr, L.src, H_SRC, sourceText(), glyph, g.target.kind == CaptureTarget::Window ? g_srcIcon : nullptr);
+    focusRing(gr, L.src, 6, H_SRC);
+    ddField(gr, L.fps, H_DD_FPS, ddItem(H_DD_FPS, ddSel(H_DD_FPS)));
+    focusRing(gr, L.fps, 6, H_DD_FPS);
+    ddField(gr, L.qual, H_DD_QUAL, ddItem(H_DD_QUAL, ddSel(H_DD_QUAL)));
+    focusRing(gr, L.qual, 6, H_DD_QUAL);
+    // preview
+    card(gr, L.preview, 10, C(T_PREV), WA(A_SUBTLE));
+    if (!g.gprev.live()) paintPreviewFallback(gr, L.surf);
+    else { gp::SolidBrush b(C(0x000000)); gr.FillRectangle(&b, L.surf); }
+    if (active) strokeRR(gr, L.preview, 10, C(T_ACC), 2.f);
+    paintLiveChip(gr, L.surf.X + 12, L.surf.Y + 12);
+    paintSizeChip(gr, RF(L.surf.X + 12, L.surf.Y + 12, L.surf.Width - 24, 22));
+    // status (left)
     {
-        RECT m{L.pause.left - S(12) - S(40), L.record.top, L.pause.left - S(12), L.record.bottom};
-        if (!active) { m.right = L.record.left - S(12); m.left = m.right - S(40); }
-        bool hvm = g.hover == H_MIC, muted = g.micMuted, on = g.s.micEnabled;
-        round(dc, m, muted ? hex(0x3A1418) : hvm ? C_INPUT_H : C_ELEV, muted ? C_ACCENT : kbFocused(H_MIC) ? C_BORDER_STRONG : C_BORDER, 10);
-        COLORREF ic = !on ? C_DISABLED : muted ? C_ACCENT_B : C_TEXT;
-        int cx = (m.left + m.right) / 2, cy = (m.top + m.bottom) / 2;
-        round(dc, RECT{cx - S(4), cy - S(10), cx + S(4), cy + S(3)}, ic, ic, 8);
-        line(dc, cx - S(7), cy - S(1), cx - S(7), cy + S(1), ic, S(2));
-        line(dc, cx + S(7), cy - S(1), cx + S(7), cy + S(1), ic, S(2));
-        line(dc, cx - S(7), cy + S(1), cx, cy + S(7), ic, S(2));
-        line(dc, cx + S(7), cy + S(1), cx, cy + S(7), ic, S(2));
-        line(dc, cx, cy + S(7), cx, cy + S(10), ic, S(2));
-        if (muted || !on) line(dc, cx - S(9), cy - S(10), cx + S(9), cy + S(10), muted ? C_ACCENT_B : C_DISABLED, S(2));
-        addRegion(m, H_MIC);
-    }
-    // Pause / Resume (only while a session is active)
-    if (active) {
-        bool hv = g.hover == H_PAUSE;
-        round(dc, L.pause, hv ? C_INPUT_H : C_ELEV, C_BORDER, 10);
-        int cx = L.pause.left + S(20), cy = (L.pause.top + L.pause.bottom) / 2;
-        if (paused) {  // play triangle
-            POINT tri[3] = {{cx - S(4), cy - S(6)}, {cx - S(4), cy + S(6)}, {cx + S(6), cy}};
-            HBRUSH b = CreateSolidBrush(C_TEXT); HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, GetStockObject(NULL_PEN));
-            Polygon(dc, tri, 3); SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b);
-        } else {
-            fill(dc, RECT{cx - S(5), cy - S(6), cx - S(1), cy + S(6)}, C_TEXT);
-            fill(dc, RECT{cx + S(2), cy - S(6), cx + S(6), cy + S(6)}, C_TEXT);
+        RF s = L.status;
+        unsigned dotc, tc; std::wstring t;
+        if (active) { dotc = paused ? T_WARN : T_ACC; tc = paused ? T_WARN : T_TEXT; t = (paused ? L"Paused  " : L"Recording  ") + timerText(); }
+        else if (finishing) { dotc = T_MUTED; tc = T_TEXT2; t = L"Finishing file\u2026"; }
+        else {
+            unsigned sc = fromRef(g.statusColor);
+            t = g.status.empty() ? L"Ready" : g.status;
+            bool err = sc == T_ERR;
+            dotc = err ? T_ERR : sc == T_WARN ? T_WARN : T_OK; tc = err ? T_ERR : sc == T_WARN ? T_WARN : (t == L"Ready" ? T_TEXT2 : sc);
         }
-        text(dc, paused ? L"Resume" : L"Pause", RECT{cx + S(12), L.pause.top, L.pause.right - S(8), L.pause.bottom}, g.fBtn, C_TEXT);
-        if (kbFocused(H_PAUSE)) { RECT fr{L.pause.left - S(3), L.pause.top - S(3), L.pause.right + S(3), L.pause.bottom + S(3)}; ring(dc, fr, C_TEXT2, 12, 1); }
-        addRegion(L.pause, H_PAUSE);
+        fillCircle(gr, s.X + 4, s.Y + s.Height / 2, 4, C(dotc));
+        float avail = s.Width - 16;
+        bool err = !active && !finishing && fromRef(g.statusColor) == T_ERR;
+        float linkW = err ? txtW(gr, L"Open log", F.status) + 14 : 0;
+        float tw = std::min(txtW(gr, t, F.status) + 2, avail - linkW);
+        txt(gr, t, RF(s.X + 16, s.Y, tw, s.Height), F.status, C(tc));
+        if (err) {
+            RF lr(s.X + 16 + tw + 10, s.Y + 4, linkW - 10, s.Height - 8);
+            txt(gr, L"Open log", lr, F.status, C(hovA(H_STATUSLOG) > 0.5f ? T_TEXT : T_ACC_B), AL_L, false);
+            hline(gr, lr.X, lr.X + lr.Width, lr.Y + lr.Height - 2, C(T_ACC_B, 160));
+            addReg(lr, H_STATUSLOG);
+        }
+        g_statusRect = s;
     }
-    // Record / Stop, drawn in code
-    RECT r = L.record;
-    bool hv = g.hover == H_RECORD, pr = g.pressed == H_RECORD;
-    int cy = (r.top + r.bottom) / 2;
-    if (active || finishing) {
-        round(dc, r, hv ? C_INPUT_H : C_ELEV, finishing ? C_BORDER : C_ACCENT, 10, S(2));
-        int sx = r.left + S(26);
-        fill(dc, RECT{sx - S(6), cy - S(6), sx + S(6), cy + S(6)}, finishing ? C_DISABLED : C_ACCENT);
-        text(dc, finishing ? L"Saving" : L"Stop", RECT{sx + S(12), r.top, r.right - S(10), r.bottom}, g.fBtn, finishing ? C_TEXT2 : C_TEXT);
+    // audio chips
+    {
+        bool micOn = g.s.micEnabled, muted = g.s.micMuted;
+        bool open = P.kind == PK_MIC && !P.closing;
+        RF m = L.mic;
+        fillRR(gr, m, 8, mix(T_SURF, T_INPUT_H, hovA(H_MICCHIP) * 0.8f));
+        strokeRR(gr, m, 8, open ? C(T_ACC) : WA(A_DEFAULT));
+        if (hovA(H_MICICON) > 0) fillRR(gr, RF(m.X + 4, m.Y + 4, 28, 32), 6, WA((int)(A_PRESSED * hovA(H_MICICON))));
+        icon(gr, muted ? G_MICMUTED : G_MIC, m.X + 10, m.Y + 12, 16, C(!micOn ? T_DIS : muted ? T_ACC_B : T_TEXT2));
+        meterW(gr, m.X + 38, m.Y + 17, m.Width - 38 - 14, 6, g_meter[0], micOn && !muted);
+        focusRing(gr, m, 8, H_MICCHIP);
+        addReg(m, H_MICCHIP);
+        addReg(L.micIcon, H_MICICON);
+        RF s = L.sys;
+        bool sysOn = g.s.systemAudio, smuted = g.s.systemMuted;
+        fillRR(gr, s, 8, mix(T_SURF, T_INPUT_H, hovA(H_SYSCHIP) * 0.8f));
+        strokeRR(gr, s, 8, WA(A_DEFAULT));
+        icon(gr, smuted ? G_SYSMUTED : G_SYS, s.X + 10, s.Y + 12, 16, C(!sysOn ? T_DIS : smuted ? T_ACC_B : T_TEXT2));
+        meterW(gr, s.X + 38, s.Y + 17, s.Width - 38 - 14, 6, g_meter[1], sysOn && !smuted);
+        focusRing(gr, s, 8, H_SYSCHIP);
+        addReg(s, H_SYSCHIP);
+    }
+    // Pause (disabled when idle; Paused shows the record glyph = resume)
+    {
+        bool dis = !active;
+        buttonBg(gr, L.pause, 10, H_PAUSE, T_ELEV, WA(A_DEFAULT), dis);
+        icon(gr, paused ? G_RECORD : G_PAUSE, L.pause.X + 14, L.pause.Y + 14, 16, C(dis ? T_DIS : paused ? T_ACC_B : T_TEXT));
+        addReg(L.pause, H_PAUSE);
+    }
+    // Record / Stop with the pulse (1200 ms loop, glow alpha .15 <-> .45)
+    {
+        RF r = L.record;
+        if (active || finishing) {
+            if (active && !paused) {
+                double ph = fmod(nowMs(), 1200.0) / 1200.0;
+                double tri = ph < 0.5 ? ph * 2 : 2 - ph * 2;
+                float a = 0.15f + 0.30f * (float)ease(E_INOUT, tri);
+                if (!animationsOn()) a = 0.3f;
+                for (int i = 6; i >= 1; --i) strokeRR(gr, inflate(r, (float)i), 10.f + i, C(T_ACC, (int)(255 * a * (7 - i) / 14.f)), 2.f);
+            }
+            buttonBg(gr, r, 10, H_RECORD, T_ELEV, finishing ? WA(A_DEFAULT) : C(T_ACC));
+            if (!finishing) strokeRR(gr, r, 10, C(T_ACC), 1.5f);
+            std::wstring t = finishing ? L"Saving" : L"Stop";
+            float tw = txtW(gr, t, F.btnP);
+            float x0 = r.X + (r.Width - (16 + 8 + tw)) / 2;
+            icon(gr, G_STOP, x0, r.Y + 14, 16, C(finishing ? T_DIS : T_ACC));
+            txt(gr, t, RF(x0 + 24, r.Y, tw + 4, r.Height), F.btnP, C(finishing ? T_TEXT2 : T_TEXT), AL_L, false);
+        } else {
+            float hv = hovA(H_RECORD);
+            bool pr = g.pressed == H_RECORD && g.hover == H_RECORD;
+            gp::Color bg = pr ? C(T_ACC_P) : mix(T_ACC, T_ACC_H, hv);
+            fillRR(gr, r, 10, bg);
+            std::wstring t = L"Record";
+            float tw = txtW(gr, t, F.btnP);
+            float x0 = r.X + (r.Width - (16 + 8 + tw)) / 2;
+            icon(gr, G_RECORD, x0, r.Y + 14, 16, C(0xFFFFFF));
+            txt(gr, t, RF(x0 + 24, r.Y, tw + 4, r.Height), F.btnP, C(0xFFFFFF), AL_L, false);
+            focusRing(gr, r, 10, H_RECORD);
+        }
+        addReg(r, H_RECORD);
+        g_recordRect = inflate(r, 8);
+    }
+}
+
+// ---------- Settings view ----------
+void cardTitle(gp::Graphics& gr, RF c, const wchar_t* t) { txt(gr, t, RF(c.X + 20, c.Y + 14, c.Width - 40, 18), F.section, C(T_MUTED), AL_L, false); }
+void label(gp::Graphics& gr, const wchar_t* t, float x, float cy, bool dis = false) { txt(gr, t, RF(x, cy - 12, 180, 24), F.label, C(dis ? T_DIS : T_TEXT2), AL_L, false); }
+void hotkeyField(gp::Graphics& gr, RF r, int id, int idx, const Hotkey& hk, bool dimmed = false) {
+    bool cap = g.capturing == idx, dis = locked(id);
+    fillRR(gr, r, 6, mix(T_INPUT, T_INPUT_H, cap ? 1.f : dis ? 0.f : hovA(id)));
+    COLORREF mc = idx < 3 ? g.hkMsgColor[idx] : 0;
+    bool bad = idx < 3 && fromRef(mc) == T_ERR && !cap;
+    strokeRR(gr, r, 6, cap ? C(T_ACC) : bad ? C(T_ERR) : WA(A_DEFAULT));
+    std::wstring t; unsigned tc = T_TEXT;
+    if (cap) { t = g.liveMods ? modsText(g.liveMods) + L"\u2026" : L"Press a key\u2026"; tc = T_MUTED; }
+    else if (hk.empty()) { t = L"Not set"; tc = T_MUTED; }
+    else t = hkText(hk);
+    if ((dis || dimmed) && !cap) tc = T_DIS;
+    txt(gr, t, r, F.hotkey, C(tc), AL_C);
+    if (bad && idx < 3 && !g.hkMsg[idx].empty()) { /* the reason shows as the field's tooltip-like suffix */ }
+    focusRing(gr, r, 6, id);
+    addReg(r, id);
+}
+void segmented(gp::Graphics& gr, float x, float cy) {
+    RF r(x, cy - 16, 160, 32);
+    fillRR(gr, r, 7, C(T_BG));
+    strokeRR(gr, r, 7, WA(A_DEFAULT));
+    float target = g.s.channels == 2 ? 1.f : 0.f;
+    if (g_chan.to != target) g_chan.go(target, 160, E_STD);
+    float k = g_chan.value();
+    RF th(x + 3 + k * 77, cy - 13, 77, 26);
+    fillRR(gr, th, 5, C(T_ELEV));
+    strokeRR(gr, th, 5, WA(A_SUBTLE));
+    bool dis = locked(H_CH_MONO);
+    txt(gr, L"Mono", RF(x + 3, cy - 13, 77, 26), g.s.channels == 1 ? F.btn : F.body, C(dis ? T_DIS : g.s.channels == 1 ? T_TEXT : T_TEXT2), AL_C, false);
+    txt(gr, L"Stereo", RF(x + 80, cy - 13, 77, 26), g.s.channels == 2 ? F.btn : F.body, C(dis ? T_DIS : g.s.channels == 2 ? T_TEXT : T_TEXT2), AL_C, false);
+    addReg(RF(x, cy - 16, 80, 32), H_CH_MONO);
+    addReg(RF(x + 80, cy - 16, 80, 32), H_CH_STEREO);
+    focusRing(gr, r, 7, H_CH_MONO);
+}
+void paintSettingsView(gp::Graphics& gr, float W, float H) {
+    (void)W; (void)H;
+    RF video(20, 60, 520, 244), hot(20, 316, 520, 170), out(20, 498, 520, 102), audio(560, 60, 520, 540);
+    for (RF c : {video, hot, out, audio}) card(gr, c, 10, C(T_SURF), WA(A_SUBTLE));
+    // Video
+    cardTitle(gr, video, L"VIDEO");
+    const wchar_t* vl[4] = {L"Encoder", L"GPU", L"Resolution", L"Container"};
+    const int vid[4] = {H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT};
+    for (int i = 0; i < 4; ++i) {
+        float top = 110.f + 46 * i;
+        label(gr, vl[i], 40, top + 16, locked(vid[i]));
+        RF f(180, top, 340, 32);
+        ddField(gr, f, vid[i], ddItem(vid[i], ddSel(vid[i])));
+        focusRing(gr, f, 6, vid[i]);
+    }
+    // Hotkeys
+    cardTitle(gr, hot, L"HOTKEYS");
+    const wchar_t* hl[3] = {L"Start / Stop", L"Pause", L"Mic mute"};
+    const Hotkey* hks[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
+    for (int i = 0; i < 3; ++i) {
+        float top = 362.f + 40 * i;
+        label(gr, hl[i], 40, top + 16);
+        hotkeyField(gr, RF(180, top, 340, 32), H_HK0 + i, i, *hks[i]);
+    }
+    // Output
+    cardTitle(gr, out, L"OUTPUT");
+    {
+        RF pf(40, 548, 282, 32);
+        fillRR(gr, pf, 6, mix(T_INPUT, T_INPUT_H, hovA(H_PATH)));
+        strokeRR(gr, pf, 6, WA(A_DEFAULT));
+        RF fi(pf.X + 4, pf.Y + 4, 28, 24);
+        if (hovA(H_FOLDERICON) > 0) fillRR(gr, fi, 4, WA((int)(A_PRESSED * hovA(H_FOLDERICON))));
+        icon(gr, G_FOLDER, pf.X + 10, pf.Y + 8, 16, C(T_TEXT2));
+        txt(gr, outputDir(), RF(pf.X + 36, pf.Y, pf.Width - 44, pf.Height), F.label, C(T_TEXT), AL_L, true, true);
+        focusRing(gr, pf, 6, H_PATH);
+        addReg(pf, H_PATH);
+        addReg(fi, H_FOLDERICON);
+        RF br(330, 548, 84, 32), lg(422, 548, 98, 32);
+        bool bdis = locked(H_BROWSE);
+        buttonBg(gr, br, 6, H_BROWSE, T_INPUT, WA(A_DEFAULT), bdis);
+        txt(gr, L"Browse", br, F.body, C(bdis ? T_DIS : T_TEXT), AL_C, false);
+        addReg(br, H_BROWSE);
+        buttonBg(gr, lg, 6, H_LOG, T_INPUT, WA(A_DEFAULT));
+        float lw = txtW(gr, L"Log", F.body);
+        float lx = lg.X + (lg.Width - (16 + 8 + lw)) / 2;
+        icon(gr, G_LOG, lx, lg.Y + 8, 16, C(T_TEXT2));
+        txt(gr, L"Log", RF(lx + 24, lg.Y, lw + 4, lg.Height), F.body, C(T_TEXT), AL_L, false);
+        addReg(lg, H_LOG);
+    }
+    // Audio (labels x+20, controls x+212)
+    cardTitle(gr, audio, L"AUDIO");
+    const float lx = 580, cx = 772;
+    label(gr, L"System audio", lx, 126);
+    toggleW(gr, cx - 52, 126, H_TG_SYS, g.s.systemAudio);
+    ddField(gr, RF(cx, 110, 288, 32), H_DD_SYSDEV, ddItem(H_DD_SYSDEV, ddSel(H_DD_SYSDEV)), g.s.systemMuted ? G_SYSMUTED : G_SYS);
+    focusRing(gr, RF(cx, 110, 288, 32), 6, H_DD_SYSDEV);
+    meterW(gr, cx, 150, 288, 4, g_meter[1], g.s.systemAudio && !g.s.systemMuted);
+    hline(gr, lx, 1060, 176, WA(A_SUBTLE));
+    label(gr, L"Microphone", lx, 210);
+    toggleW(gr, cx - 52, 210, H_TG_MIC, g.s.micEnabled);
+    ddField(gr, RF(cx, 194, 288, 32), H_DD_MICDEV, ddItem(H_DD_MICDEV, ddSel(H_DD_MICDEV)), g.s.micMuted ? G_MICMUTED : G_MIC);
+    focusRing(gr, RF(cx, 194, 288, 32), 6, H_DD_MICDEV);
+    meterW(gr, cx, 234, 288, 4, g_meter[0], g.s.micEnabled && !g.s.micMuted);
+    float y = 273;
+    label(gr, L"Volume", lx, y);
+    sliderW(gr, cx, y, 240, H_SL_VOL, g.s.micVolume / 200.f);
+    addReg(RF(cx - 10, y - 14, 260, 28), H_SL_VOL);
+    txt(gr, std::to_wstring(g.s.micVolume) + L"%", RF(cx + 256, y - 12, 50, 24), F.label, C(T_TEXT2), AL_L, false);
+    y += 48;
+    label(gr, L"Noise suppression", lx, y);
+    toggleW(gr, cx, y, H_TG_NS, g.s.noiseSuppression);
+    y += 48;
+    label(gr, L"Noise gate", lx, y);
+    sliderW(gr, cx, y, 240, H_SL_GATE, (g.s.noiseGateDb + 80) / 80.f);
+    addReg(RF(cx - 10, y - 14, 260, 28), H_SL_GATE);
+    txt(gr, g.s.noiseGateDb <= -80 ? std::wstring(L"Off") : std::to_wstring(g.s.noiseGateDb) + L" dB", RF(cx + 256, y - 12, 56, 24), F.label, C(T_TEXT2), AL_L, false);
+    y += 48;
+    label(gr, L"Monitoring", lx, y);
+    toggleW(gr, cx, y, H_TG_MON, g.s.monitoring);
+    y += 48;
+    label(gr, L"Push-to-talk", lx, y);
+    toggleW(gr, cx, y, H_TG_PTT, g.s.pushToTalk);
+    hotkeyField(gr, RF(cx + 52, y - 16, 140, 32), H_HKPTT, 3, g.s.pttKey, !g.s.pushToTalk);
+    y += 48;
+    label(gr, L"Channels", lx, y);
+    segmented(gr, cx, y);
+    txt(gr, L"Changes save automatically.", RF(20, 664 - 9 + (H - 700), 400, 18), F.caption, C(T_MUTED), AL_L, false);
+}
+
+// ---------- whole window ----------
+void paintView(gp::Graphics& gr, int view, float W, float H) {
+    if (view == 0) paintRecordView(gr, W, H); else paintSettingsView(gr, W, H);
+}
+void setupGraphics(gp::Graphics& gr, bool clearType) {
+    gr.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+    gr.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+    gr.SetTextRenderingHint(clearType ? gp::TextRenderingHintClearTypeGridFit : gp::TextRenderingHintAntiAliasGridFit);
+    gr.SetCompositingQuality(gp::CompositingQualityHighSpeed);
+}
+void paintAll(gp::Graphics& gr, float W, float H) {
+    g_regs.clear(); g_meterRects.clear();
+    gp::SolidBrush bg(C(T_BG)); gr.FillRectangle(&bg, -1.f, -1.f, W + 2, H + 2);
+    paintTitleBar(gr, W);
+    if (g_view.active()) {  // view switch: content fades in, translateX 8 -> 0
+        float e = g_view.value();
+        float s = scale();
+        int pw = (int)std::ceil(W * s), ph = (int)std::ceil(H * s);
+        gp::Bitmap off(pw, ph, PixelFormat32bppPARGB);
+        {
+            gp::Graphics og(&off); setupGraphics(og, false);
+            og.ScaleTransform(s, s);
+            gp::SolidBrush b2(C(T_BG)); og.FillRectangle(&b2, 0.f, 40.f, W, H);
+            paintView(og, g_viewIdx, W, H);
+        }
+        gp::ColorMatrix m = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, e, 0}, {0, 0, 0, 0, 1}}};
+        gp::ImageAttributes ia; ia.SetColorMatrix(&m);
+        float dx = 8 * (1 - e);
+        gr.DrawImage(&off, RF(dx, 40, W, H - 40), 0, 40 * s, (gp::REAL)pw, (gp::REAL)(ph - 40 * s), gp::UnitPixel, &ia);
     } else {
-        COLORREF bg = pr ? C_ACCENT_P : hv ? C_ACCENT_H : C_ACCENT;
-        round(dc, r, bg, bg, 10);
-        int dx = r.left + S(26);
-        dot(dc, dx, cy, S(6), RGB(255, 255, 255));
-        dot(dc, dx, cy, S(3), bg);
-        text(dc, L"Record", RECT{dx + S(14), r.top, r.right - S(10), r.bottom}, g.fBtn, RGB(255, 255, 255));
-    }
-    if (kbFocused(H_RECORD)) { RECT fr{r.left - S(3), r.top - S(3), r.right + S(3), r.bottom + S(3)}; ring(dc, fr, C_TEXT2, 12, 1); }
-    addRegion(r, H_RECORD);
-}
-
-void paintDropList(HDC dc, RECT client) {
-    if (g.openDrop == H_NONE) return;
-    int n = ddCount(g.openDrop), ih = S(30);
-    RECT r = g.dropRc;
-    RECT list{r.left, r.bottom + S(4), r.right, r.bottom + S(4) + n * ih + S(8)};
-    if (list.bottom > client.bottom - S(8)) { int h = list.bottom - list.top; list.bottom = r.top - S(4); list.top = list.bottom - h; }
-    round(dc, list, C_ELEV, C_BORDER_STRONG, 6);
-    addRegion(list, H_ITEM0 + 99);  // swallow clicks on padding
-    int sel = ddSel(g.openDrop);
-    for (int i = 0; i < n; ++i) {
-        RECT it{list.left + S(4), list.top + S(4) + i * ih, list.right - S(4), list.top + S(4) + (i + 1) * ih};
-        bool hv = g.hover == H_ITEM0 + i || g_dropKb == i;
-        if (hv) round(dc, it, C_INPUT_H, C_INPUT_H, 4);
-        if (i == sel) fill(dc, RECT{it.left + S(4), it.top + S(8), it.left + S(6), it.bottom - S(8)}, C_ACCENT);
-        text(dc, ddItem(g.openDrop, i), RECT{it.left + S(12), it.top, it.right - S(6), it.bottom}, g.fBody, i == sel ? C_TEXT : C_TEXT2,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        addRegion(it, H_ITEM0 + i);
+        paintView(gr, g_viewIdx, W, H);
     }
 }
-
-void paint(HDC dc, RECT client) {
-    g.regions.clear();
-    fill(dc, client, C_BG);
-    SetBkMode(dc, TRANSPARENT);
-    Layout L = layout(client);
-    paintTitle(dc, L);
-    paintPreview(dc, L);
-    paintPanel(dc, L);
-    paintHotkeys(dc, L);
-    paintBar(dc, L);
-    paintDropList(dc, client);  // last: overlays everything and its regions win hit-testing
+// ---------- popup painting ----------
+float popHov(int id) { auto it = P.hov.find(id); return it == P.hov.end() ? 0.f : it->second.value(); }
+void popReg(RF r, int id) { P.regs.push_back({r, id}); }
+void paintListRow(gp::Graphics& gr, RF r, int id, bool sel, bool kb) {
+    float hv = std::max(popHov(id), kb && g_kbUsed ? 1.f : 0.f);
+    if (sel) fillRR(gr, r, 6, C(T_ACC, 0x24));
+    else if (hv > 0) fillRR(gr, r, 6, C(T_LISTH, (int)(255 * hv)));
+    if (kb && !sel && hv <= 0) fillRR(gr, r, 6, C(T_LISTH));
+    if (sel) icon(gr, G_CHECK, r.X + r.Width - 28, r.Y + r.Height / 2 - 8, 16, C(T_ACC_B));
+}
+void paintPopupContent(gp::Graphics& gr) {
+    P.regs.clear();
+    const float w = P.w, h = P.h;
+    if (P.kind == PK_LIST) {
+        int n = ddCount(P.dd), sel = ddSel(P.dd);
+        for (int i = 0; i < n; ++i) {
+            RF r(4, 4 + i * 32.f - P.scroll, w - 8, 32);
+            if (r.Y + r.Height < 0 || r.Y > h) continue;
+            paintListRow(gr, r, P_BASE + i, i == sel, P.kb == i);
+            txt(gr, ddItem(P.dd, i), RF(r.X + 10, r.Y, r.Width - 46, r.Height), F.body, C(T_TEXT));
+            popReg(r, P_BASE + i);
+        }
+    } else if (P.kind == PK_SOURCE) {
+        for (size_t i = 0; i < P.rows.size(); ++i) {
+            const SrcRow& s = P.rows[i];
+            RF r(6, s.y - P.scroll, w - 12, s.h);
+            if (r.Y + r.Height < 0 || r.Y > h) continue;
+            int id = P_BASE + (int)i;
+            switch (s.kind) {
+                case SR_ALL: case SR_MON: case SR_WIN: {
+                    bool sel = rowSelected(s);
+                    paintListRow(gr, r, id, sel, P.kb == (int)i);
+                    if (s.kind == SR_WIN) drawWinIcon(gr, s.ic, r.X + 10, r.Y + r.Height / 2 - 8, 16);
+                    else icon(gr, s.kind == SR_ALL ? G_FULLSCREEN : G_MONITOR, r.X + 10, r.Y + r.Height / 2 - 8, 16, C(T_TEXT2));
+                    float rw = s.right.empty() ? 0 : txtW(gr, s.right, F.label) + 4;
+                    float rx = r.X + r.Width - (sel ? 36 : 12) - rw;
+                    txt(gr, s.label, RF(r.X + 36, r.Y, rx - r.X - 44, r.Height), F.body, C(T_TEXT));
+                    if (rw > 0) txt(gr, s.right, RF(rx, r.Y, rw, r.Height), F.label, C(T_MUTED), AL_R, false);
+                    popReg(r, id);
+                    break;
+                }
+                case SR_DIV: hline(gr, 12, w - 12, r.Y + 8, WA(A_SUBTLE)); break;
+                case SR_SEARCH: {
+                    RF sb(8, r.Y, w - 16, 30);
+                    fillRR(gr, sb, 6, C(T_INPUT));
+                    strokeRR(gr, sb, 6, P.search.empty() ? WA(A_DEFAULT) : C(T_ACC));
+                    if (P.search.empty()) txt(gr, L"Search windows\u2026", RF(sb.X + 12, sb.Y, sb.Width - 24, sb.Height), F.label, C(T_MUTED));
+                    else {
+                        txt(gr, P.search, RF(sb.X + 12, sb.Y, sb.Width - 24, sb.Height), F.label, C(T_TEXT));
+                        float cw = std::min(txtW(gr, P.search, F.label), sb.Width - 26);
+                        gp::SolidBrush cb(C(T_TEXT)); gr.FillRectangle(&cb, sb.X + 13 + cw, sb.Y + 8, 1.f, 14.f);
+                    }
+                    popReg(sb, P_SEARCH);
+                    break;
+                }
+                case SR_CAPTION: txt(gr, s.label, RF(14, r.Y, w - 28, r.Height), s.label == L"WINDOWS" ? F.tiny : F.label, C(T_MUTED), AL_L, false); break;
+            }
+        }
+    } else if (P.kind == PK_MIC) {
+        std::wstring dev = !g.s.micEnabled ? L"Microphone off" : ddItem(H_DD_MICDEV, ddSel(H_DD_MICDEV));
+        icon(gr, g.s.micMuted ? G_MICMUTED : G_MIC, 16, 18, 16, C(g.s.micMuted ? T_ACC_B : T_TEXT2));
+        txt(gr, dev, RF(40, 12, w - 40 - 64, 28), F.title, C(T_TEXT));
+        RF mb(w - 16 - 36, 12, 36, 28);
+        if (g.s.micMuted) fillRR(gr, mb, 6, C(T_ACC, 0x24));
+        else if (popHov(P_MUTE) > 0) fillRR(gr, mb, 6, WA((int)(A_SUBTLE * popHov(P_MUTE))));
+        strokeRR(gr, mb, 6, g.s.micMuted ? C(T_ACC) : WA(A_DEFAULT));
+        icon(gr, G_MICMUTED, mb.X + 10, mb.Y + 6, 16, C(g.s.micMuted ? T_ACC_B : T_TEXT2));
+        popReg(mb, P_MUTE);
+        txt(gr, L"Volume", RF(16, 50, 120, 20), F.label, C(T_TEXT2), AL_L, false);
+        float frac = g.s.micVolume / 200.f;
+        fillRR(gr, RF(16, 82, 200, 4), 2, C(T_TRACK));
+        fillRR(gr, RF(16, 82, 200 * frac, 4), 2, C(T_ACC));
+        float kx = 16 + 200 * frac;
+        float hv = std::max(popHov(P_SL_VOL), P.dragVol ? 1.f : 0.f);
+        if (hv > 0) fillCircle(gr, kx, 84, 12, WA((int)(A_SUBTLE * hv)));
+        fillCircle(gr, kx, 84, 7, C(0xFFFFFF));
+        popReg(RF(6, 70, 220, 28), P_SL_VOL);
+        txt(gr, std::to_wstring(g.s.micVolume) + L"%", RF(232, 72, 40, 24), F.label, C(T_TEXT2), AL_L, false);
+        txt(gr, L"Level", RF(16, 104, 120, 20), F.label, C(T_TEXT2), AL_L, false);
+        size_t keep = g_meterRects.size();
+        meterW(gr, 16, 132, 246, 6, g_meter[0], g.s.micEnabled && !g.s.micMuted);
+        g_meterRects.resize(keep);
+    }
+    // scrollbar
+    if (P.kind != PK_MIC && P.contentH > h + 0.5f) {
+        float th = std::max(24.f, h * h / P.contentH), ty = (h - th) * (P.scroll / (P.contentH - h));
+        fillRR(gr, RF(w - 6, ty + 2, 3, th - 4), 1.5f, WA(A_STRONG));
+    }
+}
+void drawPopupFrame(gp::Graphics& gr, bool shadow = true) {
+    RF r(0, 0, P.w, P.h);
+    if (shadow) for (int i = 10; i >= 1; --i) fillRR(gr, RF(r.X - i, r.Y - i + 6, r.Width + 2.f * i, r.Height + 2.f * i), 10.f + i, gp::Color(7, 0, 0, 0));
+    if (P.kind == PK_MIC) {  // 8 px arrow pointing at the chip
+        gp::PointF tri[3] = {gp::PointF(P.w / 2 - 8, P.h - 1), gp::PointF(P.w / 2 + 8, P.h - 1), gp::PointF(P.w / 2, P.h + 7)};
+        gp::SolidBrush ab(C(T_ELEV)); gr.FillPolygon(&ab, tri, 3);
+        gp::Pen ap(WA(A_DEFAULT), 1.f); gr.DrawLine(&ap, tri[0].X, tri[0].Y + 0.5f, tri[2].X, tri[2].Y); gr.DrawLine(&ap, tri[2].X, tri[2].Y, tri[1].X, tri[1].Y + 0.5f);
+    }
+    fillRR(gr, r, 10, C(T_ELEV));
+    gp::GraphicsPath clip; rrPath(clip, r, 10);
+    gp::GraphicsState st = gr.Save();
+    gr.SetClip(&clip, gp::CombineModeIntersect);
+    paintPopupContent(gr);
+    gr.Restore(st);
+    strokeRR(gr, r, 10, WA(A_DEFAULT));
+}
+void ulw(HWND h, int pw, int ph, POINT* pos, BYTE alpha, const std::function<void(gp::Graphics&)>& draw) {
+    if (pw <= 0 || ph <= 0) return;
+    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = pw; bi.bmiHeader.biHeight = -ph;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    HDC sdc = GetDC(nullptr); HDC mem = CreateCompatibleDC(sdc);
+    void* bits = nullptr;
+    HBITMAP hb = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (hb) {
+        HGDIOBJ old = SelectObject(mem, hb);
+        {
+            gp::Bitmap bmp(pw, ph, pw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+            gp::Graphics gr(&bmp);
+            gr.Clear(gp::Color(0, 0, 0, 0));
+            setupGraphics(gr, false);
+            draw(gr);
+        }
+        BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+        POINT src{0, 0}; SIZE sz{pw, ph};
+        UpdateLayeredWindow(h, sdc, pos, &sz, mem, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mem, old); DeleteObject(hb);
+    }
+    DeleteDC(mem); ReleaseDC(nullptr, sdc);
+}
+void renderPopup() {
+    if (!P.hwnd || P.kind == PK_NONE || !g.hwnd) return;
+    const float s = scale(), M = kShadow;
+    const bool up = P.kind == PK_MIC || P.above;
+    float o, ty, sy = 1.f;
+    if (P.closing) { float e = (float)ease(E_IN, P.close.progress()); o = 1 - e; ty = (up ? 4.f : -4.f) * e; }
+    else { float e = P.open.value(); o = std::max(0.f, std::min(1.f, e)); ty = (up ? 6.f : -6.f) * (1 - e); if (P.kind != PK_MIC) sy = 0.98f + 0.02f * e; }
+    int pw = (int)std::ceil((P.w + 2 * M) * s), ph = (int)std::ceil((P.h + 2 * M) * s);
+    POINT pt{(LONG)std::lround((P.x - M) * s), (LONG)std::lround((P.y - M) * s)};
+    ClientToScreen(g.hwnd, &pt);
+    ulw(P.hwnd, pw, ph, &pt, (BYTE)std::lround(255 * o), [&](gp::Graphics& gr) {
+        gr.ScaleTransform(s, s);
+        gr.TranslateTransform(M, M + ty);
+        if (sy != 1.f) { float oy = up ? P.h : 0.f; gr.TranslateTransform(0, oy); gr.ScaleTransform(1, sy); gr.TranslateTransform(0, -oy); }
+        drawPopupFrame(gr);
+    });
+}
+int popupHit(float x, float y) {  // card-local logical coords
+    for (auto it = P.regs.rbegin(); it != P.regs.rend(); ++it) if (inRF(it->r, x, y)) return it->id;
+    return inRF(RF(0, 0, P.w, P.h), x, y) ? P_PAD : -1;
+}
+void popupSetVolFromX(float x) { setMicVolume((int)std::lround((x - 16) / 200.f * 200.f), false); }
+LRESULT CALLBACK PopupProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    const float s = scale(), M = kShadow;
+    auto local = [&](float& x, float& y) { x = GET_X_LPARAM(lp) / s - M; y = GET_Y_LPARAM(lp) / s - M; };
+    switch (msg) {
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_SETCURSOR: SetCursor(LoadCursor(nullptr, P.hover >= P_BASE && P.hover != P_PAD ? IDC_HAND : IDC_ARROW)); return TRUE;
+        case WM_MOUSEMOVE: {
+            float x, y; local(x, y);
+            if (P.dragVol) { popupSetVolFromX(x); return 0; }
+            int id = popupHit(x, y);
+            if (id != P.hover) {
+                if (P.hover >= 0) P.hov[P.hover].go(0, 80, E_LINEAR);
+                if (id >= 0 && id != P_PAD) P.hov[id].go(1, 80, E_LINEAR);
+                P.hover = id;
+                if (id >= P_BASE && id < P_BASE + 900) P.kb = -1;
+                TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0}; TrackMouseEvent(&t);
+                renderPopup();
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            if (P.hover >= 0) P.hov[P.hover].go(0, 80, E_LINEAR);
+            P.hover = -1; renderPopup(); return 0;
+        case WM_LBUTTONDOWN: {
+            float x, y; local(x, y);
+            int id = popupHit(x, y);
+            P.pressed = id;
+            if (id == P_SL_VOL) { P.dragVol = true; SetCapture(h); popupSetVolFromX(x); }
+            if (id < 0) closePopup();
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            float x, y; local(x, y);
+            if (P.dragVol) { P.dragVol = false; ReleaseCapture(); save(); renderPopup(); return 0; }
+            int id = popupHit(x, y);
+            if (id >= 0 && id == P.pressed && id != P_PAD) popupClick(id, x);
+            P.pressed = -1;
+            return 0;
+        }
+        case WM_MOUSEWHEEL:
+            if (P.kind != PK_MIC && P.contentH > P.h) {
+                P.scroll = std::max(0.f, std::min(P.contentH - P.h, P.scroll - GET_WHEEL_DELTA_WPARAM(wp) / 120.f * 48.f));
+                renderPopup();
+            }
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+void ensurePopupWindow() {
+    if (P.hwnd || !g.hwnd) return;
+    WNDCLASSW wc{}; wc.lpfnWndProc = PopupProc; wc.hInstance = g.inst; wc.lpszClassName = L"CastRecorderPopup"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    P.hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1, g.hwnd, nullptr, g.inst, nullptr);
 }
 
-int hitTest(POINT p) {
-    for (auto it = g.regions.rbegin(); it != g.regions.rend(); ++it) if (PtInRect(&it->rc, p)) return it->id;
-    return H_NONE;
+// ---------- preview chips: layered child windows above the swapchain child ----------
+HWND g_chipL = nullptr, g_chipR = nullptr;
+float measureText(const std::wstring& t, gp::Font* f) {
+    static gp::Bitmap* mb = nullptr; if (!mb) mb = new gp::Bitmap(4, 4, PixelFormat32bppPARGB);
+    gp::Graphics gr(mb); setupGraphics(gr, false); return txtW(gr, t, f);
+}
+LRESULT CALLBACK ChipProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW(h, m, w, l);
+}
+void updateChips() {
+    if (!g.hwnd) return;
+    if (!g_chipL) {
+        WNDCLASSW wc{}; wc.lpfnWndProc = ChipProc; wc.hInstance = g.inst; wc.lpszClassName = L"CastRecorderChip";
+        RegisterClassW(&wc);
+        g_chipL = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT, wc.lpszClassName, L"", WS_CHILD, 0, 0, 1, 1, g.hwnd, nullptr, g.inst, nullptr);
+        g_chipR = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT, wc.lpszClassName, L"", WS_CHILD, 0, 0, 1, 1, g.hwnd, nullptr, g.inst, nullptr);
+    }
+    bool show = g.gprev.live() && g_viewIdx == 0 && !g_view.active() && IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd);
+    if (!show) { ShowWindow(g_chipL, SW_HIDE); ShowWindow(g_chipR, SW_HIDE); return; }
+    const float s = scale();
+    RecLayout L = recLayout(clientW(), clientH());
+    float lw = measureText(L"Live preview", F.caption) + 30;
+    std::wstring rt = sizeFpsText();
+    float rw = measureText(rt, F.caption) + 16;
+    auto place = [&](HWND hw, float x, float y, float w, float hgt, const std::function<void(gp::Graphics&)>& d) {
+        int pw = (int)std::ceil(w * s), ph = (int)std::ceil(hgt * s);
+        SetWindowPos(hw, HWND_TOP, (int)std::lround(x * s), (int)std::lround(y * s), pw, ph, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        ulw(hw, pw, ph, nullptr, 255, [&](gp::Graphics& gr) { gr.ScaleTransform(s, s); d(gr); });
+    };
+    place(g_chipL, L.surf.X + 12, L.surf.Y + 12, lw, 22, [&](gp::Graphics& gr) { paintLiveChip(gr, 0, 0); });
+    place(g_chipR, L.surf.X + L.surf.Width - 12 - rw, L.surf.Y + 12, rw, 22, [&](gp::Graphics& gr) { paintSizeChip(gr, RF(0, 0, rw, 22)); });
+}
+// ---------- audio meters / monitoring / push-to-talk ----------
+std::mutex g_meterM;
+std::unique_ptr<AudioMixer> g_meterMixer;
+std::thread g_meterTh;
+// A capture-only mixer that feeds the level meters (and monitoring) whether or not we're recording. It never
+// gets a media origin, so it buffers nothing. Opened off the UI thread (WASAPI init is 50-150 ms per device).
+void restartMeter() {
+    if (g_renderOnly) return;
+    if (g_meterTh.joinable()) g_meterTh.join();
+    bool sys = g.s.systemAudio, mic = g.s.micEnabled;
+    std::wstring mid = W(g.s.micDevice), sid = W(g.s.systemDevice);
+    g_meterTh = std::thread([sys, mic, mid, sid] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        std::unique_ptr<AudioMixer> old;
+        { std::lock_guard<std::mutex> l(g_meterM); old = std::move(g_meterMixer); }
+        old.reset();
+        auto m = std::make_unique<AudioMixer>();
+        std::wstring log;
+        if (sys || mic) m->start(sys, mic, mid, false, log, sid, false, true);
+        { std::lock_guard<std::mutex> l(g_meterM); g_meterMixer = std::move(m); }
+        if (SUCCEEDED(co)) CoUninitialize();
+    });
+}
+void stopMeter() {
+    if (g_meterTh.joinable()) g_meterTh.join();
+    std::lock_guard<std::mutex> l(g_meterM); g_meterMixer.reset();
+}
+std::atomic<unsigned> g_pttMods{0}, g_pttVk{0};
+std::atomic<bool> g_pttQuit{false};
+std::thread g_pttTh;
+void syncPtt() { g_pttMods = g.s.pttKey.mods; g_pttVk = g.s.pttKey.vk; applyAudioFx(); }
+void startPttThread() {
+    g_pttTh = std::thread([] {  // held-key polling: works while other apps have focus, no hook needed
+        while (!g_pttQuit.load()) {
+            bool down = false;
+            unsigned vk = g_pttVk.load(), mods = g_pttMods.load();
+            if (audioFx().pushToTalk.load() && vk) {
+                auto held = [](int k) { return (GetAsyncKeyState(k) & 0x8000) != 0; };
+                down = held((int)vk);
+                if (mods & MOD_CTRL_) down = down && held(VK_CONTROL);
+                if (mods & MOD_ALT_) down = down && held(VK_MENU);
+                if (mods & MOD_SHIFT_) down = down && held(VK_SHIFT);
+                if (mods & MOD_WIN_) down = down && (held(VK_LWIN) || held(VK_RWIN));
+            }
+            audioFx().pttDown = down;
+            Sleep(10);
+        }
+    });
 }
 
+// ---------- actions ----------
+void switchView(int v) {
+    if (v == g_viewIdx) return;
+    closePopup(false);
+    if (g.capturing >= 0) endCapture();
+    g_viewIdx = v;
+    g_view.set(0); g_view.go(1, 150, E_OUT);
+    g.gprev.setVisible(v == 0 && IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd));
+    if (v == 1) { g.mics = listMicrophones(); g.outs = listOutputDevices(); enumGpus(); }
+    updateChips();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void toggleMic() {
+    g.s.micMuted = !g.s.micMuted;
+    g.micMuted = g.s.micMuted;
+    applyAudioFx();
+    g.rec.setMicMuted(g.micMuted);
+    save();
+    if (!g.s.micEnabled) setStatus(L"Microphone is off (turn it on in Settings)", toRef(T_TEXT2));
+    else setStatus(g.micMuted ? L"Mic muted" : L"Mic on", toRef(g.micMuted ? T_WARN : T_OK));
+    if (P.kind == PK_MIC) renderPopup();
+}
+void toggleSys() {
+    g.s.systemMuted = !g.s.systemMuted;
+    applyAudioFx(); save();
+    if (!g.s.systemAudio) setStatus(L"System audio is off (turn it on in Settings)", toRef(T_TEXT2));
+    else setStatus(g.s.systemMuted ? L"System audio muted" : L"System audio on", toRef(g.s.systemMuted ? T_WARN : T_OK));
+}
+void setSlider(int id, float x) {
+    const float cx = 772;
+    float f = std::max(0.f, std::min(1.f, (x - cx) / 240.f));
+    if (id == H_SL_VOL) setMicVolume((int)std::lround(f * 200), false);
+    else if (id == H_SL_GATE) { g.s.noiseGateDb = (int)std::lround(-80 + f * 80); applyAudioFx(); InvalidateRect(g.hwnd, nullptr, FALSE); }
+}
+void stepSlider(int id, int d) {
+    if (id == H_SL_VOL) setMicVolume(g.s.micVolume + d, true);
+    else if (id == H_SL_GATE) { g.s.noiseGateDb = std::max(-80, std::min(0, g.s.noiseGateDb + d)); applyAudioFx(); save(); InvalidateRect(g.hwnd, nullptr, FALSE); }
+}
+RF regionOf(int id) { for (auto& r : g_regs) if (r.id == id) return r.r; return RF(0, 0, 0, 0); }
 void endCapture() {
     g.capturing = -1;
     g.liveMods = 0;
     if (!g.rec.running()) registerAll();  // never touch global hotkeys mid-recording
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
-
 UINT currentMods() {
     UINT m = 0;
     if (GetKeyState(VK_CONTROL) & 0x8000) m |= MOD_CTRL_;
@@ -896,106 +1797,192 @@ UINT currentMods() {
     if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) m |= MOD_WIN_;
     return m;
 }
-
 bool hotkeyKey(UINT vk, bool down) {
     if (g.capturing < 0) return false;
-    Hotkey* dst = g.capturing == 0 ? &g.s.toggleRecord : g.capturing == 1 ? &g.s.pauseToggle : &g.s.micMute;
+    Hotkey* dst = g.capturing == 0 ? &g.s.toggleRecord : g.capturing == 1 ? &g.s.pauseToggle : g.capturing == 2 ? &g.s.micMute : &g.s.pttKey;
     UINT mods = currentMods();
     if (isModifierKey(vk)) { g.liveMods = mods; InvalidateRect(g.hwnd, nullptr, FALSE); return true; }
     if (!down && vk != VK_SNAPSHOT) return true;
     if (mods == 0 && vk == VK_ESCAPE) { endCapture(); return true; }
-    if (mods == 0 && (vk == VK_BACK || vk == VK_DELETE)) { *dst = Hotkey{}; save(); endCapture(); return true; }
+    if (mods == 0 && (vk == VK_BACK || vk == VK_DELETE)) { *dst = Hotkey{}; save(); syncPtt(); endCapture(); return true; }
     Hotkey hk{mods, vk};
     int idx = g.capturing;
-    if (keyName(vk).empty()) { setStatus(L"Key not supported", C_ERR); return true; }
-    Issue is = validate(hk);
-    const Hotkey* all[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
-    const wchar_t* names[3] = {L"Start / Stop", L"Pause", L"Mic mute"};
+    if (keyName(vk).empty()) { setStatus(L"Key not supported", toRef(T_ERR)); return true; }
+    const Hotkey* all[4] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute, &g.s.pttKey};
+    const wchar_t* names[4] = {L"Start / Stop", L"Pause", L"Mic mute", L"Push-to-talk"};
     int clash = -1;
-    for (int k = 0; k < 3; ++k) if (k != idx && hk == *all[k]) clash = k;
-    if (is.severity == Severity::Error || clash >= 0) {
+    for (int k = 0; k < 4; ++k) if (k != idx && hk == *all[k]) clash = k;
+    Issue is = validate(hk);
+    bool bad = idx < 3 && is.severity == Severity::Error;  // push-to-talk is polled, not registered: any held combo works
+    if (bad || clash >= 0) {
         g.capturing = -1; g.liveMods = 0;
         registerAll();
-        setStatus(W(format(hk)) + (clash >= 0 ? std::wstring(L" is used by ") + names[clash] : L": " + W(is.message)), C_ERR);
+        setStatus(W(format(hk)) + (clash >= 0 ? std::wstring(L" is used by ") + names[clash] : L": " + W(is.message)), toRef(T_ERR));
         InvalidateRect(g.hwnd, nullptr, FALSE);
         return true;
     }
-    if (hk == g.s.openFolder) g.s.openFolder = Hotkey{};  // the hidden folder combo yields to the visible ones
+    if (hk == g.s.openFolder) g.s.openFolder = Hotkey{};
     *dst = hk;
     save();
+    syncPtt();
     endCapture();
-    trayUpdate(NIM_MODIFY);
     return true;
 }
-
-void click(int id) {
-    if (id != H_HK0 && id != H_HK1 && id != H_HK2 && g.capturing >= 0) endCapture();
-    if (g.openDrop != H_NONE) {
-        int dd = g.openDrop;
-        g.openDrop = H_NONE;
-        g_dropKb = -1;
-        if (id >= H_ITEM0 && id < H_ITEM0 + ddCount(dd)) ddSet(dd, id - H_ITEM0);
-        InvalidateRect(g.hwnd, nullptr, FALSE);
-        if (id >= H_ITEM0 || id == dd) return;  // item picked, padding, or toggled closed
-    }
-    if (id == H_MIN) ShowWindow(g.hwnd, SW_MINIMIZE);
-    else if (id == H_CLOSE) forceQuit();  // exits; a live recording is stopped and saved first
-    else if (id == H_MAX) { ShowWindow(g.hwnd, IsZoomed(g.hwnd) ? SW_RESTORE : SW_MAXIMIZE); save(); }
-    else if (id == H_LOG) openLog();
-    else if (id == H_MIC) toggleMic();
-    else if (id == H_RECORD) toggleRecording();
-    else if (id == H_PAUSE) togglePause();
-    else if (id >= H_DD_FPS && id <= H_DD_MIC) {
-        if (ddLocked(id)) setStatus(L"Stop recording to change settings", C_TEXT2);
-        else { if (id == H_DD_GPU) enumGpus(); if (id == H_DD_MIC) g.mics = listMicrophones(); g.openDrop = id; }
-    } else if (id == H_HK0 || id == H_HK1 || id == H_HK2) {
-        if (g.rec.running()) { setStatus(L"Stop recording to change hotkeys", C_TEXT2); InvalidateRect(g.hwnd, nullptr, FALSE); return; }
-        g.capturing = id - H_HK0;
-        g.liveMods = 0;
-        unregisterAll();
-        SetFocus(g.hwnd);
-    } else if (id == H_BROWSE) { if (!g.rec.running()) pickFolder(); }
-    else if (id == H_PATH) openFolder();
-    InvalidateRect(g.hwnd, nullptr, FALSE);
-}
-
 void showWindow() {
     ShowWindow(g.hwnd, IsIconic(g.hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g.hwnd);
 }
-
-void trayMenu() {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, 1, g.rec.isActive() ? L"Stop recording" : L"Start recording");
-    if (g.rec.isActive()) AppendMenuW(m, MF_STRING, 5, g.rec.isPaused() ? L"Resume" : L"Pause");
-    AppendMenuW(m, MF_STRING, 2, L"Open recordings folder");
-    AppendMenuW(m, MF_STRING, 3, L"Settings");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, 4, L"Exit");
-    POINT p;
-    GetCursorPos(&p);
-    SetForegroundWindow(g.hwnd);
-    int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, p.x, p.y, 0, g.hwnd, nullptr);
-    DestroyMenu(m);
-    if (c == 1) toggleRecording();
-    else if (c == 5) togglePause();
-    else if (c == 2) openFolder();
-    else if (c == 3) showWindow();
-    else if (c == 4) forceQuit();
+void click(int id) {
+    if (id != H_HK0 && id != H_HK1 && id != H_HK2 && id != H_HKPTT && g.capturing >= 0) endCapture();
+    const RF r = regionOf(id);
+    switch (id) {
+        case H_MIN: ShowWindow(g.hwnd, SW_MINIMIZE); return;
+        case H_CLOSE: forceQuit(); return;  // exits; a live recording is stopped and saved first
+        case H_MAX: ShowWindow(g.hwnd, IsZoomed(g.hwnd) ? SW_RESTORE : SW_MAXIMIZE); save(); return;
+        case H_TAB_REC: switchView(0); return;
+        case H_TAB_SET: switchView(1); return;
+        case H_LOG: case H_STATUSLOG: openLog(); return;
+        case H_RECORD: toggleRecording(); break;
+        case H_PAUSE: if (g.rec.isActive()) togglePause(); break;
+        case H_MICICON: toggleMic(); break;
+        case H_SYSCHIP: toggleSys(); break;
+        case H_MICCHIP: openPopup(PK_MIC, H_MICCHIP, r); break;
+        case H_SRC:
+            if (locked(id)) { setStatus(L"Stop recording to change the source", toRef(T_TEXT2)); break; }
+            openPopup(PK_SOURCE, H_SRC, r); break;
+        case H_DD_FPS: case H_DD_QUAL: case H_DD_ENC: case H_DD_GPU: case H_DD_RES: case H_DD_CONT: case H_DD_SYSDEV: case H_DD_MICDEV:
+            if (locked(id)) { setStatus(L"Stop recording to change this", toRef(T_TEXT2)); break; }
+            if (id == H_DD_GPU) enumGpus();
+            if (id == H_DD_MICDEV) g.mics = listMicrophones();
+            if (id == H_DD_SYSDEV) g.outs = listOutputDevices();
+            openPopup(PK_LIST, id, r); break;
+        case H_HK0: case H_HK1: case H_HK2: case H_HKPTT:
+            if (locked(id)) { setStatus(L"Stop recording to change hotkeys", toRef(T_TEXT2)); break; }
+            g.capturing = id == H_HKPTT ? 3 : id - H_HK0;
+            g.liveMods = 0;
+            unregisterAll();
+            SetFocus(g.hwnd);
+            break;
+        case H_FOLDERICON: openFolder(); break;
+        case H_PATH: case H_BROWSE: if (!locked(H_BROWSE)) pickFolder(); break;
+        case H_TG_SYS: if (!locked(id)) { g.s.systemAudio = !g.s.systemAudio; save(); restartMeter(); } break;
+        case H_TG_MIC: if (!locked(id)) { g.s.micEnabled = !g.s.micEnabled; save(); restartMeter(); } break;
+        case H_TG_NS: g.s.noiseSuppression = !g.s.noiseSuppression; applyAudioFx(); save(); break;
+        case H_TG_MON: g.s.monitoring = !g.s.monitoring; applyAudioFx(); save(); break;
+        case H_TG_PTT: g.s.pushToTalk = !g.s.pushToTalk; syncPtt(); save(); break;
+        case H_CH_MONO: case H_CH_STEREO:
+            if (!locked(id)) { int c = id == H_CH_MONO ? 1 : 2; if (g.s.channels != c) { g.s.channels = c; save(); } } break;
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+std::vector<int> focusOrder() {
+    if (g_viewIdx == 0) {
+        std::vector<int> v = {H_TAB_REC, H_TAB_SET, H_SRC, H_DD_FPS, H_DD_QUAL, H_MICCHIP, H_SYSCHIP};
+        if (uiActive()) v.push_back(H_PAUSE);
+        v.push_back(H_RECORD);
+        return v;
+    }
+    return {H_TAB_REC, H_TAB_SET, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT, H_HK0, H_HK1, H_HK2, H_PATH, H_BROWSE, H_LOG,
+            H_TG_SYS, H_DD_SYSDEV, H_TG_MIC, H_DD_MICDEV, H_SL_VOL, H_TG_NS, H_SL_GATE, H_TG_MON, H_TG_PTT, H_HKPTT, H_CH_MONO};
+}
+void moveFocus(int dir) {
+    auto v = focusOrder();
+    int n = (int)v.size(), i = -1;
+    for (int k = 0; k < n; ++k) if (v[k] == g_focus) i = k;
+    i = i < 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n;
+    g_focus = v[i];
+    g_kbUsed = true;
+}
+int hitTest(float x, float y) {
+    for (auto it = g_regs.rbegin(); it != g_regs.rend(); ++it) if (inRF(it->r, x, y)) return it->id;
+    return H_NONE;
+}
+void setHover(int id) {
+    if (id == g.hover) return;
+    if (g.hover != H_NONE) g_hov[g.hover].go(0, 100, E_LINEAR);
+    if (id != H_NONE) g_hov[id].go(1, 100, E_LINEAR);
+    g.hover = id;
+    InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-void paintTo(HWND h, HDC dc) {
+// ---------- frame clock (16 ms): animations, meters, record pulse ----------
+void kickAnim() { if (g.hwnd && !g_renderOnly) SetTimer(g.hwnd, TIMER_FRAME, 16, nullptr); }
+bool anyActive(const std::map<int, Anim>& m) { for (auto& p : m) if (p.second.active()) return true; return false; }
+void invalidateLogical(RF r) { RECT px = toPx(r); InvalidateRect(g.hwnd, &px, FALSE); }
+void frameTick() {
+    double t = nowMs(), dt = g_meterT ? t - g_meterT : 16; g_meterT = t;
+    bool changed = false;
+    std::atomic<float>* lv[2] = {&audioFx().levelMic, &audioFx().levelSys};
+    for (int k = 0; k < 2; ++k) {
+        float pk = AudioFx::take(*lv[k]);
+        float n = pk > 1e-6f ? std::max(0.f, std::min(1.f, (20.f * std::log10(pk) + 60.f) / 60.f)) : 0.f;
+        float d = std::max(n, g_meter[k] - (float)(dt / 300.0));  // 60 Hz attack, 300 ms full-scale decay
+        if (d < 0) d = 0;
+        if (std::fabs(d - g_meter[k]) > 0.004f) changed = true;
+        g_meter[k] = d;
+    }
+    bool anim = g_view.active() || g_chan.active() || anyActive(g_tog) || anyActive(g_hov);
+    if (P.kind != PK_NONE) {
+        bool pa = P.open.active() || P.close.active() || anyActive(P.hov);
+        if (pa || (changed && P.kind == PK_MIC)) renderPopup();
+        if (pa) anim = true;  // the field chevron rotates with the list
+        if (P.closing && !P.close.active()) { ShowWindow(P.hwnd, SW_HIDE); P.kind = PK_NONE; P.closing = false; anim = true; }
+    }
+    static bool viewWasActive = false;
+    if (viewWasActive && !g_view.active()) updateChips();
+    viewWasActive = g_view.active();
+    if (anim) InvalidateRect(g.hwnd, nullptr, FALSE);
+    else {
+        if (changed) for (auto& r : g_meterRects) invalidateLogical(r);
+        if (uiActive()) { invalidateLogical(g_recordRect); invalidateLogical(g_statusRect); }
+    }
+}
+// ---------- window procedure ----------
+HBITMAP g_back = nullptr; int g_backW = 0, g_backH = 0; void* g_backBits = nullptr;
+void paintTo(HWND h, HDC dc, const RECT& clip) {
     RECT rc; GetClientRect(h, &rc);
+    if (!g_back || g_backW != rc.right || g_backH != rc.bottom) {
+        if (g_back) DeleteObject(g_back);
+        BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = std::max(1L, rc.right); bi.bmiHeader.biHeight = -std::max(1L, rc.bottom);
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+        g_back = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &g_backBits, nullptr, 0);
+        g_backW = rc.right; g_backH = rc.bottom;
+    }
     HDC mem = CreateCompatibleDC(dc);
-    HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-    HGDIOBJ old = SelectObject(mem, bmp);
-    paint(mem, rc);
-    BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+    HGDIOBJ old = SelectObject(mem, g_back);
+    {
+        gp::Graphics gr(mem);
+        setupGraphics(gr, true);
+        const float s = scale();
+        gr.ScaleTransform(s, s);
+        gr.SetClip(RF(clip.left / s - 1, clip.top / s - 1, (clip.right - clip.left) / s + 2, (clip.bottom - clip.top) / s + 2));
+        paintAll(gr, rc.right / s, rc.bottom / s);
+    }
+    BitBlt(dc, clip.left, clip.top, clip.right - clip.left, clip.bottom - clip.top, mem, clip.left, clip.top, SRCCOPY);
+    SelectObject(mem, old); DeleteDC(mem);
 }
-
+int ncHit(HWND h, POINT sp) {
+    POINT p = sp; ScreenToClient(h, &p);
+    RECT rc; GetClientRect(h, &rc);
+    const float s = scale();
+    const int e = (int)std::lround(6 * s);
+    if (!IsZoomed(h)) {
+        bool L = p.x < e, R = p.x >= rc.right - e, T = p.y < e, B = p.y >= rc.bottom - e;
+        if (T && L) return HTTOPLEFT; if (T && R) return HTTOPRIGHT; if (B && L) return HTBOTTOMLEFT; if (B && R) return HTBOTTOMRIGHT;
+        if (L) return HTLEFT; if (R) return HTRIGHT; if (T) return HTTOP; if (B) return HTBOTTOM;
+    }
+    float x = p.x / s, y = p.y / s;
+    if (y < 40) {
+        float W = rc.right / s;
+        if (inRF(tbBtn(W, 1), x, y)) return HTMAXBUTTON;  // Win11 snap layouts flyout
+        if (inRF(tbBtn(W, 0), x, y) || inRF(tbBtn(W, 2), x, y)) return HTCLIENT;
+        if (inRF(RF(150, 7, 68, 26), x, y) || inRF(RF(222, 7, 80, 26), x, y)) return HTCLIENT;
+        return HTCAPTION;  // double-click toggles maximize
+    }
+    return HTCLIENT;
+}
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == g.taskbarCreated && g.taskbarCreated) { trayUpdate(NIM_ADD); return 0; }
+    const float s = scale();
     switch (msg) {
     case WM_NCCALCSIZE:
         if (wp && IsZoomed(h)) {  // maximized borderless: keep the client inside the monitor work area
@@ -1005,109 +1992,139 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             p->rgrc[0].left += fx; p->rgrc[0].right -= fx; p->rgrc[0].top += fy; p->rgrc[0].bottom -= fy;
             return 0;
         }
-        if (wp) return 0;  // whole window is client area (borderless)
+        if (wp) return 0;
         break;
-    case WM_NCHITTEST: {
-        POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        ScreenToClient(h, &p);
-        RECT rc; GetClientRect(h, &rc);
-        if (p.x >= rc.right - S(16) && p.y >= rc.bottom - S(16)) return HTBOTTOMRIGHT;  // invisible resize grip
-        if (p.y < S(TB_H) && hitTest(p) == H_NONE) return HTCAPTION;  // double-click maximizes
-        return HTCLIENT;
-    }
+    case WM_NCHITTEST: return ncHit(h, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+    case WM_NCMOUSEMOVE:
+        if (wp == HTMAXBUTTON) { setHover(H_MAX); TRACKMOUSEEVENT t{sizeof t, TME_LEAVE | TME_NONCLIENT, h, 0}; TrackMouseEvent(&t); }
+        else setHover(H_NONE);
+        if (wp == HTMAXBUTTON) return 0;
+        break;
+    case WM_NCMOUSELEAVE: if (g.hover == H_MAX) setHover(H_NONE); break;
+    case WM_NCLBUTTONDOWN:
+        if (wp == HTMAXBUTTON) { closePopup(); g.pressed = H_MAX; return 0; }
+        closePopup(false);
+        break;
+    case WM_NCLBUTTONUP:
+        if (wp == HTMAXBUTTON) { if (g.pressed == H_MAX) click(H_MAX); g.pressed = H_NONE; return 0; }
+        break;
+    case WM_NCLBUTTONDBLCLK: if (wp == HTMAXBUTTON) return 0; break;
     case WM_GETMINMAXINFO: {
         auto* mm = (MINMAXINFO*)lp;
-        mm->ptMinTrackSize = {S(MIN_W), S(MIN_H)};
+        mm->ptMinTrackSize = {(LONG)std::lround(MIN_W * s), (LONG)std::lround(MIN_H * s)};
         return 0;
     }
     case WM_DPICHANGED: {
         g.dpi = HIWORD(wp);
-        makeFonts();
+        makeFonts(); makeUiFonts();
+        closePopup(false);
         RECT* r = (RECT*)lp;
         SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        updatePreview();
         g.gprev.setRect(previewRectNow());
+        updateChips();
         return 0;
     }
+    case WM_ENTERSIZEMOVE: closePopup(false); break;
+    case WM_MOVE: if (P.kind != PK_NONE) closePopup(false); break;
     case WM_SHOWWINDOW:
-        if (wp) { updatePreview(); SetTimer(h, TIMER_PREVIEW, 500, nullptr); }
-        else KillTimer(h, TIMER_PREVIEW);  // hidden to tray: no preview work at all
-        g.gprev.setVisible(wp != 0);
+        if (wp) { updatePreview(); SetTimer(h, TIMER_PREVIEW, 500, nullptr); SetTimer(h, TIMER_FRAME, 16, nullptr); }
+        else { KillTimer(h, TIMER_PREVIEW); KillTimer(h, TIMER_FRAME); }
+        g.gprev.setVisible(wp != 0 && g_viewIdx == 0);
         break;
     case WM_SIZE:
+        closePopup(false);
         g.gprev.setRect(previewRectNow());
-        g.gprev.setVisible(wp != SIZE_MINIMIZED && IsWindowVisible(h));
+        g.gprev.setVisible(wp != SIZE_MINIMIZED && IsWindowVisible(h) && g_viewIdx == 0);
+        if (wp == SIZE_MINIMIZED) KillTimer(h, TIMER_FRAME); else SetTimer(h, TIMER_FRAME, 16, nullptr);
+        updateChips();
+        InvalidateRect(h, nullptr, FALSE);
         break;
     case WM_APP + 41:  // GPU preview went live (1) or failed (0)
-        if (wp) g.gprev.setVisible(IsWindowVisible(h) && !IsIconic(h));
+        if (wp) g.gprev.setVisible(IsWindowVisible(h) && !IsIconic(h) && g_viewIdx == 0);
         else { if (g.gprev.hwnd()) ShowWindow(g.gprev.hwnd(), SW_HIDE); updatePreview(); }
+        updateChips();
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_APP + 44:  // the preview's window target is gone
+        if (g.target.kind == CaptureTarget::Window && !g.rec.running()) {
+            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g_srcTitle.clear();
+            setStatus(L"Window closed", toRef(T_WARN));
+            cr::appLog(L"source: captured window closed, preview back on Full screen");
+        }
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        paintTo(h, dc);
+        paintTo(h, dc, ps.rcPaint);
         EndPaint(h, &ps);
         return 0;
     }
     case WM_MOUSEMOVE: {
-        int id = hitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-        if (id != g.hover) {
-            g.hover = id;
-            InvalidateRect(h, nullptr, FALSE);
-            TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0};
-            TrackMouseEvent(&t);
-        }
-        SetCursor(LoadCursor(nullptr, id != H_NONE ? IDC_HAND : IDC_ARROW));
+        float x = GET_X_LPARAM(lp) / s, y = GET_Y_LPARAM(lp) / s;
+        if (g_drag != H_NONE) { setSlider(g_drag, x); return 0; }
+        int id = hitTest(x, y);
+        if (id != g.hover) { setHover(id); TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0}; TrackMouseEvent(&t); }
         return 0;
     }
     case WM_SETCURSOR:
-        if (LOWORD(lp) == HTCLIENT) return TRUE;
-        break;
-    case WM_MOUSELEAVE: g.hover = H_NONE; InvalidateRect(h, nullptr, FALSE); return 0;
-    case WM_LBUTTONDOWN: g.pressed = hitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
-    case WM_LBUTTONUP: {
-        ReleaseCapture();
-        int id = hitTest(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-        if (id != H_NONE && id == g.pressed) click(id);
-        else if (id == H_NONE) {
-            if (g.capturing >= 0) endCapture();
-            if (g.openDrop != H_NONE) { g.openDrop = H_NONE; InvalidateRect(h, nullptr, FALSE); }
+        if (LOWORD(lp) == HTCLIENT) {
+            bool hand = g.hover != H_NONE && !locked(g.hover) && !(g.hover == H_PAUSE && !uiActive());
+            SetCursor(LoadCursor(nullptr, hand ? IDC_HAND : IDC_ARROW));
+            return TRUE;
         }
-        g.pressed = H_NONE;
+        break;
+    case WM_MOUSELEAVE: if (g_drag == H_NONE) setHover(H_NONE); return 0;
+    case WM_LBUTTONDOWN: {
+        float x = GET_X_LPARAM(lp) / s, y = GET_Y_LPARAM(lp) / s;
+        int id = hitTest(x, y);
+        // a click outside an open popup closes it; clicking its own field again just closes it
+        if (P.kind != PK_NONE && !P.closing) {
+            int owner = P.dd; closePopup();
+            if (id == owner || (owner == H_MICCHIP && id == H_MICCHIP)) { g.pressed = H_NONE; return 0; }
+        }
+        g.pressed = id;
+        if ((id == H_SL_VOL || id == H_SL_GATE) && !locked(id)) { g_drag = id; g_focus = id; setSlider(id, x); }
+        SetCapture(h);
+        InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
+    case WM_LBUTTONUP: {
+        ReleaseCapture();
+        float x = GET_X_LPARAM(lp) / s, y = GET_Y_LPARAM(lp) / s;
+        if (g_drag != H_NONE) { g_drag = H_NONE; save(); g.pressed = H_NONE; InvalidateRect(h, nullptr, FALSE); return 0; }
+        int id = hitTest(x, y);
+        if (id != H_NONE && id == g.pressed) { if (id != H_PAUSE || uiActive()) click(id); }
+        else if (id == H_NONE && g.capturing >= 0) endCapture();
+        g.pressed = H_NONE;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+        if (P.kind == PK_SOURCE || P.kind == PK_LIST) { PopupProc(P.hwnd, msg, wp, lp); return 0; }
+        break;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (hotkeyKey((UINT)wp, true)) return 0;
-        if (wp == VK_ESCAPE) {
-            if (g.openDrop != H_NONE) { g.openDrop = H_NONE; g_dropKb = -1; InvalidateRect(h, nullptr, FALSE); }
-            else ShowWindow(h, SW_HIDE);
-            return 0;
+        if (P.kind != PK_NONE && !P.closing) {
+            if (wp == VK_ESCAPE) { closePopup(); return 0; }
+            if (wp == VK_UP || wp == VK_DOWN || wp == VK_RETURN) { g_kbUsed = true; popupKey((UINT)wp); return 0; }
+            if (P.kind == PK_SOURCE && wp == VK_BACK) { if (!P.search.empty()) popupType(P.search.substr(0, P.search.size() - 1)); return 0; }
+            if (P.kind == PK_MIC && (wp == VK_LEFT || wp == VK_RIGHT)) { setMicVolume(g.s.micVolume + (wp == VK_RIGHT ? 1 : -1), true); return 0; }
+            if (wp == VK_TAB) { closePopup(); }
+            else if (msg == WM_KEYDOWN) break;  // characters arrive as WM_CHAR (search box)
         }
         if (msg == WM_KEYDOWN) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            if (g.openDrop != H_NONE) {  // list navigation
-                int n = ddCount(g.openDrop);
-                if (g_dropKb < 0) g_dropKb = ddSel(g.openDrop);
-                if (wp == VK_DOWN) g_dropKb = (g_dropKb + 1) % n;
-                else if (wp == VK_UP) g_dropKb = (g_dropKb + n - 1) % n;
-                else if (wp == VK_RETURN || wp == VK_SPACE) { int dd = g.openDrop; g.openDrop = H_NONE; ddSet(dd, g_dropKb); g_dropKb = -1; }
-                else if (wp == VK_TAB) { g.openDrop = H_NONE; g_dropKb = -1; moveFocus(shift ? -1 : 1); }
-                InvalidateRect(h, nullptr, FALSE);
-                return 0;
-            }
             if (wp == VK_TAB) { moveFocus(shift ? -1 : 1); InvalidateRect(h, nullptr, FALSE); return 0; }
-            if (g_focus >= H_DD_FPS && g_focus <= H_DD_MIC && (wp == VK_UP || wp == VK_DOWN) && !ddLocked(g_focus)) {
-                int n = ddCount(g_focus), i = ddSel(g_focus) + (wp == VK_DOWN ? 1 : -1);
-                if (i >= 0 && i < n) ddSet(g_focus, i);
-                InvalidateRect(h, nullptr, FALSE);
-                return 0;
+            if (g_focus == H_SL_VOL || g_focus == H_SL_GATE) {
+                int d = wp == VK_RIGHT || wp == VK_UP ? 1 : wp == VK_LEFT || wp == VK_DOWN ? -1 : wp == VK_PRIOR ? 10 : wp == VK_NEXT ? -10 : 0;
+                if (d) { stepSlider(g_focus, d); return 0; }
             }
-            if ((wp == VK_LEFT || wp == VK_RIGHT) && g_focus != H_NONE) { moveFocus(wp == VK_RIGHT ? 1 : -1); InvalidateRect(h, nullptr, FALSE); return 0; }
+            if (g_focus == H_CH_MONO && (wp == VK_LEFT || wp == VK_RIGHT)) { click(wp == VK_LEFT ? H_CH_MONO : H_CH_STEREO); return 0; }
             if ((wp == VK_RETURN || wp == VK_SPACE) && g_focus != H_NONE) {
-                if (g_focus >= H_DD_FPS && g_focus <= H_DD_MIC) g_dropKb = ddSel(g_focus);
-                click(g_focus);
+                if (g_focus == H_CH_MONO) click(g.s.channels == 1 ? H_CH_STEREO : H_CH_MONO);
+                else if (g_focus != H_SL_VOL && g_focus != H_SL_GATE) click(g_focus);
                 return 0;
             }
         }
@@ -1117,13 +2134,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_SYSCHAR: case WM_CHAR:
         if (g.capturing >= 0) return 0;
+        if (P.kind == PK_SOURCE && !P.closing && msg == WM_CHAR && wp >= 32 && wp != 127) { popupType(P.search + (wchar_t)wp); return 0; }
         break;
-    case WM_KILLFOCUS: case WM_ACTIVATE:
-        if (msg == WM_KILLFOCUS || LOWORD(wp) == WA_INACTIVE) {
-            if (g.capturing >= 0) endCapture();
-            if (g.openDrop != H_NONE) { g.openDrop = H_NONE; InvalidateRect(h, nullptr, FALSE); }
-        }
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) { if (g.capturing >= 0) endCapture(); closePopup(); }
         break;
+    case WM_KILLFOCUS: if (g.capturing >= 0) endCapture(); break;
     case WM_HOTKEY:
         if (wp == HK_TOGGLE) toggleRecording();
         else if (wp == HK_MIC) toggleMic();
@@ -1131,21 +2147,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == HK_FOLDER) openFolder();
         return 0;
     case WM_TIMER:
+        if (wp == TIMER_FRAME) { frameTick(); return 0; }
         if (wp == TIMER_SELFTEST + 1) { KillTimer(h, wp); click(H_CLOSE); return 0; }  // stop + save + exit
-        if (wp == TIMER_SELFTEST) {  // CI: change settings through the same click paths a user takes, then press X
-            KillTimer(h, TIMER_SELFTEST);
-            click(H_DD_FPS); click(H_ITEM0 + 1);   // 30 fps
-            click(H_DD_QUAL); click(H_ITEM0 + 3);  // Ultra
-            click(H_DD_CONT); click(H_ITEM0 + 1);  // MKV
-            click(H_DD_SYS); click(H_ITEM0 + 0);   // system audio off
-            click(H_DD_MIC); click(H_ITEM0 + 1);   // default microphone
-            g.s.micMute = Hotkey{MOD_CTRL_ | MOD_ALT_, 0x7B}; save();  // Ctrl+Alt+F12
-            click(H_MAX);
-            click(H_CLOSE);
-            return 0;
-        }
+        if (wp == TIMER_SELFTEST) { KillTimer(h, TIMER_SELFTEST); selftestSettings(); return 0; }
         if (wp == TIMER_PREVIEW) {
-            if (!g.rec.running() && IsWindowVisible(h) && !IsIconic(h)) { updatePreview(); InvalidateRect(h, nullptr, FALSE); }
+            static int n = 0;
+            if (!g.rec.running() && IsWindowVisible(h) && !IsIconic(h) && !g.gprev.live() && g_viewIdx == 0) { updatePreview(); InvalidateRect(h, nullptr, FALSE); }
+            if (++n % 2 == 0) updateChips();  // source size / fps text
             return 0;
         }
         if (wp == TIMER_TICK) {
@@ -1156,9 +2164,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (GetTickCount64() - finishSince > kWatchdogMs) {
                     finishSince = 0;
                     g.rec.abort();
-                    setStatus(L"Stopped (finalize took too long)", C_WARN);
+                    setStatus(L"Stopped (finalize took too long)", toRef(T_WARN));
                     KillTimer(h, TIMER_TICK);
-                    trayUpdate(NIM_MODIFY);
                 }
             } else finishSince = 0;
             InvalidateRect(h, nullptr, FALSE);
@@ -1183,28 +2190,27 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         const RecordResult& r = g.rec.result();
         g.gprev.setRecording(false);
         writeSessionLog(r);
-        if (r.ok) {
-            size_t k = r.file.find_last_of(L'\\');
-            std::wstring msg2 = L"Saved " + (k == std::wstring::npos ? r.file : r.file.substr(k + 1)) + L"  \u00b7  " + r.encoderUsed;
+        size_t k = r.file.find_last_of(L'\\');
+        std::wstring fname = k == std::wstring::npos ? r.file : r.file.substr(k + 1);
+        if (r.ok && r.windowClosed) {
+            setStatus(L"Window closed  \u00b7  saved " + fname, toRef(T_WARN));
+            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g_srcTitle.clear();
+            g.gprev.setTarget(g.target);
+        } else if (r.ok) {
+            std::wstring msg2 = L"Saved " + fname + L"  \u00b7  " + r.encoderUsed;
             if (!r.message.empty()) msg2 += L"  \u00b7  " + r.message;
             if (r.cpuFallback) msg2 += L"  \u00b7  GPU conversion failed, finished on CPU";
             if (r.dropped) msg2 += L"  \u00b7  " + std::to_wstring(r.dropped) + L" dropped";
-            if (r.windowClosed) msg2 += L"  \u00b7  the window was closed";
             if (!r.encoderFallbacks.empty()) msg2 += L"  \u00b7  " + r.encoderFallbacks.front() + L" failed its test encode, fell back";
-            setStatus(msg2, C_OK);
-        } else if (r.abandoned) setStatus(L"Encoder got stuck, file discarded. Restart Cast Recorder to record again.", C_WARN);
-        else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, C_WARN);
-        else setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), C_ERR);
-        trayUpdate(NIM_MODIFY);
+            setStatus(msg2, toRef(T_OK));
+        } else if (r.abandoned) setStatus(L"Encoder got stuck, file discarded. Restart Cast Recorder to record again.", toRef(T_WARN));
+        else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, toRef(T_WARN));
+        else setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), toRef(T_ERR));
         updatePreview();
         InvalidateRect(h, nullptr, FALSE);
         if (g.quitting) DestroyWindow(h);
         return 0;
     }
-    case WM_TRAY:
-        if (LOWORD(lp) == WM_LBUTTONDBLCLK || LOWORD(lp) == WM_LBUTTONUP) showWindow();
-        else if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) trayMenu();
-        return 0;
     case WM_APP + 2:
         showWindow();
         return 0;
@@ -1213,51 +2219,93 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         save();
+        closePopup(false);
         g.gprev.stop();
         unregisterAll();
-        if (g.trayAdded) { NOTIFYICONDATAW n{sizeof n}; n.hWnd = h; n.uID = 1; Shell_NotifyIconW(NIM_DELETE, &n); }
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-// Headless UI render for docs/CI screenshots: paints the window at 96 DPI into a 24-bit BMP.
-// state: idle | recording | paused | dropdown
+void paintToNull() { gp::Bitmap b(8, 8, PixelFormat32bppPARGB); gp::Graphics gr(&b); gr.ScaleTransform(scale(), scale()); paintAll(gr, clientW(), clientH()); }
+// CI: change settings through the same click paths a user takes, then press X.
+void selftestSettings() {
+    auto pick = [](int dd, int idx) { click(dd); popupActivate(idx); };
+    click(H_TAB_REC);
+    pick(H_DD_FPS, 1);   // 30 fps
+    pick(H_DD_QUAL, 3);  // Ultra
+    // Source: open the picker, type into its search box, take the first matching window (CI starts Notepad)
+    click(H_SRC);
+    popupType(L"notepad");
+    int row = -1;
+    for (size_t i = 0; i < P.rows.size(); ++i) if (P.rows[i].kind == SR_WIN) { row = (int)i; break; }
+    if (row >= 0) popupActivate(row); else { popupType(L""); popupActivate(0); }
+    cr::appLog(L"selftest: source " + sourceText());
+    click(H_TAB_SET);
+    paintToNull();
+    pick(H_DD_CONT, 1);  // MKV
+    if (g.s.systemAudio) click(H_TG_SYS);  // off
+    if (!g.s.micEnabled) click(H_TG_MIC);  // on (default microphone)
+    if (!g.s.noiseSuppression) click(H_TG_NS);
+    if (!g.s.pushToTalk) click(H_TG_PTT);
+    if (!g.s.monitoring) click(H_TG_MON);
+    click(H_CH_STEREO);
+    setSlider(H_SL_VOL, 772 + 240 * 0.75f);   // 150 %
+    setSlider(H_SL_GATE, 772 + 240 * 0.375f); // -50 dB
+    save();
+    g.s.micMute = Hotkey{MOD_CTRL_ | MOD_ALT_, 0x7B}; save();  // Ctrl+Alt+F12
+    click(H_MAX);
+    click(H_CLOSE);
+}
+
+// Headless render for docs/CI screenshots (PNG or BMP). States: idle | source | settings | recording | micpop
+int encoderClsid(const wchar_t* mime, CLSID* out) {
+    UINT n = 0, size = 0; gp::GetImageEncodersSize(&n, &size);
+    if (!size) return -1;
+    std::vector<BYTE> buf(size); auto* info = (gp::ImageCodecInfo*)buf.data();
+    gp::GetImageEncoders(n, size, info);
+    for (UINT i = 0; i < n; ++i) if (wcscmp(info[i].MimeType, mime) == 0) { *out = info[i].Clsid; return (int)i; }
+    return -1;
+}
 int renderUi(const std::wstring& path, const std::wstring& state, int dpi) {
+    g_renderOnly = true;
     g.dpi = dpi;
-    makeFonts();
+    makeFonts(); makeUiFonts(); loadUiIcons();
     enumGpus();
-    if (g.icoSmall == nullptr) loadIcons();
-    RECT rc{0, 0, S(BASE_W), S(BASE_H)};
-    HDC screen = GetDC(nullptr);
-    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = rc.right; bi.bmiHeader.biHeight = -rc.bottom;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HDC mem = CreateCompatibleDC(screen);
-    HGDIOBJ old = SelectObject(mem, bmp);
-    if (state == L"dropdown") g.openDrop = H_DD_ENC;
-    g.hwnd = nullptr;
-    g.status = state == L"recording" ? L"Recording…" : state == L"paused" ? L"Paused" : L"Ready";
-    g.statusColor = state == L"recording" ? C_ACCENT_B : state == L"paused" ? C_WARN : C_TEXT2;
-    for (int i = 0; i < 3; ++i) g.hkMsgColor[i] = C_OK;
-    g.s.micEnabled = true;
-    paint(mem, rc);
-    GdiFlush();
-    // write BMP
-    BITMAPFILEHEADER fh{}; fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof bi.bmiHeader;
-    DWORD sz = (DWORD)rc.right * rc.bottom * 4; fh.bfSize = fh.bfOffBits + sz;
-    BITMAPINFOHEADER ih = bi.bmiHeader; ih.biHeight = -rc.bottom;
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-    bool ok = f != INVALID_HANDLE_VALUE;
-    if (ok) {
-        DWORD w = 0;
-        ok = WriteFile(f, &fh, sizeof fh, &w, nullptr) && WriteFile(f, &ih, sizeof ih, &w, nullptr) && WriteFile(f, bits, sz, &w, nullptr);
-        CloseHandle(f);
+    g.mics = listMicrophones(); g.outs = listOutputDevices();
+    resolveSource();
+    g.status = L"Ready"; g.statusColor = toRef(T_TEXT2);
+    for (int i = 0; i < 3; ++i) g.hkMsgColor[i] = toRef(T_OK);
+    g_meter[0] = 0.58f; g_meter[1] = 0.66f;
+    g.s.micEnabled = true;  // screenshots show both chips live
+    if (state == L"recording") { g_fakeRec = true; }
+    if (state == L"settings") { g_viewIdx = 1; }
+    updatePreview();
+    const float s = scale(), W = 1100, H = 700;
+    gp::Bitmap bmp((INT)std::lround(W * s), (INT)std::lround(H * s), PixelFormat32bppARGB);
+    {
+        gp::Graphics gr(&bmp);
+        setupGraphics(gr, false);
+        gr.ScaleTransform(s, s);
+        paintAll(gr, W, H);
+        RecLayout L = recLayout(W, H);
+        if (state == L"source" || state == L"dropdown" || state == L"micpop") {
+            P.kind = state == L"micpop" ? PK_MIC : PK_SOURCE;
+            P.dd = state == L"micpop" ? H_MICCHIP : H_SRC;
+            P.anchor = state == L"micpop" ? L.mic : L.src;
+            layoutPopup();
+            P.open.set(1);
+            P.kb = -1;
+            paintAll(gr, W, H);  // field shows its open state
+            gr.TranslateTransform(P.x, P.y);
+            drawPopupFrame(gr);
+        }
     }
-    SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(nullptr, screen);
-    return ok ? 0 : 1;
+    CLSID cl{};
+    bool png = path.size() > 4 && _wcsicmp(path.c_str() + path.size() - 4, L".png") == 0;
+    if (encoderClsid(png ? L"image/png" : L"image/bmp", &cl) < 0) return 1;
+    return bmp.Save(path.c_str(), &cl, nullptr) == gp::Ok ? 0 : 1;
 }
 
 void enableDpiAwareness() {
@@ -1309,9 +2357,12 @@ int runCli(int argc, wchar_t** argv) {
         "  --test-tone          add a synthetic 440 Hz audio source (CI)\n"
         "  --pause-at S / --resume-at S  pause and resume at S seconds into the recording\n"
         "  --window TEXT        capture one window (title or exe substring) instead of the screen\n"
+        "  --source all|monitor[:N]|window:TEXT   what to capture (default: the saved source)\n"
+        "  --test-mic           synthetic noisy microphone through the real mic chain (CI)\n"
+        "  --noise-suppression on|off / --noise-gate DB (-80 = off) / --mic-volume PCT / --channels 1|2\n"
         "  --list-windows       list capturable windows\n"
         "  --render-ui FILE.bmp  paint the settings window to a BMP (docs/CI)\n"
-        "  --ui-state idle|dropdown\n"
+        "  --ui-state idle|source|settings|recording|micpop\n"
         "  --help               show this help\n\n"
         "Exit codes: 0 success, 1 recording failed, 2 invalid arguments.\n";
     auto bad = [&](const std::string& m) { emit("error: " + m + "\n\n" + usage, stderr); return 2; };
@@ -1325,6 +2376,17 @@ int runCli(int argc, wchar_t** argv) {
     o.fps = s.fps; o.quality = s.quality; o.encoder = s.encoder; o.container = s.container; o.captureCursor = s.captureCursor;
     o.scale = s.scale; o.gpuIndex = s.gpuIndex; o.bitrateCap = s.bitrateCap;
     o.systemAudio = false;  // CLI: audio only when asked for
+    o.channels = s.channels;
+    o.systemId = W(s.systemDevice);
+    g.s = s;  // saved audio chain settings (volume, noise suppression, gate) apply to CLI recordings too
+    applyAudioFx();
+    audioFx().micMuted = false; audioFx().systemMuted = false; audioFx().pushToTalk = false; audioFx().monitoring = false;
+    {   // saved source (same fallbacks as the app)
+        g_displays = listDisplays();
+        if (s.sourceKind == "all") o.allDisplays = true;
+        else if (s.sourceKind == "monitor") { for (auto& d : g_displays) if (U(d.device) == s.sourceMonitor) o.monitor = d.mon; }
+        else if (s.sourceKind == "window") { o.window = resolveSavedWindow(W(s.sourceExe), W(s.sourceTitle)); if (!o.window) o.allDisplays = true; }
+    }
     std::wstring patternPath;
     bool cliWarmup = false;
     std::string warmInfo;
@@ -1342,7 +2404,13 @@ int runCli(int argc, wchar_t** argv) {
         if (a == L"--system-audio") { o.systemAudio = true; continue; }
         if (a == L"--mic") { o.mic = true; continue; }
         if (a == L"--test-tone") { o.testTone = true; continue; }
+        if (a == L"--test-mic") { o.testMic = true; continue; }
         if (a == L"--warmup") { cliWarmup = true; continue; }
+        if (a == L"--list-sources") {
+            std::string o2;
+            for (auto& d : listDisplays()) { char b[200]; snprintf(b, sizeof b, "monitor:%d\t%s\t%ldx%ld%s\n", d.index, U(d.device).c_str(), d.rect.right - d.rect.left, d.rect.bottom - d.rect.top, d.primary ? "\tprimary" : ""); o2 += b; }
+            emit(o2, stdout); return 0;
+        }
         if (a == L"--list-windows") {
             std::string o2;
             for (auto& w : listCaptureWindows()) {
@@ -1356,12 +2424,38 @@ int runCli(int argc, wchar_t** argv) {
         if (a == L"--minimized") continue;
         if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality"
             && a != L"--out" && a != L"--log" && a != L"--scale" && a != L"--gpu" && a != L"--bitrate-cap"
-            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window")
+            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window"
+            && a != L"--source" && a != L"--noise-suppression" && a != L"--noise-gate" && a != L"--mic-volume" && a != L"--channels")
             return bad("unknown option " + U(a));
         if (!value(v)) return bad(U(a) + " needs a value");
         if (a == L"--window") {
             o.window = findCaptureWindow(W(v));
             if (!o.window) return bad("no capturable window matches '" + v + "' (see --list-windows)");
+            o.allDisplays = false; o.monitor = nullptr;
+        } else if (a == L"--source") {
+            o.window = nullptr; o.monitor = nullptr; o.allDisplays = false;
+            if (v == "all") o.allDisplays = true;
+            else if (v.rfind("monitor", 0) == 0) {
+                int n = v.size() > 8 && v[7] == ':' ? atoi(v.c_str() + 8) : 0;
+                if (n) { if (n > (int)g_displays.size()) return bad("--source monitor:N: there are " + std::to_string(g_displays.size()) + " displays"); o.monitor = g_displays[(size_t)n - 1].mon; }
+            } else if (v.rfind("window:", 0) == 0) {
+                o.window = findCaptureWindow(W(v.substr(7)));
+                if (!o.window) return bad("no capturable window matches '" + v.substr(7) + "' (see --list-windows)");
+            } else return bad("--source must be all, monitor[:N] or window:TEXT");
+        } else if (a == L"--noise-suppression") {
+            if (v != "on" && v != "off") return bad("--noise-suppression must be on or off");
+            audioFx().noiseSuppression = v == "on";
+        } else if (a == L"--noise-gate") {
+            char* end = nullptr; double d = strtod(v.c_str(), &end);
+            if (v.empty() || !end || *end || d < -80 || d > 0) return bad("--noise-gate must be -80..0 dB");
+            audioFx().gateDb = (float)d;
+        } else if (a == L"--mic-volume") {
+            char* end = nullptr; long d = strtol(v.c_str(), &end, 10);
+            if (v.empty() || !end || *end || d < 0 || d > 200) return bad("--mic-volume must be 0..200");
+            audioFx().micGain = d / 100.f;
+        } else if (a == L"--channels") {
+            if (v != "1" && v != "2") return bad("--channels must be 1 or 2");
+            o.channels = atoi(v.c_str());
         } else if (a == L"--record") {
             char* end = nullptr;
             double d = strtod(v.c_str(), &end);
@@ -1403,7 +2497,7 @@ int runCli(int argc, wchar_t** argv) {
             if (v.empty()) return bad("--render-ui needs a .bmp path");
             renderPath = W(v);
         } else if (a == L"--ui-state") {
-            if (v != "idle" && v != "dropdown") return bad("--ui-state must be idle or dropdown");
+            if (v != "idle" && v != "dropdown" && v != "source" && v != "settings" && v != "recording" && v != "micpop") return bad("--ui-state must be idle, source, settings, recording or micpop");
             uiState = W(v);
         } else if (a == L"--dpi") {
             char* end = nullptr; long d = strtol(v.c_str(), &end, 10);
@@ -1449,6 +2543,8 @@ int runCli(int argc, wchar_t** argv) {
     }
     if (!renderPath.empty()) {
         g.inst = GetModuleHandleW(nullptr);
+        gp::GdiplusStartupInput gsi; ULONG_PTR gpTok = 0;
+        gp::GdiplusStartup(&gpTok, &gsi, nullptr);
         loadIcons();
         int rc = renderUi(renderPath, uiState, renderDpi);
         emit(rc == 0 ? "ok=1 render-ui\n" : "ok=0 render-ui\n", stdout);
@@ -1569,9 +2665,17 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
                    L" from " + g.settingsFile + L": " + settingsSummary(g.s));
     }
     g.s.fps = normalizeFps(g.s.fps);
+    gp::GdiplusStartupInput gsi; ULONG_PTR gpTok = 0;
+    gp::GdiplusStartup(&gpTok, &gsi, nullptr);
     loadIcons();
+    loadUiIcons();
     enumGpus();
     g.mics = listMicrophones();  // so a saved microphone shows (and is used) right away
+    g.outs = listOutputDevices();
+    g.micMuted = g.s.micMuted;
+    applyAudioFx();
+    syncPtt();
+    startPttThread();
 
     WNDCLASSEXW wc{sizeof wc};
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1593,6 +2697,7 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     startWarmup();  // as early as possible: before the window is even shown
     g.dpi = dpiFor(g.hwnd);
     makeFonts();
+    makeUiFonts();
     int w = S(BASE_W), h = S(BASE_H);
     RECT wa = mi.rcWork;
     SetWindowPos(g.hwnd, nullptr, wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
@@ -1614,8 +2719,10 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     ShowWindow(g.hwnd, (minimized || g.s.startMinimized) ? SW_SHOWMINNOACTIVE : g.s.maximized ? SW_MAXIMIZE : SW_SHOW);
     if (g_selftestRecord) PostMessageW(g.hwnd, WM_APP + 5, 0, 0);  // CI cold start: press Record as soon as the loop runs
     if (g_selftest && !g_selftestRecord) SetTimer(g.hwnd, TIMER_SELFTEST, 4000, nullptr);
+    resolveSource();  // before the preview starts, so it opens on the saved source
     g.gprev.start(g.hwnd, previewRectNow(), g.s.captureCursor);
     if (!IsWindowVisible(g.hwnd)) g.gprev.setVisible(false);
+    restartMeter();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -1625,6 +2732,9 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     g.warm.waitUntilIdle(3000);
     if (!g.warmLogged && !g.warm.running() && g.warm.result().frames == 0 && !g.warm.result().latencyLog.empty())
         writeSessionLog(g.warm.result(), L"warm-up (encoder probe cache)");
+    stopMeter();
+    g_pttQuit = true;
+    if (g_pttTh.joinable()) g_pttTh.join();
     cr::appLog(L"exit");
     if (mtx) CloseHandle(mtx);
     CoUninitialize();

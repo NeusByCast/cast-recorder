@@ -28,6 +28,11 @@ struct RecordOptions {
     std::wstring micId;              // empty = default microphone
     bool testTone = false;           // CI: synthetic 440 Hz audio source
     HWND window = nullptr;           // capture this top-level window instead of the monitor (WGC)
+    HMONITOR monitor = nullptr;      // capture this monitor (nullptr = primary)
+    bool allDisplays = false;        // capture every monitor composited into one virtual-desktop frame (WGC)
+    std::wstring systemId;           // system-audio output device (empty = default, excluding our own sounds)
+    int channels = 1;                // 1 = mono, 2 = stereo AAC
+    bool testMic = false;            // CI: synthetic noisy microphone through the real mic chain
     bool pauseTones = false;         // UI plays pause/resume tones: keep them out of the audio
     bool warmupOnly = false;         // run setup (device, capture, probes, writer/AAC load) and exit before recording
     long long pressQpc = 0;          // QPC when the user asked to record (latency breakdown)

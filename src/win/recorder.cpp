@@ -3,6 +3,8 @@
 // BGRA texture (cursor is drawn with GDI), then wrapped with MFCreateDXGISurfaceBuffer. The sink writer's
 // GPU video processor converts BGRA->NV12 and feeds the vendor's hardware MFT (NVENC/AMF/QuickSync).
 #include "recorder.h"
+#include <climits>
+#include <algorithm>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3d10.h>
@@ -209,6 +211,46 @@ struct WgcSourceAdapter : Source {
         return cap.copyLatest(ctx, dst, timeoutMs, gotNew);
     }
 };
+// All displays: one WGC capture per monitor composited at its virtual-desktop offset (gaps stay black).
+struct WgcAllDisplays : Source {
+    struct Mon { std::unique_ptr<WgcCapture> cap; int x, y; };
+    std::vector<Mon> mons;
+    POINT origin{0, 0};
+    bool cleared = false;
+    const wchar_t* name() const override { return L"Windows Graphics Capture (all displays)"; }
+    bool init(ID3D11Device* d, bool cursor, std::wstring& err) {
+        std::vector<std::pair<HMONITOR, RECT>> ms;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT r, LPARAM p) -> BOOL {
+            ((std::vector<std::pair<HMONITOR, RECT>>*)p)->push_back({m, *r}); return TRUE; }, (LPARAM)&ms);
+        RECT u{INT_MAX, INT_MAX, INT_MIN, INT_MIN};
+        for (auto& m : ms) { u.left = std::min(u.left, m.second.left); u.top = std::min(u.top, m.second.top); u.right = std::max(u.right, m.second.right); u.bottom = std::max(u.bottom, m.second.bottom); }
+        if (ms.empty()) { err = L"no displays"; return false; }
+        origin = {u.left, u.top};
+        for (auto& m : ms) {
+            Mon x; x.cap = std::make_unique<WgcCapture>();
+            if (!x.cap->start(d, m.first, cursor, err)) return false;
+            x.x = m.second.left - u.left; x.y = m.second.top - u.top;
+            mons.push_back(std::move(x));
+        }
+        w = (UINT)(u.right - u.left) & ~1u; h = (UINT)(u.bottom - u.top) & ~1u;
+        return true;
+    }
+    bool acquire(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew) override {
+        if (!cleared) {
+            ComPtr<ID3D11Device> d; ctx->GetDevice(&d); ComPtr<ID3D11RenderTargetView> rtv;
+            if (SUCCEEDED(d->CreateRenderTargetView(dst, nullptr, &rtv))) { const float k[4] = {0, 0, 0, 1}; ctx->ClearRenderTargetView(rtv.Get(), k); }
+            cleared = true;
+        }
+        gotNew = false;
+        bool ok = true;
+        for (size_t i = 0; i < mons.size(); ++i) {
+            bool g = false;
+            ok &= mons[i].cap->copyLatest(ctx, dst, i == 0 ? timeoutMs : 0, g, mons[i].x, mons[i].y);
+            gotNew |= g;
+        }
+        return ok;
+    }
+};
 #endif
 
 void drawCursor(ID3D11Texture2D* frame, POINT origin) {
@@ -395,6 +437,7 @@ struct Writer {
     }
     DWORD astream = 0;
     bool audio = false;
+    UINT32 achannels = 2;
     // AAC 48 kHz stereo track encoded by the sink writer's AAC MFT from s16 PCM. Call before BeginWriting.
     bool addAudio(std::wstring& err) {
         ComPtr<IMFMediaType> o, i;
@@ -403,8 +446,8 @@ struct Writer {
         o->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
         o->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
         o->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
-        o->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AudioMixer::kChannels);
-        o->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);  // 192 kbps
+        o->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, achannels);
+        o->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, achannels == 1 ? 16000 : 24000);  // 128 / 192 kbps
         o->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
         HRESULT hr = sw->AddStream(o.Get(), &astream);
         MFCreateMediaType(&i);
@@ -412,9 +455,9 @@ struct Writer {
         i->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
         i->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
         i->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
-        i->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AudioMixer::kChannels);
-        i->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
-        i->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AudioMixer::kRate * 4);
+        i->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, achannels);
+        i->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * achannels);
+        i->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AudioMixer::kRate * 2 * achannels);
         if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(astream, i.Get(), nullptr);
         if (FAILED(hr)) { err = hrMsg(L"Audio stream (AAC)", hr); return false; }
         audio = true;
@@ -428,7 +471,7 @@ struct Writer {
         BYTE* p = nullptr;
         if (SUCCEEDED(hr) && SUCCEEDED(hr = b->Lock(&p, nullptr, nullptr))) { memcpy(p, pcm.data(), bytes); b->Unlock(); b->SetCurrentLength(bytes); }
         if (SUCCEEDED(hr)) hr = MFCreateSample(&s);
-        if (SUCCEEDED(hr)) { s->AddBuffer(b.Get()); s->SetSampleTime(t); s->SetSampleDuration((LONGLONG)(pcm.size() / 2) * 10000000LL / AudioMixer::kRate); }
+        if (SUCCEEDED(hr)) { s->AddBuffer(b.Get()); s->SetSampleTime(t); s->SetSampleDuration((LONGLONG)(pcm.size() / achannels) * 10000000LL / AudioMixer::kRate); }
         if (SUCCEEDED(hr)) hr = sw->WriteSample(astream, s.Get());
         return hr;
     }
@@ -707,7 +750,8 @@ void Recorder::run() {
 
     [&] {
         // ---- device on the adapter that owns the primary monitor (or an explicit gpuIndex) ----
-        HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        HMONITOR mon = opt_.monitor ? opt_.monitor : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        if (opt_.window) { HMONITOR wm = MonitorFromWindow(opt_.window, MONITOR_DEFAULTTONULL); if (wm) mon = wm; }
         ComPtr<IDXGIFactory1> fac;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) { r.message = L"DXGI unavailable"; return; }
         ComPtr<IDXGIAdapter1> adapter;
@@ -782,7 +826,8 @@ void Recorder::run() {
         mixer.systemMuteUntil = 3000000;  // start tone (only where it could be captured: mic / no self-exclusion)
         auto audioReady = std::async(std::launch::async, [&] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            if (!opt_.warmupOnly) mixer.start(opt_.systemAudio, opt_.mic, opt_.micId, opt_.testTone, alog);
+            mixer.channels = opt_.channels == 1 ? 1 : 2;
+            if (!opt_.warmupOnly) mixer.start(opt_.systemAudio, opt_.mic, opt_.micId, opt_.testTone, alog, opt_.systemId, opt_.testMic, false);
             CoUninitialize();
         });
         struct AudioJoin { std::future<void>& f; ~AudioJoin() { if (f.valid()) f.wait(); } } audioJoin{audioReady};
@@ -801,6 +846,11 @@ void Recorder::run() {
             if (!src) { r.message = L"Window capture unavailable: " + capErr; return; }
         }
 #ifdef CR_HAVE_WGC
+        if (!src && !opt_.forcePattern && opt_.allDisplays) {
+            auto w = std::make_unique<WgcAllDisplays>();
+            if (w->init(dev.Get(), opt_.captureCursor, capErr)) src = std::move(w);
+            else r.encoderLog += L"all displays: " + capErr + L" (falling back to one monitor)\n";
+        }
         if (!src && !opt_.forcePattern) {
             auto w = std::make_unique<WgcSourceAdapter>();
             if (w->init(dev.Get(), mon, opt_.captureCursor, capErr)) src = std::move(w);
@@ -820,6 +870,11 @@ void Recorder::run() {
         mark(L"capture_init");
         UINT W = 0, H = 0;  // encoded size (even; optionally downscaled)
         scaledSize(opt_.scale, src->w, src->h, W, H);
+        if (W > 4096 || H > 4096) {  // H.264 level 5.2 limit (wide multi-display desktops): fit inside 4096
+            double k = 4096.0 / (double)std::max(W, H);
+            W = (UINT)(W * k) & ~1u; H = (UINT)(H * k) & ~1u;
+            r.encoderLog += L"capture larger than 4096: encoding " + std::to_wstring(W) + L"x" + std::to_wstring(H) + L"\n";
+        }
 
         D3D11_TEXTURE2D_DESC td{};
         td.Width = src->w; td.Height = src->h; td.MipLevels = 1; td.ArraySize = 1;
@@ -888,6 +943,7 @@ void Recorder::run() {
             r.encoderLog += alog;
             mark(L"audio_wait");
             wr.wantAudio = mixer.active() || opt_.warmupOnly;
+            wr.achannels = (UINT32)mixer.channels;
             r.hasAudio = wr.wantAudio;
             if (opt_.encoder != Encoder::Software && videoSupport) {
                 auto encs = hwEncodersForDevice(dev.Get(), elog);

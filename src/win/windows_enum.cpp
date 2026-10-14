@@ -1,6 +1,7 @@
 #include "windows_enum.h"
 #include <dwmapi.h>
 #include <cwctype>
+#include <algorithm>
 
 namespace cr {
 namespace {
@@ -67,5 +68,30 @@ HWND findCaptureWindow(const std::wstring& q) {
     for (auto& w : listCaptureWindows())
         if (lower(w.title).find(l) != std::wstring::npos || lower(w.exe).find(l) != std::wstring::npos) return w.hwnd;
     return nullptr;
+}
+std::wstring windowExe(HWND h) { return exeOf(h); }
+
+HWND resolveSavedWindow(const std::wstring& exe, const std::wstring& title) {
+    if (exe.empty()) return nullptr;
+    auto ws = listCaptureWindows();
+    std::wstring le = lower(exe);
+    for (auto& w : ws) if (lower(w.exe) == le && w.title == title) return w.hwnd;
+    for (auto& w : ws) if (lower(w.exe) == le) return w.hwnd;
+    return nullptr;
+}
+
+std::vector<DisplayInfo> listDisplays() {
+    std::vector<DisplayInfo> v;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM p) -> BOOL {
+        MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+        if (!GetMonitorInfoW(m, &mi)) return TRUE;
+        DisplayInfo d; d.mon = m; d.device = mi.szDevice; d.rect = mi.rcMonitor; d.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        ((std::vector<DisplayInfo>*)p)->push_back(d);
+        return TRUE;
+    }, (LPARAM)&v);
+    std::sort(v.begin(), v.end(), [](const DisplayInfo& a, const DisplayInfo& b) {
+        return a.rect.left != b.rect.left ? a.rect.left < b.rect.left : a.rect.top < b.rect.top; });
+    for (size_t i = 0; i < v.size(); ++i) v[i].index = (int)i + 1;
+    return v;
 }
 }  // namespace cr

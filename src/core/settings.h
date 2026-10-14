@@ -27,7 +27,20 @@ struct Settings {
     bool startMinimized = false;
     bool maximized = false;
     std::string gpuName;             // adapter description (stable across driver/list order changes); gpuIndex is a hint
-    bool pauseTones = false;         // play a tick on pause/resume (off: the mic would pick it up)          // window state, restored at launch
+    bool pauseTones = false;         // play a tick on pause/resume (off: the mic would pick it up)
+    // v2 source picker: "all", "monitor" (sourceMonitor = \\.\DISPLAYn), "window" (exe + title, re-found at launch)
+    std::string sourceKind = "all";      // default: Full screen (all displays)
+    std::string sourceMonitor, sourceExe, sourceTitle;
+    // v2 audio
+    std::string systemDevice;          // UTF-8 output endpoint id; empty = default (excludes our own sounds)
+    bool systemMuted = false, micMuted = false;  // chip mute state
+    int micVolume = 100;               // 0..200 %
+    bool noiseSuppression = false;
+    int noiseGateDb = -42;             // -80 = off .. 0
+    bool monitoring = false;           // hear the processed mic on the default output
+    bool pushToTalk = false;
+    Hotkey pttKey{MOD_CTRL_, 0x20};    // Ctrl+Space (held)
+    int channels = 1;                  // 1 mono, 2 stereo
     OutputScale scale = OutputScale::Native;
     int gpuIndex = -1;                 // -1 Auto; else adapter ordinal
     unsigned bitrateCap = 0;           // 0 = uncapped beyond quality

@@ -18,7 +18,8 @@ public:
     bool startWindow(ID3D11Device* dev, HWND hwnd, bool cursor, std::wstring& err);
     bool closed() const;       // captured window/item went away
     std::wstring takeEvents(); // "minimized", "restored", "resized WxH", "closed"
-    bool copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew);
+    // dx/dy: destination offset (all-displays compositing). The copy is clipped to dst.
+    bool copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew, int dx = 0, int dy = 0);
     UINT width() const;
     UINT height() const;
 private:

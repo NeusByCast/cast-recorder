@@ -130,7 +130,57 @@ static void testSettings() {
     CHECK_EQ(std::string(extension(Container::MKV)), std::string(".mkv"));
 }
 
+#include "micfx.h"
+#include <cmath>
+#include <random>
+static double rms(const std::vector<float>& v, size_t a, size_t b) { double s = 0; for (size_t i = a; i < b; ++i) s += v[i] * v[i]; return std::sqrt(s / (double)(b - a)); }
+static void testMicFx() {
+    // 1 s of noise, then 1 s of 300 Hz tone + the same noise level, in 480-sample chunks
+    std::mt19937 rng(1); std::normal_distribution<float> nd(0.f, 0.01f);
+    const size_t N = 96000;
+    std::vector<float> in(N), out(N);
+    for (size_t i = 0; i < N; ++i) in[i] = nd(rng) + (i >= 48000 ? 0.25f * (float)std::sin(2 * 3.14159265 * 300 * i / 48000.0) : 0.f);
+    cr::MicFx fx; cr::MicFxParams p; p.noiseSuppression = true; p.gateDb = -80;
+    out = in;
+    for (size_t i = 0; i < N; i += 480) fx.process(out.data() + i, 480, p);
+    CHECK(fx.delay() == cr::MicFx::kN);
+    // noise-only region (after convergence) attenuated by >= 10 dB
+    double nin = rms(in, 24000, 46000), nout = rms(out, 24000 + 1024, 46000 + 1024);
+    std::printf("micfx: noise %.4f -> %.4f\n", nin, nout);
+    CHECK(nout < nin * 0.32);
+    // tone survives (aligned by the reported delay): within 2 dB
+    double tin = rms(in, 60000, 90000), tout = rms(out, 60000 + 1024, 90000 + 1024);
+    CHECK(tout > tin * 0.79 && tout < tin * 1.26);
+    // gate at -42 dBFS closes on -40 dBFS noise only... use quieter noise: 0.002 rms (-54 dB)
+    std::vector<float> q(N);
+    for (size_t i = 0; i < N; ++i) q[i] = nd(rng) * 0.2f + (i >= 48000 ? 0.25f * (float)std::sin(2 * 3.14159265 * 300 * i / 48000.0) : 0.f);
+    std::vector<float> qo = q;
+    cr::MicFx g2; cr::MicFxParams p2; p2.gateDb = -42;
+    for (size_t i = 0; i < N; i += 480) g2.process(qo.data() + i, 480, p2);
+    CHECK(rms(qo, 24000, 46000) < rms(q, 24000, 46000) * 0.05);  // closed
+    CHECK(rms(qo, 60000, 90000) > rms(q, 60000, 90000) * 0.95);  // open on the tone
+    // gain
+    std::vector<float> gv(480, 0.5f); cr::MicFx g3; cr::MicFxParams p3; p3.gain = 2.0f; p3.gateDb = -80;
+    g3.process(gv.data(), 480, p3);
+    CHECK(std::fabs(gv[100] - 1.0f) < 1e-6f);
+}
+
+static void testSettingsV2() {
+    cr::Settings a; a.sourceKind = "window"; a.sourceExe = "notepad.exe"; a.sourceTitle = "Untitled - Notepad \"x\"";
+    a.sourceMonitor = "\\\\.\\DISPLAY2"; a.systemDevice = "{0.0.0.00000000}.{abc}"; a.systemMuted = true; a.micMuted = true;
+    a.micVolume = 150; a.noiseSuppression = true; a.noiseGateDb = -50; a.monitoring = true; a.pushToTalk = true;
+    a.pttKey = cr::Hotkey{cr::MOD_ALT_, 0x56}; a.channels = 2;
+    cr::Settings b; CHECK(cr::fromJson(cr::toJson(a), b));
+    CHECK(b.sourceKind == "window" && b.sourceExe == a.sourceExe && b.sourceTitle == a.sourceTitle && b.sourceMonitor == a.sourceMonitor);
+    CHECK(b.systemDevice == a.systemDevice && b.systemMuted && b.micMuted && b.micVolume == 150 && b.noiseSuppression);
+    CHECK(b.noiseGateDb == -50 && b.monitoring && b.pushToTalk && b.pttKey == a.pttKey && b.channels == 2);
+    cr::Settings c; CHECK(cr::fromJson("{\"micVolume\": 900, \"channels\": 7, \"sourceKind\": \"bogus\", \"noiseGateDb\": 5}", c));
+    CHECK(c.micVolume == 100 && c.channels == 1 && c.sourceKind == "all" && c.noiseGateDb == -42);
+}
+
 int main() {
+    testSettingsV2();
+    testMicFx();
     testParseFormat();
     testValidateConflicts();
     testSettings();

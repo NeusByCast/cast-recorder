@@ -126,7 +126,7 @@ bool WgcCapture::Impl::begin(ID3D11Device* devIn, bool cursor, std::wstring& err
     }
 }
 
-bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew) {
+bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew, int dx, int dy) {
     gotNew = false;
     try {
         DWORD start = GetTickCount();
@@ -159,8 +159,12 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
         auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         winrt::com_ptr<ID3D11Texture2D> tex;
         winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(tex.put())));
-        D3D11_BOX box{0, 0, 0, (UINT)std::min(cs.Width, (int)p_->w), (UINT)std::min(cs.Height, (int)p_->h), 1};
-        ctx->CopySubresourceRegion(dst, 0, 0, 0, 0, tex.get(), 0, &box);
+        D3D11_TEXTURE2D_DESC dd{}; dst->GetDesc(&dd);
+        int bw = std::min(std::min(cs.Width, (int)p_->w), (int)dd.Width - dx), bh = std::min(std::min(cs.Height, (int)p_->h), (int)dd.Height - dy);
+        if (dx >= 0 && dy >= 0 && bw > 0 && bh > 0) {
+            D3D11_BOX box{0, 0, 0, (UINT)bw, (UINT)bh, 1};
+            ctx->CopySubresourceRegion(dst, 0, (UINT)dx, (UINT)dy, 0, tex.get(), 0, &box);
+        }
         frame.Close();
         gotNew = true;
         return true;
