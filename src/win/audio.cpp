@@ -61,6 +61,7 @@ struct AudioSource {
     std::wstring name;
     std::mutex m;
     std::vector<float> fifo;  // interleaved stereo
+    unsigned long long received = 0, filled = 0, trimmed = 0, silentFlagged = 0;
     size_t head = 0;
     std::atomic<bool> quit{false};
     std::thread th;
@@ -102,10 +103,12 @@ struct AudioSource {
                 {
                     std::lock_guard<std::mutex> g(m);
                     const float* f = (const float*)data;
+                    received += frames;
+                    if (fl & AUDCLNT_BUFFERFLAGS_SILENT) silentFlagged += frames;
                     for (UINT32 i = 0; i < frames * 2; ++i) fifo.push_back((fl & AUDCLNT_BUFFERFLAGS_SILENT) ? 0.f : f[i]);
                     // keep at most ~250 ms (device clock running ahead of ours)
                     size_t avail = fifo.size() - head, maxS = AudioMixer::kRate / 4 * 2;
-                    if (avail > maxS) head += avail - maxS;
+                    if (avail > maxS) { trimmed += (avail - maxS) / 2; head += avail - maxS; }
                     if (head > 1 << 20) { fifo.erase(fifo.begin(), fifo.begin() + head); head = 0; }
                 }
                 cap->ReleaseBuffer(frames);
@@ -146,6 +149,17 @@ bool AudioMixer::start(bool system, bool mic, const std::wstring& micId, bool te
     return active();
 }
 
+std::wstring AudioMixer::stats() const {
+    std::wstring r;
+    for (auto& s : sources_) {
+        wchar_t b[200];
+        swprintf(b, 200, L"%ls: received=%llu silent_flagged=%llu silence_filled=%llu trimmed=%llu; ", s->name.c_str(),
+                 s->received, s->silentFlagged, s->filled, s->trimmed);
+        r += b;
+    }
+    return r;
+}
+
 void AudioMixer::stop() { sources_.clear(); tone_ = false; }
 
 void AudioMixer::discard() { for (auto& s : sources_) s->clear(); }
@@ -161,8 +175,10 @@ void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& ou
     std::vector<float> mix(n * 2, 0.f), tmp(n * 2);
     for (auto& s : sources_) {
         size_t got = s->pull(tmp.data(), n);
-        if (got < n) underrunFrames += n - got;
+        if (got < n) { underrunFrames += n - got; s->filled += n - got; }
         if (s->isMic && micMuted.load()) continue;
+        // Our own start/stop tone goes out through the speakers: keep it out of the system-audio track.
+        if (!s->isMic && (final || pos_ * 10000000LL / kRate < systemMuteUntil)) continue;
         for (size_t i = 0; i < got * 2; ++i) mix[i] += tmp[i];
     }
     if (tone_) {

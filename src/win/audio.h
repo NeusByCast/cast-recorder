@@ -28,6 +28,9 @@ public:
     void discard();  // while paused: drop device data, don't advance
     std::atomic<bool> micMuted{false};
     unsigned long long underrunFrames = 0, overrunFrames = 0;
+    // Zero system audio for media time < this (start beep) and in the final flush (stop beep).
+    long long systemMuteUntil = 0;
+    std::wstring stats() const;  // per-source frames received / silence-filled / trimmed
 private:
     std::vector<std::unique_ptr<AudioSource>> sources_;
     bool tone_ = false;

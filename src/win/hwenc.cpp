@@ -126,6 +126,7 @@ bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT 
     if (info.index < 0 || (size_t)info.index >= acts.size()) { log += L"open: encoder index gone\n"; return false; }
     act_ = acts[info.index];
     label = info.name;
+    argb_ = info.argb;
     HRESULT hr = act_->ActivateObject(IID_PPV_ARGS(&mft_));
     logHr(log, L"ActivateObject", hr);
     if (FAILED(hr)) return false;
@@ -180,6 +181,7 @@ bool HwEncoder::openSoftware(UINT w, UINT h, int fps, unsigned bitrate, bool hig
 bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log) {
     HRESULT hr = S_OK;
     w_ = w; h_ = h; fps_ = fps; br_ = bitrate;
+    const GUID inSub = argb_ ? MFVideoFormat_ARGB32 : MFVideoFormat_NV12;
     // Rate control / latency before types (some drivers lock these at SetOutputType).
     ComPtr<ICodecAPI> codec;
     if (SUCCEEDED(mft_->QueryInterface(kIID_ICodecAPI, (void**)codec.GetAddressOf())) && codec) {
@@ -225,9 +227,9 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
         ComPtr<IMFMediaType> t;
         if (FAILED(mft_->GetInputAvailableType(inId_, i, &t))) break;
         GUID sub{};
-        if (SUCCEEDED(t->GetGUID(MF_MT_SUBTYPE, &sub)) && sub == MFVideoFormat_NV12) { inT = t; found = true; }
+        if (SUCCEEDED(t->GetGUID(MF_MT_SUBTYPE, &sub)) && (sub == inSub || (argb_ && sub == MFVideoFormat_RGB32))) { inT = t; found = true; }
     }
-    if (!inT) { MFCreateMediaType(&inT); inT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video); inT->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12); }
+    if (!inT) { MFCreateMediaType(&inT); inT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video); inT->SetGUID(MF_MT_SUBTYPE, inSub); }
     inT->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     inT->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
     inT->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
@@ -237,7 +239,7 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
     MFSetAttributeRatio(inT.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
     MFSetAttributeRatio(inT.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     hr = mft_->SetInputType(inId_, inT.Get(), 0);
-    logHr(log, L"SetInputType(NV12)", hr);
+    logHr(log, argb_ ? L"SetInputType(ARGB32)" : L"SetInputType(NV12)", hr);
     if (FAILED(hr)) return false;
 
     MFT_OUTPUT_STREAM_INFO osi{};
@@ -444,7 +446,7 @@ bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h
             if (SUCCEEDED(pdev.As(&mt))) mt->SetMultithreadProtected(TRUE);
             if (enc->open(pdev.Get(), info, w, h, fps, 4000000, false, lg)) {
                 D3D11_TEXTURE2D_DESC td{};
-                td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_NV12;
+                td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = info.argb ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_NV12;
                 td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
                 ComPtr<ID3D11Texture2D> tex;
                 hr = pdev->CreateTexture2D(&td, nullptr, &tex);

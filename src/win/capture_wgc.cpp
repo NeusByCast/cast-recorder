@@ -2,6 +2,7 @@
 #include "capture_wgc.h"
 #include <dxgi.h>
 #include <algorithm>
+#include <chrono>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/Windows.Foundation.h>
@@ -59,6 +60,10 @@ bool WgcCapture::start(ID3D11Device* dev, HMONITOR mon, bool cursor, std::wstrin
         p_->session.IsCursorCaptureEnabled(cursor);
         if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsBorderRequired")) {
             try { p_->session.IsBorderRequired(false); } catch (...) {}
+        }
+        // Windows 11 24H2+: default MinUpdateInterval throttles delivery; ask for every composed frame.
+        if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
+            try { p_->session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{std::chrono::milliseconds(1)}); } catch (...) {}
         }
         p_->session.StartCapture();
         return p_->w && p_->h;

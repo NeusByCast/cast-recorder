@@ -224,32 +224,46 @@ struct GpuConvert {
     UINT inW = 0, inH = 0, outW = 0, outH = 0;
     bool ok = false;
 
+    std::wstring why;  // last init failure, with HRESULT
+    bool fail(const wchar_t* what, HRESULT hr) { wchar_t b[160]; swprintf(b, 160, L"%ls: 0x%08lX", what, (unsigned long)hr); why = b; return false; }
     bool init(ID3D11Device* d, UINT srcW, UINT srcH, UINT dstW, UINT dstH) {
         inW = srcW; inH = srcH; outW = dstW; outH = dstH;
-        if (FAILED(d->QueryInterface(IID_PPV_ARGS(&vdev))) || FAILED(d->QueryInterface(IID_PPV_ARGS(&vctx)))) return false;
+        HRESULT hr;
+        if (FAILED(hr = d->QueryInterface(IID_PPV_ARGS(&vdev)))) return fail(L"QI ID3D11VideoDevice", hr);
+        ComPtr<ID3D11DeviceContext> ic; d->GetImmediateContext(&ic);
+        if (FAILED(hr = ic.As(&vctx))) return fail(L"QI ID3D11VideoContext", hr);
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
         cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
         cd.InputWidth = srcW; cd.InputHeight = srcH;
         cd.OutputWidth = dstW; cd.OutputHeight = dstH;
-        cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
-        if (FAILED(vdev->CreateVideoProcessorEnumerator(&cd, &venum))) return false;
-        D3D11_VIDEO_PROCESSOR_CAPS caps{};
-        if (FAILED(venum->GetVideoProcessorCaps(&caps))) return false;
-        if (FAILED(vdev->CreateVideoProcessor(venum.Get(), 0, &vp))) return false;
+        cd.InputFrameRate = {60, 1}; cd.OutputFrameRate = {60, 1};
+        cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+        if (FAILED(hr = vdev->CreateVideoProcessorEnumerator(&cd, &venum))) {
+            cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+            if (FAILED(hr = vdev->CreateVideoProcessorEnumerator(&cd, &venum))) return fail(L"CreateVideoProcessorEnumerator", hr);
+        }
+        UINT fin = 0, fout = 0;
+        venum->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &fin);
+        venum->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &fout);
+        if (!(fin & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) return fail(L"VP: BGRA input unsupported", (HRESULT)fin);
+        if (!(fout & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) return fail(L"VP: NV12 output unsupported", (HRESULT)fout);
+        if (FAILED(hr = vdev->CreateVideoProcessor(venum.Get(), 0, &vp))) return fail(L"CreateVideoProcessor", hr);
         D3D11_TEXTURE2D_DESC td{};
         td.Width = dstW; td.Height = dstH; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_NV12; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(d->CreateTexture2D(&td, nullptr, &nv12))) return false;
+        if (FAILED(hr = d->CreateTexture2D(&td, nullptr, &nv12))) {
+            td.BindFlags = D3D11_BIND_RENDER_TARGET;  // some iGPUs refuse SRV on NV12
+            if (FAILED(hr = d->CreateTexture2D(&td, nullptr, &nv12))) return fail(L"CreateTexture2D(NV12 RT)", hr);
+        }
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
         ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        if (FAILED(vdev->CreateVideoProcessorOutputView(nv12.Get(), venum.Get(), &ovd, &outView))) return false;
+        if (FAILED(hr = vdev->CreateVideoProcessorOutputView(nv12.Get(), venum.Get(), &ovd, &outView))) return fail(L"CreateVideoProcessorOutputView(NV12)", hr);
         RECT src{0, 0, (LONG)srcW, (LONG)srcH}, dst{0, 0, (LONG)dstW, (LONG)dstH};
         vctx->VideoProcessorSetStreamFrameFormat(vp.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
         vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &src);
         vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dst);
         vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &dst);
-        // Full-range RGB in -> BT.709 limited-range YCbCr out (matches what the encoder signals).
         D3D11_VIDEO_PROCESSOR_COLOR_SPACE in{}; in.RGB_Range = 0; in.YCbCr_Matrix = 1;
         D3D11_VIDEO_PROCESSOR_COLOR_SPACE out{}; out.Usage = 0; out.RGB_Range = 0; out.YCbCr_Matrix = 1;
         out.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
@@ -747,6 +761,7 @@ void Recorder::run() {
         {
             std::wstring alog;
             mixer.start(opt_.systemAudio, opt_.mic, opt_.micId, opt_.testTone, alog);
+            mixer.systemMuteUntil = 3500000;  // 350 ms: the start tone (160 ms) + device latency
             r.encoderLog += alog;
         }
         Writer wr;
@@ -773,6 +788,7 @@ void Recorder::run() {
         const std::wstring tmp = opt_.container == Container::MP4 ? opt_.outputPath : opt_.outputPath + L".part.mp4";
         GpuConvert conv;
         bool zeroCopy = false;
+        bool bgraDirect = false;  // HW encoder fed BGRA textures (no VideoProcessor)
         std::unique_ptr<HwEncoder> hw;
         bool opened = false;
         std::wstring& elog = r.encoderLog;
@@ -782,7 +798,15 @@ void Recorder::run() {
             std::stable_sort(encs.begin(), encs.end(), [want](const HwEncoderInfo& a, const HwEncoderInfo& b) {
                 return (want && a.pciVendor == want) > (want && b.pciVendor == want);
             });
-            if (!encs.empty() && conv.init(dev.Get(), src->w, src->h, W, H)) {
+            bool vpOk = !encs.empty() && conv.init(dev.Get(), src->w, src->h, W, H);
+            if (!encs.empty() && !vpOk) {
+                elog += L"GPU NV12 conversion unavailable (" + conv.why + L"): feeding the encoder BGRA surfaces directly\n";
+                conv = GpuConvert{};
+                W = src->w & ~1u; H = src->h & ~1u;  // no GPU scaler on this path: native size
+                for (auto& e : encs) e.argb = true;
+                bgraDirect = true;
+            }
+            if (!encs.empty()) {
                 for (auto& e : encs) {
                     elog += L"probe " + e.name + L"\n";
                     if (!probeHwEncoder(dev.Get(), e, W, H, opt_.fps, 2500, elog)) { r.encoderFallbacks.push_back(e.name); continue; }
@@ -796,7 +820,8 @@ void Recorder::run() {
                     enc->release();
                     r.encoderFallbacks.push_back(e.name);
                 }
-            } else if (!encs.empty()) elog += L"GPU NV12 conversion unavailable: hardware path skipped\n";
+            }
+            if (!opened) bgraDirect = false;
         }
         bool swNv12 = false;  // software MFT fed CPU NV12, muxed by the same pass-through writer as hardware
         if (!opened) {
@@ -844,7 +869,7 @@ void Recorder::run() {
         if (FAILED(dev->CreateTexture2D(&td, nullptr, &latest))) { r.message = L"CreateTexture2D failed"; return; }
         // Ring of encode surfaces so the async encoder never reads a texture we're overwriting.
         D3D11_TEXTURE2D_DESC ed = td; ed.Width = W; ed.Height = H; ed.MiscFlags = 0;
-        if (zeroCopy) ed.Format = DXGI_FORMAT_NV12;
+        if (zeroCopy && !bgraDirect) ed.Format = DXGI_FORMAT_NV12;
         const int RING = 16;  // > encoder queue + in-flight, so the async MFT never reads a surface we overwrite
         ComPtr<ID3D11Texture2D> ring[RING];
         ComPtr<ID3D11Texture2D> staging;
@@ -861,7 +886,7 @@ void Recorder::run() {
             nv12Cpu.resize((size_t)W * H * 3 / 2);
         }
         if (zeroCopy) {
-            if (FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return; }
+            if (!bgraDirect && FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return; }
         }
         if (!zeroCopy && !swNv12) {
             D3D11_TEXTURE2D_DESC sd = ed; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -942,7 +967,11 @@ void Recorder::run() {
             ID3D11Texture2D* t = ring[next % RING].Get();
             LARGE_INTEGER cs0; QueryPerformanceCounter(&cs0);
             ComPtr<IMFMediaBuffer> buf;
-            if (zeroCopy && !cpuFallback) {
+            if (bgraDirect) {
+                ctx->CopySubresourceRegion(t, 0, 0, 0, 0, latest.Get(), 0, &box);
+                whr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), t, 0, FALSE, &buf);
+                if (SUCCEEDED(whr)) { ComPtr<IMF2DBuffer> b2; if (SUCCEEDED(buf.As(&b2))) { DWORD len = 0; b2->GetContiguousLength(&len); buf->SetCurrentLength(len); } }
+            } else if (zeroCopy && !cpuFallback) {
                 // GPU BGRA->NV12 (+scale) into the ring surface; no CPU readback.
                 bool okConv = conv.convert(latest.Get());
                 LARGE_INTEGER nowc; QueryPerformanceCounter(&nowc);
@@ -969,7 +998,8 @@ void Recorder::run() {
                     }
                 }
             }
-            if ((zeroCopy && cpuFallback) || swNv12) {
+            if (bgraDirect) {
+            } else if ((zeroCopy && cpuFallback) || swNv12) {
                 ctx->CopyResource(cpuStaging.Get(), latest.Get());
                 D3D11_MAPPED_SUBRESOURCE m{};
                 whr = ctx->Map(cpuStaging.Get(), 0, D3D11_MAP_READ, 0, &m);
@@ -1050,12 +1080,13 @@ void Recorder::run() {
             pushAudio(next * dur, true);
             while (!audioPending.empty()) { wr.writeAudio(audioPending.front().second, audioPending.front().first); audioPending.pop_front(); }
         }
+        r.encoderLog += L"audio stats: " + mixer.stats() + L"\n";
         mixer.stop();
 
         {   // diagnostics: effective path
             wchar_t b[512];
-            swprintf(b, 512, L"adapter=%ls; output=%ls; encoder=%ls; zero_copy=%ls; cpu_fallback=%ls; size=%ux%u@%d; dropped=%llu; duplicated=%llu; convert_failures=%llu",
-                     adapterName.c_str(), output ? L"local" : L"cross-adapter", r.encoderUsed.c_str(), zeroCopy ? L"yes" : L"no", r.cpuFallback ? L"yes" : L"no", W, H, opt_.fps,
+            swprintf(b, 512, L"adapter=%ls; output=%ls; encoder=%ls; zero_copy=%ls%ls; cpu_fallback=%ls; size=%ux%u@%d; dropped=%llu; duplicated=%llu; convert_failures=%llu",
+                     adapterName.c_str(), output ? L"local" : L"cross-adapter", r.encoderUsed.c_str(), zeroCopy ? L"yes" : L"no", bgraDirect ? L" (bgra)" : L"", r.cpuFallback ? L"yes" : L"no", W, H, opt_.fps,
                      r.dropped, r.duplicated, r.convertFailures);
             r.pathLog = b;
             swprintf(b, 512, L"; capture_fps=%.1f; encode_fps=%.1f; convert_ms=%.2f; encode_ms=%.2f; audio=%ls; audio_underrun_frames=%llu",

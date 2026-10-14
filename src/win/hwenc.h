@@ -18,6 +18,7 @@ struct HwEncoderInfo {
     std::wstring name;     // friendly name
     UINT pciVendor = 0;
     int index = 0;         // ordinal in the LUID-filtered enumeration
+    bool argb = false;     // feed BGRA (MFVideoFormat_ARGB32) surfaces instead of NV12 (VideoProcessor unavailable)
 };
 
 // Hardware H.264 encoders registered for the adapter that owns `dev` (MFT_ENUM_ADAPTER_LUID).
@@ -54,6 +55,7 @@ private:
     std::vector<Microsoft::WRL::ComPtr<IMFSample>> queue_;  // waiting for METransformNeedInput (max 4)
     HRESULT submitQueued();
     bool sync_ = false;
+    bool argb_ = false;
     bool gotKey_ = false;
     std::vector<BYTE> seqHeader_;
     UINT w_ = 0, h_ = 0; int fps_ = 30; unsigned br_ = 0; UINT32 profile_ = 77;
