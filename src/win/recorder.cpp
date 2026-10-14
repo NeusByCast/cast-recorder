@@ -869,6 +869,22 @@ void Recorder::run() {
         }
         D3D11_BOX box{0, 0, 0, W, H, 1};
 
+        // ---- pre-warm: the pass-through MP4 writer opens on the first encoded frame; load the MP4 sink and the
+        // AAC encoder once now so that open doesn't stall the paced loop (CI saw ~250 ms -> 8 dropped frames).
+        if (hw) {
+            wchar_t tp[MAX_PATH], tf[MAX_PATH];
+            if (GetTempPathW(MAX_PATH, tp) && GetTempFileNameW(tp, L"crw", 0, tf)) {
+                std::wstring warm = std::wstring(tf) + L".mp4";
+                {
+                    Writer pw; pw.wantAudio = wr.wantAudio; std::wstring e3;
+                    ComPtr<IMFMediaType> vt = hw->muxType();
+                    pw.openPassthrough(warm, vt.Get(), e3);
+                    pw.sw.Reset();
+                }
+                DeleteFileW(warm.c_str()); DeleteFileW(tf);
+            }
+        }
+
         // ---- paced loop: high-res waitable timer, duplicate last frame when nothing new ----
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
