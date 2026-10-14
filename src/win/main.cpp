@@ -289,7 +289,9 @@ void registerAll() {
 }
 
 void setStatus(const std::wstring& s, COLORREF c);
-std::wstring settingsSummary(const Settings& s) {
+std::wstring redactTitle(const std::wstring& t);
+std::wstring settingsSummary(const Settings& s0) {
+    Settings s = s0; s.sourceTitle = U(redactTitle(W(s.sourceTitle)));  // never log window titles
     std::string j = toJson(s);
     for (auto& c : j) if (c == '\n') c = ' ';
     return W(j);
