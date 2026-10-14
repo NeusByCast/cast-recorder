@@ -306,11 +306,41 @@ std::wstring settingsDiff(const Settings& a, const Settings& b) {
     }
     return d.empty() ? L"(no change)" : d;
 }
+// Leftover "<name>.part.<mp4|mkv|mov>" copies from a remux / conversion that was killed. Only runs while we hold the
+// single-instance mutex, so nothing can still be writing them; the source recordings are never touched.
+std::wstring outputDir();
+void sweepPartFiles() {
+    std::wstring dir = outputDir();
+    int n = 0;
+    for (const wchar_t* ext : {L"mp4", L"mkv", L"mov"}) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE f = FindFirstFileW((dir + L"\\*.part." + ext).c_str(), &fd);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (DeleteFileW((dir + L"\\" + fd.cFileName).c_str())) ++n;
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    if (n) cr::appLog(L"startup: removed " + std::to_wstring(n) + L" leftover .part file(s) from " + dir);
+}
+std::wstring redactTitle(const std::wstring& t);
+// "sourceTitle": "<private window title>" -> "sourceTitle": title#hash (n chars)
+std::wstring redactSettingsDiff(const std::wstring& d) {
+    const std::wstring key = L"\"sourceTitle\": \"";
+    size_t k = d.find(key);
+    if (k == std::wstring::npos) return d;
+    size_t a = k + key.size(), e = d.find(L"; ", a);
+    if (e == std::wstring::npos) e = d.size();
+    size_t q = e; while (q > a && d[q - 1] != L'"') --q;
+    std::wstring v = q > a ? d.substr(a, q - 1 - a) : std::wstring();
+    return d.substr(0, k) + L"\"sourceTitle\": " + redactTitle(v) + d.substr(e);
+}
 void save() {
     if (g.hwnd) g.s.maximized = IsZoomed(g.hwnd) != 0;
     if (saveFile(U(g.settingsFile), g.s)) {
         std::wstring d = settingsDiff(g_lastSaved, g.s);
-        if (d != L"(no change)") cr::appLog(L"settings saved: " + d);
+        if (d != L"(no change)") cr::appLog(L"settings saved: " + redactSettingsDiff(d));
         g_lastSaved = g.s;
         return;
     }
@@ -1005,6 +1035,7 @@ ReplayBudget replayBudget(int secs) {
     return b;
 }
 // 15 s .. 5 min always; 10 / 15 min only when they fit in the RAM cap at the current quality
+int replayEffSecs(int secs) { return replayBudget(secs).effSecs; }
 std::vector<int> replayPresets() {
     std::vector<int> v = {15, 30, 60, 120, 300};
     for (int s : {600, 900}) if (replayBudget(s).effSecs >= s) v.push_back(s);
@@ -1394,9 +1425,18 @@ std::wstring stampName(const wchar_t* prefix, const wchar_t* ext, const std::wst
 }
 std::wstring fileNameOf(const std::wstring& p) { size_t k = p.find_last_of(L"\\/"); return k == std::wstring::npos ? p : p.substr(k + 1); }
 std::wstring replayShort(int s) { return s % 60 == 0 && s >= 60 ? std::to_wstring(s / 60) + L"m" : std::to_wstring(s) + L"s"; }
+struct ReplayBudget; ReplayBudget replayBudget(int secs); std::vector<int> replayPresets(); int replayEffSecs(int secs);
+// Closed-field label: preset name only while it is still a preset; the length the RAM cap really keeps when it is less.
 std::wstring replayLenText() {
-    for (int i = 0; i < 7; ++i) if (kReplayLen[i] == g.s.replaySeconds) return kReplayLenL[i];
-    return std::to_wstring(g.s.replaySeconds) + L" s (custom)";
+    const int s = g.s.replaySeconds;
+    auto ps = replayPresets();
+    bool preset = std::find(ps.begin(), ps.end(), s) != ps.end();
+    std::wstring t;
+    if (preset) { for (int i = 0; i < 7; ++i) if (kReplayLen[i] == s) t = kReplayLenL[i]; }
+    else t = std::to_wstring(s) + L" s (custom)";
+    int eff = replayEffSecs(s);
+    if (eff > 0 && eff < s) t += L" - keeps " + std::to_wstring(eff) + L" s";
+    return t;
 }
 std::wstring durText(int s) {
     if (s < 60) return std::to_wstring(s) + L" s";
@@ -1714,7 +1754,7 @@ void remuxPumpLocked() {  // call with g_remuxM held
                 cr::appLog(L"post-process " + job.pj.file + L": " + plog);
             } else {
                 r->out = remuxTarget(job.in);
-                { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = r->out; }
+                { size_t dt = r->out.find_last_of(L'.'); std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = r->out.substr(0, dt) + L".part" + r->out.substr(dt); }
                 r->ok = remuxFile(job.in, r->out, r->err, L"", 0);
             }
             if (!PostMessageW(h, WM_APP_REMUX_DONE, 0, (LPARAM)r)) delete r;
@@ -3577,7 +3617,7 @@ void selftestSettings() {
     int row = -1;
     for (size_t i = 0; i < P.rows.size(); ++i) if (P.rows[i].kind == SR_WIN) { row = (int)i; break; }
     if (row >= 0) popupActivate(row); else { popupType(L""); popupActivate(0); }
-    cr::appLog(L"selftest: source " + sourceText());
+    cr::appLog(L"selftest: source " + (g.target.kind == CaptureTarget::Window ? redactTitle(g_srcTitle) : sourceText()));
     click(H_TAB_SET);
     paintToNull();
     pick(H_DD_CONT, 0);  // MKV (non-default since v1.0)
@@ -3846,6 +3886,7 @@ int runCli(int argc, wchar_t** argv) {
     int replaySecs = 0, replayMaxMb = 0; double saveReplayAt = -1;
     std::wstring replayOut, remuxIn, remuxOut, remuxEngine, shotPath, toastShot;
     double pauseAt = -1, resumeAt = -1;
+    DWORD latePublishMs = 0;
     RecordOptions o;
     Settings s;
     loadFile(U(settingsPath()), s);
@@ -3908,7 +3949,7 @@ int runCli(int argc, wchar_t** argv) {
         if (a == L"--minimized") continue;
         if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality"
             && a != L"--out" && a != L"--log" && a != L"--scale" && a != L"--gpu" && a != L"--bitrate-cap"
-            && a != L"--test-hang-finalize" && a != L"--test-slow-post" && a != L"--replay-max-mb" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window"
+            && a != L"--test-hang-finalize" && a != L"--test-slow-post" && a != L"--test-late-publish" && a != L"--replay-max-mb" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window"
             && a != L"--source" && a != L"--noise-suppression" && a != L"--noise-gate" && a != L"--mic-volume" && a != L"--channels"
             && a != L"--codec" && a != L"--auto-remux" && a != L"--replay" && a != L"--save-replay-at" && a != L"--replay-out" && a != L"--remux"
             && a != L"--remux-engine" && a != L"--screenshot" && a != L"--test-toast" && a != L"--test-toast-visible" && a != L"--ui-theme")
@@ -3996,6 +4037,10 @@ int runCli(int argc, wchar_t** argv) {
             char* end = nullptr; unsigned long b = strtoul(v.c_str(), &end, 10);
             if (v.empty() || !end || *end || b > 500000000ul) return bad("--bitrate-cap must be 0..500000000");
             o.bitrateCap = (unsigned)b;
+        } else if (a == L"--test-late-publish") {
+            char* end = nullptr; unsigned long ms = strtoul(v.c_str(), &end, 10);
+            if (v.empty() || !end || *end || ms > 60000) return bad("--test-late-publish must be 0..60000 ms");
+            setTestLatePublishMs((DWORD)ms); latePublishMs = (DWORD)ms;
         } else if (a == L"--test-slow-post") {
             // handled in wWinMain (UI and CLI)
         } else if (a == L"--test-hang-finalize") {
@@ -4197,9 +4242,14 @@ int runCli(int argc, wchar_t** argv) {
     if (pausedOnce && !resumedOnce && pauseStart) pausedWall = GetTickCount64() - pauseStart;
     r.stop();
     // Hang-finalize tests use a short finalize budget; give them headroom then abort.
-    DWORD waitMs = 15000;
+    DWORD waitMs = latePublishMs ? 300 : 15000;
     if (!r.waitUntilIdle(waitMs)) r.abort();
     r.waitUntilIdle(2000);
+    if (latePublishMs) {  // abort() published first: wait for the worker to lose the claim (it must keep the file)
+        for (DWORD w = 0; w < latePublishMs + 8000 && testLatePublishLost() == 0; w += 50) Sleep(50);
+        Sleep(200);
+        char b[64]; snprintf(b, sizeof b, "late_publish_lost=%d\n", testLatePublishLost()); warmInfo += b;
+    }
     for (int i = 0; i < 100 && abandonedFinalizeLive() > 0; ++i) Sleep(50);
     RecordResult res = r.result();
     if (res.ok && res.post.needed()) {  // MKV / track names: after the file is saved, outside the recorder
@@ -4274,6 +4324,8 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
                    L" from " + g.settingsFile + L": " + settingsSummary(g.s));
     }
     g.s.fps = normalizeFps(g.s.fps);
+    sweepPartFiles();
+    prewarmCaptureAsync();
     applyTheme();
     if (g_selftestHotkeys) { g.s.replayEnabled = true; g.s.replaySeconds = 10; g_hkTestHook = [](int e) { g_hkEvents.push_back(e); }; }
     gp::GdiplusStartupInput gsi; ULONG_PTR gpTok = 0;

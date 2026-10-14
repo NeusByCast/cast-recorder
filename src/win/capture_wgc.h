@@ -10,6 +10,9 @@
 namespace cr {
 class WgcCapture {
 public:
+    // Cold-start mitigation: loads the WGC runtime + activation factories on a background thread (no capture).
+    static void prewarmAsync();
+public:
     WgcCapture();
     ~WgcCapture();
     bool start(ID3D11Device* dev, HMONITOR mon, bool cursor, std::wstring& err);

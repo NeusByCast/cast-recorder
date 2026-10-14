@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <thread>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/Windows.Foundation.h>
@@ -49,6 +50,19 @@ WgcCapture::~WgcCapture() {
 }
 UINT WgcCapture::width() const { return p_->w; }
 UINT WgcCapture::height() const { return p_->h; }
+
+void WgcCapture::prewarmAsync() {
+    std::thread([] {
+        try {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            if (wgc::GraphicsCaptureSession::IsSupported()) {
+                (void)winrt::get_activation_factory<wgc::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+                (void)winrt::get_activation_factory<wgc::Direct3D11CaptureFramePool>();
+            }
+            winrt::uninit_apartment();
+        } catch (...) {}
+    }).detach();
+}
 
 bool WgcCapture::start(ID3D11Device* dev, HMONITOR mon, bool cursor, std::wstring& err) {
     try {

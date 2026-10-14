@@ -35,6 +35,7 @@ public:
     static size_t defaultMaxBytes();  // min(25 % of physical RAM, 2 GB)
     // Muxes the last `seconds()` (from a key frame) into an MP4. Blocking: call off the UI thread.
     bool save(const std::wstring& path, double& savedSeconds, std::wstring& err);
+    bool saveImpl(const std::wstring& path, double& savedSeconds, std::wstring& err);
     // recorder side
     void attach(IMFMediaType* videoType, int fps, int channels, int tracks, bool audio);
     void addVideo(IMFSample* s);
@@ -92,6 +93,9 @@ struct PostJob {
 // Runs a PostJob (blocking; call off the UI thread). finalFile = the file to show afterwards (the MP4 if anything failed).
 bool postProcessRecording(const PostJob& j, std::wstring& finalFile, std::wstring& log);
 void setTestSlowPostMs(DWORD ms);  // test hook: post-processing takes this long first (simulates a ~5 GB copy)
+void prewarmCaptureAsync();  // cold-start mitigation: load the WGC runtime off the UI thread
+void setTestLatePublishMs(DWORD ms);  // test hook: the worker publishes this late so abort() wins the claim
+int testLatePublishLost();           // how many workers lost the publish claim
 
 struct RecordResult {
     PostJob post;                    // to run after the result is published (UI: background queue; CLI: inline)

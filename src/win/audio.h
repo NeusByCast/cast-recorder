@@ -5,6 +5,7 @@
 // small continuous resampling-ratio correction (no silence inserts / trims except on real discontinuities).
 // Lost devices (AUDCLNT_E_DEVICE_INVALIDATED) and default-device changes reconnect automatically.
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -30,7 +31,14 @@ struct AudioFx {
     // 100 ns) are silenced so the speakers -> mic path can't put them in the file. System audio needs it only
     // when process-loopback exclusion isn't available (old Windows, or an explicitly chosen output device).
     std::atomic<long long> ownSoundFrom{0}, ownSoundTo{0};
-    void markOwnSound(long long from100, long long to100) { ownSoundTo.store(0); ownSoundFrom.store(from100); ownSoundTo.store(to100); }
+    // Overlapping/adjacent tones extend the window instead of replacing it (a short click can't cut a long tone's mute).
+    void markOwnSound(long long from100, long long to100) {
+        std::lock_guard<std::mutex> g(ownM);
+        long long f = ownSoundFrom.load(), t = ownSoundTo.load();
+        if (t > 0 && from100 <= t + 1000000 && to100 >= f) { from100 = std::min(f, from100); to100 = std::max(t, to100); }
+        ownSoundTo.store(0); ownSoundFrom.store(from100); ownSoundTo.store(to100);
+    }
+    std::mutex ownM;
     static float take(std::atomic<float>& a) { return a.exchange(0.f); }
 };
 AudioFx& audioFx();

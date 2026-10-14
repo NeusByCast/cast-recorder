@@ -4,6 +4,7 @@
 // GPU video processor converts BGRA->NV12 and feeds the vendor's hardware MFT (NVENC/AMF/QuickSync).
 #include "recorder.h"
 #include <climits>
+#include <new>
 #include <algorithm>
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -550,6 +551,15 @@ DWORD finalizeBudgetMs(DWORD finalizeTimeoutMs) { return (finalizeTimeoutMs ? fi
 void setTestHangFinalizeMs(DWORD ms) { g_testHangFinalizeMs = ms; }
 std::atomic<DWORD> g_testSlowPostMs{0};
 void setTestSlowPostMs(DWORD ms) { g_testSlowPostMs = ms; }
+std::atomic<DWORD> g_testLatePublishMs{0};
+void prewarmCaptureAsync() {
+#ifdef CR_HAVE_WGC
+    WgcCapture::prewarmAsync();
+#endif
+}
+void setTestLatePublishMs(DWORD ms) { g_testLatePublishMs = ms; }
+std::atomic<int> g_testLateLost{0};
+int testLatePublishLost() { return g_testLateLost.load(); }
 static unsigned long long fileSizeOf(const std::wstring& p) {
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     return GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
@@ -768,7 +778,7 @@ void Recorder::run() {
     };
     mark(L"thread_start");
 
-    [&] {
+    try { [&] {
         // ---- device on the adapter that owns the primary monitor (or an explicit gpuIndex) ----
         HMONITOR mon = opt_.monitor ? opt_.monitor : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
         if (opt_.window) { HMONITOR wm = MonitorFromWindow(opt_.window, MONITOR_DEFAULTTONULL); if (wm) mon = wm; }
@@ -1483,7 +1493,10 @@ void Recorder::run() {
             }
         }
         r.ok = r.frames > 0 && !r.timedOut && r.message.empty();
-    }();
+    }(); } catch (const std::bad_alloc&) {  // out of memory: stop cleanly, keep what reached the disk
+        r.ok = false; r.message = L"Out of memory - recording stopped (the file keeps what was written)";
+        r.encoderLog += L"worker: std::bad_alloc caught\n";
+    }
 
     // Skip MF/COM teardown if anything was abandoned (a detached Finalize/Close may still be inside MF).
     timeEndPeriod(1);
@@ -1495,6 +1508,7 @@ void Recorder::run() {
         if (mfStarted) MFShutdown();
         if (SUCCEEDED(hrCo)) CoUninitialize();
     }
+    if (DWORD late = g_testLatePublishMs.load()) Sleep(late);  // test hook: abort() publishes first
     const bool won = claim_.claim(gen, [&] {
         result_ = r;
         fsm_.toIdle();
@@ -1502,8 +1516,12 @@ void Recorder::run() {
         if (doneEvent_) SetEvent(doneEvent_);
         if (opt_.notify) PostMessageW(opt_.notify, opt_.warmupOnly ? WM_APP_WARMUP_DONE : opt_.doneMsg ? opt_.doneMsg : WM_APP_RECORDER_DONE, 0, 0);
     });
-    // abort() already published for this session: our output is stale, remove any file we produced.
-    if (!won && !r.file.empty()) DeleteFileW(r.file.c_str());
+    // abort() already published for this session. Never delete what we wrote (fragmented MP4 = playable);
+    // like abort(), only an empty file is removed.
+    if (!won) {
+        if (!r.file.empty() && fileSizeOf(r.file) == 0) DeleteFileW(r.file.c_str());
+        g_testLateLost.fetch_add(1);
+    }
 }
 
 
@@ -1619,8 +1637,24 @@ bool mfCopy(const std::wstring& in, const std::wstring& out, std::wstring& err) 
 }
 }  // namespace
 
+static bool remuxFileDirect(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
+                            const std::vector<std::wstring>& trackNames);
+// Writes to "<name>.part<ext>" and renames over `out` only when complete: a crash/kill never leaves a half file at `out`.
 bool remuxFile(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
                const std::vector<std::wstring>& trackNames) {
+    size_t dot = out.find_last_of(L'.'), sl = out.find_last_of(L"\\/");
+    if (dot == std::wstring::npos || (sl != std::wstring::npos && dot < sl)) dot = out.size();
+    const std::wstring part = out.substr(0, dot) + L".part" + out.substr(dot);
+    DeleteFileW(part.c_str());
+    bool ok = remuxFileDirect(in, part, err, engine, timeoutMs, trackNames) && fileSizeOf(part) > 0;
+    if (ok && !MoveFileExW(part.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        err = L"rename failed (" + std::to_wstring(GetLastError()) + L")"; ok = false;
+    }
+    if (!ok) DeleteFileW(part.c_str());
+    return ok;
+}
+static bool remuxFileDirect(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
+                            const std::vector<std::wstring>& trackNames) {
     if (GetFileAttributesW(in.c_str()) == INVALID_FILE_ATTRIBUTES) { err = L"source file missing"; return false; }
     size_t odot = out.find_last_of(L'.');
     std::wstring oext = odot == std::wstring::npos ? L"" : out.substr(odot);
@@ -1716,6 +1750,12 @@ struct ReplayRing::Impl {
         while (k < v.size() && !v[k].key) ++k;
         for (size_t i = 0; i < k && !v.empty(); ++i) { bytes -= v.front().bytes; v.pop_front(); }
     }
+    // Out of memory: halve the cap (shorter replay instead of a crash); the UI reads cappedByMemory().
+    void oom() {
+        maxBytes = std::max<size_t>((size_t)1 << 20, bytes / 2);
+        trim();
+        capped = true;
+    }
     void trim() {
         // keep one GOP more than asked so the nearest key frame can be the one before (end - seconds)
         const LONGLONG keep = (LONGLONG)seconds * 10000000LL;
@@ -1805,26 +1845,34 @@ void ReplayRing::addVideo(IMFSample* s) {
     c->AddBuffer(dst.Get());
     std::lock_guard<std::mutex> g(p_->m);
     if (!p_->attached) return;
+    try {
     Impl::V x; x.s = c; x.t = t + p_->offset; x.d = d; x.key = clean != 0; x.bytes = len;
     if (p_->v.empty() && !x.key) return;  // the ring always starts on a key frame
     p_->v.push_back(x);
     p_->bytes += len;
     if (x.t + d > p_->lastEnd) p_->lastEnd = x.t + d;
     p_->trim();
+    } catch (const std::bad_alloc&) { p_->oom(); }
 }
 
 void ReplayRing::addAudio(long long t, const std::vector<short>* const pcm[3]) {
     Impl::A c;  // copy the PCM before taking the lock
-    for (int k = 0; k < 3; ++k) if (pcm[k] && !pcm[k]->empty()) { c.pcm[k] = std::make_shared<const std::vector<short>>(*pcm[k]); c.bytes += pcm[k]->size() * sizeof(short); }
+    try {
+        for (int k = 0; k < 3; ++k) if (pcm[k] && !pcm[k]->empty()) { c.pcm[k] = std::make_shared<const std::vector<short>>(*pcm[k]); c.bytes += pcm[k]->size() * sizeof(short); }
+    } catch (const std::bad_alloc&) { std::lock_guard<std::mutex> g(p_->m); p_->oom(); return; }
     std::lock_guard<std::mutex> g(p_->m);
     if (!p_->attached || !p_->audio || p_->v.empty()) return;
     c.t = t + p_->offset;
     for (int k = p_->tracks; k < 3; ++k) { if (c.pcm[k]) c.bytes -= c.pcm[k]->size() * sizeof(short); c.pcm[k].reset(); }
-    p_->bytes += c.bytes;
-    p_->a.push_back(std::move(c));
+    const size_t nb = c.bytes;
+    try { p_->a.push_back(std::move(c)); p_->bytes += nb; } catch (const std::bad_alloc&) { p_->oom(); }
 }
 
 bool ReplayRing::save(const std::wstring& path, double& savedSeconds, std::wstring& err) {
+    try { return saveImpl(path, savedSeconds, err); }
+    catch (const std::bad_alloc&) { savedSeconds = 0; err = L"Out of memory while saving the replay"; DeleteFileW(path.c_str()); return false; }
+}
+bool ReplayRing::saveImpl(const std::wstring& path, double& savedSeconds, std::wstring& err) {
     savedSeconds = 0;
     std::vector<Impl::V> vs; std::vector<Impl::A> as;
     ComPtr<IMFMediaType> vt; int fps = 30, channels = 1, tracks = 1; bool audio = false;
