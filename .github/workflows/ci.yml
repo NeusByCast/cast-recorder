@@ -83,6 +83,10 @@ jobs:
         run: |
           $exe = Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1
           New-Item -ItemType Directory rec -Force | Out-Null
+          # Explicit start→stop via CLI (the --record timer calls stop() then waitUntilIdle).
+          $p0 = Start-Process $exe.FullName -ArgumentList "--record 1 --fps ${{ matrix.fps }} --encoder software --allow-synthetic --out `"$PWD\rec\start-stop-${{ matrix.fps }}.mp4`" --log `"$PWD\rec\start-stop-${{ matrix.fps }}.txt`"" -Wait -PassThru
+          if (Test-Path "$PWD\rec\start-stop-${{ matrix.fps }}.txt") { Get-Content "$PWD\rec\start-stop-${{ matrix.fps }}.txt" }
+          if ($p0.ExitCode -ne 0) { throw "start-stop smoke exit $($p0.ExitCode)" }
           foreach ($c in @('mp4','mkv')) {
             $out = "$PWD\rec\smoke-${{ matrix.fps }}.$c"
             $log = "$PWD\rec\smoke-${{ matrix.fps }}-$c.txt"
