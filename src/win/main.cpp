@@ -20,6 +20,7 @@
 #include "preview.h"
 #include "audio.h"
 #include "applog.h"
+#include "windows_enum.h"
 #include "resource.h"
 #include "version.h"
 #include "click_wav.h"
@@ -55,7 +56,8 @@ std::wstring knownFolder(REFKNOWNFOLDERID id) {
     return s;
 }
 std::wstring g_settingsOverride;  // --settings-file (tests)
-bool g_selftest = false;          // --selftest-settings: drive the real UI, change settings, exit via X
+bool g_selftest = false;
+bool g_selftestRecord = false;    // --selftest-record: press Record right after launch, stop after 2 s, exit          // --selftest-settings: drive the real UI, change settings, exit via X
 std::wstring settingsPath() {
     if (!g_settingsOverride.empty()) return g_settingsOverride;
     return cr::appDataDir() + L"\\settings.json";
@@ -116,6 +118,7 @@ struct App {
     bool micMuted = false;
     double lastBeepMs = 0;
     bool warmLogged = false;
+    bool recPending = false;  // a recording ran whose result isn't logged yet
     Recorder warm;  // startup warm-up: fills the encoder probe cache and loads MF/AAC so Record starts fast
     std::wstring status;
     COLORREF statusColor = C_TEXT2;
@@ -198,6 +201,13 @@ void enumGpus() {
         a->Release();
     }
     f->Release();
+    // The saved GPU is matched by its description; the list position is only a tie-break for identical names.
+    if (!g.s.gpuName.empty()) {
+        int found = -1;
+        for (int k = 0; k < (int)g.gpus.size(); ++k)
+            if (U(g.gpus[k]) == g.s.gpuName && (found < 0 || k == g.s.gpuIndex)) found = k;
+        g.s.gpuIndex = found;  // GPU gone -> Auto (name kept, so it comes back when the GPU does)
+    } else if (g.s.gpuIndex >= (int)g.gpus.size()) g.s.gpuIndex = -1;
 }
 
 // ---------- tray ----------
@@ -244,9 +254,26 @@ std::wstring settingsSummary(const Settings& s) {
     for (auto& c : j) if (c == '\n') c = ' ';
     return W(j);
 }
+Settings g_lastSaved;  // what's on disk: saves are logged as a diff against it
+std::wstring settingsDiff(const Settings& a, const Settings& b) {
+    auto lines = [](const Settings& x) { std::vector<std::string> v; std::string j = toJson(x), cur;
+        for (char c : j) { if (c == '\n') { v.push_back(cur); cur.clear(); } else cur += c; } return v; };
+    auto la = lines(a), lb = lines(b);
+    std::wstring d;
+    for (size_t i = 0; i < lb.size(); ++i) if (i >= la.size() || la[i] != lb[i]) {
+        std::string t = lb[i]; while (!t.empty() && (t[0] == ' ')) t.erase(0, 1); if (!t.empty() && t.back() == ',') t.pop_back();
+        d += W(t) + L"; ";
+    }
+    return d.empty() ? L"(no change)" : d;
+}
 void save() {
     if (g.hwnd) g.s.maximized = IsZoomed(g.hwnd) != 0;
-    if (saveFile(U(g.settingsFile), g.s)) { cr::appLog(L"settings saved: " + settingsSummary(g.s)); return; }
+    if (saveFile(U(g.settingsFile), g.s)) {
+        std::wstring d = settingsDiff(g_lastSaved, g.s);
+        if (d != L"(no change)") cr::appLog(L"settings saved: " + d);
+        g_lastSaved = g.s;
+        return;
+    }
     DWORD e = GetLastError();
     cr::appLog(L"settings SAVE FAILED (" + std::to_wstring(e) + L") to " + g.settingsFile);
     setStatus(L"Couldn't save settings (error " + std::to_wstring(e) + L")", C_ERR);
@@ -255,10 +282,11 @@ void save() {
 std::wstring outputDir() { return g.s.outputDir.empty() ? defaultOutputDir() : W(g.s.outputDir); }
 void setStatus(const std::wstring& s, COLORREF c) { g.status = s; g.statusColor = c; if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE); }
 
-void playClick() {
+// Our own tones (res/sounds, scripts/make-sounds.py): soft bell chimes at -24 dBFS, a -28 dBFS tick.
+void playTone(int id) {
     LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
-    if (!PlaySoundW(reinterpret_cast<LPCWSTR>(kClickWav), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT))
-        PlaySoundW(L"SystemNotification", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+    if (!PlaySoundW(MAKEINTRESOURCEW(id), g.inst, SND_RESOURCE | SND_ASYNC | SND_NODEFAULT))
+        PlaySoundW(reinterpret_cast<LPCWSTR>(kClickWav), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
     QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
     g.lastBeepMs = (double)(b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;  // SND_ASYNC: returns immediately
 }
@@ -307,6 +335,7 @@ RecordOptions optionsFromSettings() {
     RecordOptions o;
     o.fps = g.s.fps; o.quality = g.s.quality; o.encoder = g.s.encoder; o.container = g.s.container;
     o.captureCursor = g.s.captureCursor; o.scale = g.s.scale; o.gpuIndex = g.s.gpuIndex; o.bitrateCap = g.s.bitrateCap;
+    o.pauseTones = g.s.pauseTones;
     o.systemAudio = g.s.systemAudio; o.mic = g.s.micEnabled; o.micId = W(g.s.micDevice);
     return o;
 }
@@ -335,6 +364,7 @@ void forceQuit() {
     }
     if (g.rec.running()) g.rec.abort();
     g.rec.waitUntilIdle(500);
+    if (g.recPending) { g.recPending = false; writeSessionLog(g.rec.result(), L"recording (saved on exit)"); }
     DestroyWindow(g.hwnd);
 }
 
@@ -352,13 +382,15 @@ void startRecording() {
     LARGE_INTEGER pq; QueryPerformanceCounter(&pq);
     // A warm-up still probing the same encoder would contend with this session (AMD session limits); it only
     // runs for a couple of seconds after launch or a settings change, and its time shows in the latency log.
-    if (g.warm.running()) g.warm.waitUntilIdle(4000);
+    // No waiting on the launch warm-up: capture starts now and frames are buffered while the encoder (whose
+    // probe verdict the warm-up is producing) finishes initialising.
     RecordOptions o = optionsFromSettings();
     o.pressQpc = pq.QuadPart;
     o.notify = g.hwnd;
     o.outputPath = dir + L"\\" + name + W(extension(g.s.container));
     registerAll();
     if (!g.rec.start(o)) { setStatus(L"Already recording", C_WARN); return; }
+    g.recPending = true;
     g.gprev.setRecording(true);
     g.rec.setMicMuted(g.micMuted);
     // start tone plays on WM_APP_RECORDER_STARTED (first captured frame), never blocking the start path
@@ -368,7 +400,7 @@ void startRecording() {
 }
 void stopRecording() {
     if (!g.rec.isActive()) return;
-    playClick();
+    playTone(IDR_SND_STOP);
     g.rec.stop();
     setStatus(L"Finishing file\u2026", C_TEXT2);
     trayUpdate(NIM_MODIFY);
@@ -380,7 +412,7 @@ void toggleRecording() {
 void togglePause() {
     if (!g.rec.isActive()) return;
     if (g.rec.togglePause()) {
-        playClick();
+        if (g.s.pauseTones) playTone(IDR_SND_TICK);  // off by default: the mic would record it
         if (g.rec.isPaused()) setStatus(L"Paused", C_WARN);
         else setStatus(L"Recording\u2026", C_ACCENT_B);
         trayUpdate(NIM_MODIFY);
@@ -511,7 +543,7 @@ int ddSel(int id) {
 void ddSet(int id, int i) {
     switch (id) {
         case H_DD_FPS: g.s.fps = kFps[i]; break; case H_DD_QUAL: g.s.quality = kQual[i]; break;
-        case H_DD_ENC: g.s.encoder = kEnc[i]; break; case H_DD_GPU: g.s.gpuIndex = i - 1; break;
+        case H_DD_ENC: g.s.encoder = kEnc[i]; break; case H_DD_GPU: g.s.gpuIndex = i - 1; g.s.gpuName = i > 0 ? U(g.gpus[i - 1]) : std::string(); break;
         case H_DD_RES: g.s.scale = kRes[i]; break; case H_DD_CONT: g.s.container = kCont[i]; break;
         case H_DD_SYS: g.s.systemAudio = i == 1; break;
         case H_DD_MIC: g.s.micEnabled = i > 0; g.s.micDevice = i >= 2 ? U(g.mics[i - 2].id) : std::string(); break;
@@ -1099,6 +1131,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == HK_FOLDER) openFolder();
         return 0;
     case WM_TIMER:
+        if (wp == TIMER_SELFTEST + 1) { KillTimer(h, wp); click(H_CLOSE); return 0; }  // stop + save + exit
         if (wp == TIMER_SELFTEST) {  // CI: change settings through the same click paths a user takes, then press X
             KillTimer(h, TIMER_SELFTEST);
             click(H_DD_FPS); click(H_ITEM0 + 1);   // 30 fps
@@ -1131,15 +1164,21 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
+    case WM_APP + 5:
+        toggleRecording();
+        SetTimer(h, TIMER_SELFTEST + 1, 2000, nullptr);
+        return 0;
     case WM_APP_WARMUP_DONE:
         g.warm.waitUntilIdle(200);
         if (!g.warm.running()) { writeSessionLog(g.warm.result(), L"warm-up (encoder probe cache)"); g.warmLogged = true; }
         return 0;
     case WM_APP_RECORDER_STARTED:
-        if (g.rec.isActive()) playClick();
+        if (g.rec.isActive()) playTone(IDR_SND_START);
         return 0;
     case WM_APP_RECORDER_DONE: {
         g.rec.waitUntilIdle(100);
+        if (!g.recPending) return 0;  // already handled (e.g. logged by forceQuit)
+        g.recPending = false;
         KillTimer(h, TIMER_TICK);
         const RecordResult& r = g.rec.result();
         g.gprev.setRecording(false);
@@ -1150,6 +1189,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (!r.message.empty()) msg2 += L"  \u00b7  " + r.message;
             if (r.cpuFallback) msg2 += L"  \u00b7  GPU conversion failed, finished on CPU";
             if (r.dropped) msg2 += L"  \u00b7  " + std::to_wstring(r.dropped) + L" dropped";
+            if (r.windowClosed) msg2 += L"  \u00b7  the window was closed";
             if (!r.encoderFallbacks.empty()) msg2 += L"  \u00b7  " + r.encoderFallbacks.front() + L" failed its test encode, fell back";
             setStatus(msg2, C_OK);
         } else if (r.abandoned) setStatus(L"Encoder got stuck, file discarded. Restart Cast Recorder to record again.", C_WARN);
@@ -1268,6 +1308,8 @@ int runCli(int argc, wchar_t** argv) {
         "  --system-audio / --mic     record system audio / the default microphone\n"
         "  --test-tone          add a synthetic 440 Hz audio source (CI)\n"
         "  --pause-at S / --resume-at S  pause and resume at S seconds into the recording\n"
+        "  --window TEXT        capture one window (title or exe substring) instead of the screen\n"
+        "  --list-windows       list capturable windows\n"
         "  --render-ui FILE.bmp  paint the settings window to a BMP (docs/CI)\n"
         "  --ui-state idle|dropdown\n"
         "  --help               show this help\n\n"
@@ -1301,15 +1343,26 @@ int runCli(int argc, wchar_t** argv) {
         if (a == L"--mic") { o.mic = true; continue; }
         if (a == L"--test-tone") { o.testTone = true; continue; }
         if (a == L"--warmup") { cliWarmup = true; continue; }
+        if (a == L"--list-windows") {
+            std::string o2;
+            for (auto& w : listCaptureWindows()) {
+                char b[64]; snprintf(b, sizeof b, "0x%llx\t%s\t", (unsigned long long)(uintptr_t)w.hwnd, w.minimized ? "min" : "-");
+                o2 += b + U(w.exe) + "\t" + U(w.title) + "\n";
+            }
+            emit(o2, stdout); return 0;
+        }
         if (a == L"--print-settings") { emit(toJson(s), stdout); return 0; }
         if (a == L"--settings-file") { ++i; continue; }
         if (a == L"--minimized") continue;
         if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality"
             && a != L"--out" && a != L"--log" && a != L"--scale" && a != L"--gpu" && a != L"--bitrate-cap"
-            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern")
+            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window")
             return bad("unknown option " + U(a));
         if (!value(v)) return bad(U(a) + " needs a value");
-        if (a == L"--record") {
+        if (a == L"--window") {
+            o.window = findCaptureWindow(W(v));
+            if (!o.window) return bad("no capturable window matches '" + v + "' (see --list-windows)");
+        } else if (a == L"--record") {
             char* end = nullptr;
             double d = strtod(v.c_str(), &end);
             if (v.empty() || !end || *end || !(d > 0) || d > 86400) return bad("--record must be a number of seconds between 0 and 86400");
@@ -1467,8 +1520,8 @@ int runCli(int argc, wchar_t** argv) {
     }
     char summary[4096];
     snprintf(summary, sizeof summary,
-             "ok=%d frames=%llu duplicated=%llu late=%llu dropped=%llu abandoned=%d\ncapture_fps=%.1f encode_fps=%.1f audio=%d\nstart_ms=%.0f\nlatency=%s\ncapture=%s\nencoder=%s\npath=%s\nfile=%s\nmessage=%s\n",
-             res.ok ? 1 : 0, res.frames, res.duplicated, res.late, res.dropped, res.abandoned ? 1 : 0, res.captureFps, res.encodeFps, res.hasAudio ? 1 : 0, res.startMs, U(res.latencyLog).c_str(),
+             "ok=%d frames=%llu duplicated=%llu late=%llu dropped=%llu abandoned=%d window_closed=%d\ncapture_fps=%.1f encode_fps=%.1f audio=%d\nstart_ms=%.0f\nlatency=%s\ncapture=%s\nencoder=%s\npath=%s\nfile=%s\nmessage=%s\n",
+             res.ok ? 1 : 0, res.frames, res.duplicated, res.late, res.dropped, res.abandoned ? 1 : 0, res.windowClosed ? 1 : 0, res.captureFps, res.encodeFps, res.hasAudio ? 1 : 0, res.startMs, U(res.latencyLog).c_str(),
              U(res.captureUsed).c_str(), U(res.encoderUsed).c_str(), U(res.pathLog).c_str(),
              U(res.file).c_str(), U(res.message).c_str());
     emit(std::string(summary) + extra + "encoder_log:\n" + U(res.encoderLog), stdout);
@@ -1487,6 +1540,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     enableDpiAwareness();
     for (int i = 1; i + 1 < argc; ++i) if (wcscmp(argv[i], L"--settings-file") == 0) g_settingsOverride = argv[i + 1];
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-settings") == 0) g_selftest = true;
+    for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-record") == 0) g_selftest = g_selftestRecord = true;
     for (int i = 1; i < argc; ++i)
         // Any option other than --minimized goes to the console CLI, which validates it (never opens the window).
 if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i], L"/?") == 0)) {
@@ -1510,6 +1564,7 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     {
         bool exists = GetFileAttributesW(g.settingsFile.c_str()) != INVALID_FILE_ATTRIBUTES;
         bool ok = loadFile(U(g.settingsFile), g.s);
+        g_lastSaved = g.s;
         cr::appLog(L"start " + std::wstring(GetCommandLineW()) + L"\nsettings " + (ok ? L"loaded" : exists ? L"INVALID (defaults used)" : L"missing (defaults)") +
                    L" from " + g.settingsFile + L": " + settingsSummary(g.s));
     }
@@ -1535,6 +1590,7 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
                              WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_SYSMENU | WS_CAPTION, 0, 0, BASE_W, BASE_H,
                              nullptr, nullptr, inst, nullptr);
     if (!g.hwnd) return 1;
+    startWarmup();  // as early as possible: before the window is even shown
     g.dpi = dpiFor(g.hwnd);
     makeFonts();
     int w = S(BASE_W), h = S(BASE_H);
@@ -1556,8 +1612,8 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     }
     g.status = L"Ready";
     ShowWindow(g.hwnd, (minimized || g.s.startMinimized) ? SW_SHOWMINNOACTIVE : g.s.maximized ? SW_MAXIMIZE : SW_SHOW);
-    startWarmup();
-    if (g_selftest) SetTimer(g.hwnd, TIMER_SELFTEST, 4000, nullptr);
+    if (g_selftestRecord) PostMessageW(g.hwnd, WM_APP + 5, 0, 0);  // CI cold start: press Record as soon as the loop runs
+    if (g_selftest && !g_selftestRecord) SetTimer(g.hwnd, TIMER_SELFTEST, 4000, nullptr);
     g.gprev.start(g.hwnd, previewRectNow(), g.s.captureCursor);
     if (!IsWindowVisible(g.hwnd)) g.gprev.setVisible(false);
 

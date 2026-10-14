@@ -27,6 +27,8 @@ struct RecordOptions {
     bool mic = false;
     std::wstring micId;              // empty = default microphone
     bool testTone = false;           // CI: synthetic 440 Hz audio source
+    HWND window = nullptr;           // capture this top-level window instead of the monitor (WGC)
+    bool pauseTones = false;         // UI plays pause/resume tones: keep them out of the audio
     bool warmupOnly = false;         // run setup (device, capture, probes, writer/AAC load) and exit before recording
     long long pressQpc = 0;          // QPC when the user asked to record (latency breakdown)
     HWND notify = nullptr;           // WM_APP_RECORDER_DONE when the recording thread exits
@@ -46,6 +48,7 @@ struct RecordResult {
     std::vector<std::wstring> encoderFallbacks;  // hardware encoders that failed the probe / setup
     bool encoderStalled = false;
     std::wstring latencyLog;         // press -> first frame breakdown
+    bool windowClosed = false;       // window capture ended because the window closed
     double startMs = 0;              // press -> first captured frame
     std::wstring pathLog;            // adapter / encoder / zero-copy / drops for diagnostics
     bool hasAudio = false;

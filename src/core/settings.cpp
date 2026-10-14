@@ -242,6 +242,8 @@ std::string toJson(const Settings& s) {
       << "  \"maximized\": " << (s.maximized ? "true" : "false") << ",\n"
       << "  \"scale\": \"" << toString(s.scale) << "\",\n"
       << "  \"gpuIndex\": " << s.gpuIndex << ",\n"
+      << "  \"gpuName\": \"" << esc(s.gpuName) << "\",\n"
+      << "  \"pauseTones\": " << (s.pauseTones ? "true" : "false") << ",\n"
       << "  \"bitrateCap\": " << s.bitrateCap << "\n"
       << "}\n";
     return o.str();
@@ -285,6 +287,8 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     boo("captureCursor", s.captureCursor);
     boo("startMinimized", s.startMinimized);
     boo("maximized", s.maximized);
+    str("gpuName", s.gpuName);
+    boo("pauseTones", s.pauseTones);
     if (str("scale", v)) fromString(v, s.scale);
     auto git = m.find("gpuIndex");
     if (git != m.end() && git->second.t == Value::Num && std::isfinite(git->second.n) && git->second.n >= -1 && git->second.n <= 32)

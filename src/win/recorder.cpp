@@ -26,6 +26,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <condition_variable>
 #include <deque>
 #include <timeapi.h>
 #include "../core/nv12.h"
@@ -94,6 +95,8 @@ struct Source {
     virtual const wchar_t* name() const = 0;
     // Copies the newest frame into dst (if one arrived). Returns false on fatal error.
     virtual bool acquire(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew) = 0;
+    virtual bool ended() const { return false; }      // window capture: the window closed
+    virtual std::wstring events() { return L""; }     // window capture: minimized/restored/resized
     UINT w = 0, h = 0;
 };
 
@@ -187,12 +190,21 @@ struct SyntheticSource : Source {
 #ifdef CR_HAVE_WGC
 struct WgcSourceAdapter : Source {
     WgcCapture cap;
-    const wchar_t* name() const override { return L"Windows Graphics Capture"; }
+    const wchar_t* name() const override { return window ? L"Windows Graphics Capture (window)" : L"Windows Graphics Capture"; }
+    bool window = false;
     bool init(ID3D11Device* d, HMONITOR mon, bool cursor, std::wstring& err) {
         if (!cap.start(d, mon, cursor, err)) return false;
         w = cap.width(); h = cap.height();
         return true;
     }
+    bool initWindow(ID3D11Device* d, HWND hw, bool cursor, std::wstring& err) {
+        if (!cap.startWindow(d, hw, cursor, err)) return false;
+        window = true;
+        w = cap.width(); h = cap.height();
+        return true;
+    }
+    bool ended() const override { return window && cap.closed(); }
+    std::wstring events() override { return cap.takeEvents(); }
     bool acquire(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew) override {
         return cap.copyLatest(ctx, dst, timeoutMs, gotNew);
     }
@@ -535,8 +547,10 @@ std::wstring describeHardwareEncoders() {
 
 // Process-wide encoder probe cache: (adapter LUID, encoder ordinal, input format) -> worked?
 // Filled by the startup warm-up so pressing Record never waits on probes (3 AMD MFTs x ~1.5-2.5 s each).
+static std::atomic<bool> g_writerWarm{false};
 static std::mutex g_probeM;
-static std::map<std::wstring, bool> g_probe;
+static std::map<std::wstring, int> g_probe;  // 1 ok, 0 failed, 2 being probed (by the warm-up)
+static std::condition_variable g_probeCv;
 static std::wstring probeKey(ID3D11Device* dev, const HwEncoderInfo& e) {
     ComPtr<IDXGIDevice> d; ComPtr<IDXGIAdapter> a; DXGI_ADAPTER_DESC ad{};
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d))) && SUCCEEDED(d->GetAdapter(&a))) a->GetDesc(&ad);
@@ -765,7 +779,7 @@ void Recorder::run() {
         // after t0 covers its 160 ms + output latency. Nothing waits on the tone.
         AudioMixer mixer;
         std::wstring alog;
-        mixer.systemMuteUntil = 3500000;
+        mixer.systemMuteUntil = 3000000;  // start tone (only where it could be captured: mic / no self-exclusion)
         auto audioReady = std::async(std::launch::async, [&] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             if (!opt_.warmupOnly) mixer.start(opt_.systemAudio, opt_.mic, opt_.micId, opt_.testTone, alog);
@@ -777,8 +791,17 @@ void Recorder::run() {
         std::unique_ptr<Source> src;
         bool cursorByGdi = false;
         std::wstring capErr;
+        if (opt_.window) {  // single window: WGC only, no silent fallback to the whole screen
 #ifdef CR_HAVE_WGC
-        if (!opt_.forcePattern) {
+            auto w = std::make_unique<WgcSourceAdapter>();
+            if (w->initWindow(dev.Get(), opt_.window, opt_.captureCursor, capErr)) src = std::move(w);
+#else
+            capErr = L"window capture needs Windows Graphics Capture (MSVC build)";
+#endif
+            if (!src) { r.message = L"Window capture unavailable: " + capErr; return; }
+        }
+#ifdef CR_HAVE_WGC
+        if (!src && !opt_.forcePattern) {
             auto w = std::make_unique<WgcSourceAdapter>();
             if (w->init(dev.Get(), mon, opt_.captureCursor, capErr)) src = std::move(w);
         }
@@ -798,13 +821,15 @@ void Recorder::run() {
         UINT W = 0, H = 0;  // encoded size (even; optionally downscaled)
         scaledSize(opt_.scale, src->w, src->h, W, H);
 
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = src->w; td.Height = src->h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+        ComPtr<ID3D11Texture2D> latest;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &latest))) { r.message = L"CreateTexture2D failed"; return; }
         // ---- audio (system loopback + mic), mixed on the video media clock ----
-        audioReady.wait();
-        r.encoderLog += alog;
-        mark(L"audio_wait");
         Writer wr;
-        wr.wantAudio = mixer.active() || opt_.warmupOnly;
-        r.hasAudio = wr.wantAudio;
         std::deque<std::pair<long long, std::vector<short>>> audioPending;  // until the lazy writer opens
         HRESULT audioHr = S_OK;
         auto pushAudio = [&](long long mediaTime, bool final) {
@@ -830,65 +855,17 @@ void Recorder::run() {
         std::unique_ptr<HwEncoder> hw;
         bool opened = false;
         std::wstring& elog = r.encoderLog;
-        if (opt_.encoder != Encoder::Software && videoSupport) {
-            auto encs = hwEncodersForDevice(dev.Get(), elog);
-            const UINT want = vendorPci(opt_.encoder);
-            std::stable_sort(encs.begin(), encs.end(), [want](const HwEncoderInfo& a, const HwEncoderInfo& b) {
-                return (want && a.pciVendor == want) > (want && b.pciVendor == want);
-            });
-            bool vpOk = !encs.empty() && conv.init(dev.Get(), src->w, src->h, W, H);
-            if (!encs.empty() && !vpOk) {
-                elog += L"GPU NV12 conversion unavailable (" + conv.why + L"): feeding the encoder BGRA surfaces directly\n";
-                conv = GpuConvert{};
-                W = src->w & ~1u; H = src->h & ~1u;  // no GPU scaler on this path: native size
-                for (auto& e : encs) e.argb = true;
-                bgraDirect = true;
-            }
-            if (!encs.empty()) {
-                for (auto& e : encs) {
-                    elog += L"probe " + e.name + L"\n";
-                    const std::wstring key = probeKey(dev.Get(), e);
-                    int cached = -1;
-                    { std::lock_guard<std::mutex> g(g_probeM); auto it = g_probe.find(key); if (it != g_probe.end()) cached = it->second ? 1 : 0; }
-                    if (cached == 0) { elog += L"probe " + e.name + L": cached FAIL, skipped\n"; r.encoderFallbacks.push_back(e.name); continue; }
-                    if (cached == 1) elog += L"probe " + e.name + L": cached OK\n";
-                    else {
-                        bool okp = probeHwEncoder(dev.Get(), e, W, H, opt_.fps, 2500, elog);
-                        { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp; }
-                        mark(L"probe");
-                        if (!okp) { r.encoderFallbacks.push_back(e.name); continue; }
-                    }
-                    auto enc = std::make_unique<HwEncoder>();
-                    unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
-                    if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) {
-                        hw = std::move(enc); zeroCopy = true; opened = true;
-                        r.encoderUsed = std::wstring(vendorLabel(e.vendor)) + L" (hardware)";
-                        break;
-                    }
-                    enc->release();
-                    r.encoderFallbacks.push_back(e.name);
-                }
-            }
-            if (!opened) bgraDirect = false;
-        }
-        bool swNv12 = false;  // software MFT fed CPU NV12, muxed by the same pass-through writer as hardware
-        if (!opened) {
-            conv = GpuConvert{};
-            auto enc = std::make_unique<HwEncoder>();
-            unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
-            if (enc->openSoftware(W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) { hw = std::move(enc); swNv12 = true; opened = true; }
-            else { enc->release(); opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err); }
-            r.encoderUsed = L"Software (Media Foundation H.264)";
-            if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
-        }
-        if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
-        const bool scaling = W != (src->w & ~1u) || H != (src->h & ~1u);
-        if (!zeroCopy && !swNv12 && scaling) {  // CPU / RGB path can't scale: encode native instead
-            { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str());
-            W = src->w & ~1u; H = src->h & ~1u;
-            opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
-            if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
-        }
+        // Encoder/writer state, filled by setup(). For a real recording setup() runs on its own thread while
+        // capture has already started (frames are buffered), so Record is not held up by encoder init.
+        bool swNv12 = false;
+        D3D11_TEXTURE2D_DESC ed{};
+        const int RING = 16;  // > encoder queue + in-flight, so the async MFT never reads a surface we overwrite
+        ComPtr<ID3D11Texture2D> ring[RING];
+        ComPtr<ID3D11Texture2D> staging, lastGood, cpuStaging;
+        bool haveGood = false, cpuFallback = false;
+        long long failSince = 0;
+        std::vector<uint8_t> nv12Cpu;
+        D3D11_BOX box{};
         // Encoded-sample sink for the hardware path: the MP4 writer is opened on the first output so it gets the
         // encoder's final output type (sequence header).
         HRESULT muxHr = S_OK;
@@ -906,61 +883,134 @@ void Recorder::run() {
         double convMs = 0, encMs = 0;
         LONGLONG lastOutTick = 0;
         unsigned long long lastOutCount = 0;
-
-        mark(L"encoder");
-        // ---- textures ----
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = src->w; td.Height = src->h; td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        td.MiscFlags = D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
-        ComPtr<ID3D11Texture2D> latest;
-        if (FAILED(dev->CreateTexture2D(&td, nullptr, &latest))) { r.message = L"CreateTexture2D failed"; return; }
-        // Ring of encode surfaces so the async encoder never reads a texture we're overwriting.
-        D3D11_TEXTURE2D_DESC ed = td; ed.Width = W; ed.Height = H; ed.MiscFlags = 0;
-        if (zeroCopy && !bgraDirect) ed.Format = DXGI_FORMAT_NV12;
-        const int RING = 16;  // > encoder queue + in-flight, so the async MFT never reads a surface we overwrite
-        ComPtr<ID3D11Texture2D> ring[RING];
-        ComPtr<ID3D11Texture2D> staging;
-        for (auto& t : ring) if (FAILED(dev->CreateTexture2D(&ed, nullptr, &t))) { r.message = L"CreateTexture2D(ring) failed"; return; }
-        // Zero-copy safety net: last good NV12 frame (separate texture, survives processor rebuilds) and a
-        // BGRA staging texture for the CPU fallback if the GPU video processor keeps failing.
-        ComPtr<ID3D11Texture2D> lastGood, cpuStaging;
-        bool haveGood = false, cpuFallback = false;
-        long long failSince = 0;
-        std::vector<uint8_t> nv12Cpu;
-        if (swNv12) {
-            D3D11_TEXTURE2D_DESC sd = td; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            if (FAILED(dev->CreateTexture2D(&sd, nullptr, &cpuStaging))) { r.message = L"CreateTexture2D(cpuStaging) failed"; return; }
-            nv12Cpu.resize((size_t)W * H * 3 / 2);
-        }
-        if (zeroCopy) {
-            if (!bgraDirect && FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return; }
-        }
-        if (!zeroCopy && !swNv12) {
-            D3D11_TEXTURE2D_DESC sd = ed; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) { r.message = L"CreateTexture2D(staging) failed"; return; }
-        }
-        D3D11_BOX box{0, 0, 0, W, H, 1};
-
-        // ---- pre-warm: the pass-through MP4 writer opens on the first encoded frame; load the MP4 sink and the
-        // AAC encoder once now so that open doesn't stall the paced loop (CI saw ~250 ms -> 8 dropped frames).
-        if (hw) {
-            wchar_t tp[MAX_PATH], tf[MAX_PATH];
-            if (GetTempPathW(MAX_PATH, tp) && GetTempFileNameW(tp, L"crw", 0, tf)) {
-                std::wstring warm = std::wstring(tf) + L".mp4";
-                {
-                    Writer pw; pw.wantAudio = wr.wantAudio; std::wstring e3;
-                    ComPtr<IMFMediaType> vt = hw->muxType();
-                    pw.openPassthrough(warm, vt.Get(), e3);
-                    pw.sw.Reset();
+        auto setup = [&]() -> bool {
+            audioReady.wait();
+            r.encoderLog += alog;
+            mark(L"audio_wait");
+            wr.wantAudio = mixer.active() || opt_.warmupOnly;
+            r.hasAudio = wr.wantAudio;
+            if (opt_.encoder != Encoder::Software && videoSupport) {
+                auto encs = hwEncodersForDevice(dev.Get(), elog);
+                const UINT want = vendorPci(opt_.encoder);
+                std::stable_sort(encs.begin(), encs.end(), [want](const HwEncoderInfo& a, const HwEncoderInfo& b) {
+                    return (want && a.pciVendor == want) > (want && b.pciVendor == want);
+                });
+                bool vpOk = !encs.empty() && conv.init(dev.Get(), src->w, src->h, W, H);
+                if (!encs.empty() && !vpOk) {
+                    elog += L"GPU NV12 conversion unavailable (" + conv.why + L"): feeding the encoder BGRA surfaces directly\n";
+                    conv = GpuConvert{};
+                    W = src->w & ~1u; H = src->h & ~1u;  // no GPU scaler on this path: native size
+                    for (auto& e : encs) e.argb = true;
+                    bgraDirect = true;
                 }
-                DeleteFileW(warm.c_str()); DeleteFileW(tf);
+                if (!encs.empty()) {
+                    for (auto& e : encs) {
+                        elog += L"probe " + e.name + L"\n";
+                        const std::wstring key = probeKey(dev.Get(), e);
+                        int cached = -1;
+                        {
+                        // Another session (the launch warm-up) is probing this encoder: wait for its verdict, don't
+                        // run a second concurrent probe (AMD/NVENC session limits). Capture is already running.
+                        std::unique_lock<std::mutex> g(g_probeM);
+                        g_probeCv.wait_for(g, std::chrono::seconds(6), [&] { auto it = g_probe.find(key); return it == g_probe.end() || it->second != 2; });
+                        auto it = g_probe.find(key);
+                        if (it != g_probe.end() && it->second != 2) cached = it->second;
+                        else g_probe[key] = 2;
+                    }
+                        if (cached == 0) { elog += L"probe " + e.name + L": cached FAIL, skipped\n"; r.encoderFallbacks.push_back(e.name); continue; }
+                        if (cached == 1) elog += L"probe " + e.name + L": cached OK\n";
+                        else {
+                            bool okp = probeHwEncoder(dev.Get(), e, W, H, opt_.fps, 2500, elog);
+                            { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp ? 1 : 0; }
+                        g_probeCv.notify_all();
+                            mark(L"probe");
+                            if (!okp) { r.encoderFallbacks.push_back(e.name); continue; }
+                        }
+                        auto enc = std::make_unique<HwEncoder>();
+                        unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
+                        if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) {
+                            hw = std::move(enc); zeroCopy = true; opened = true;
+                            r.encoderUsed = std::wstring(vendorLabel(e.vendor)) + L" (hardware)";
+                            break;
+                        }
+                        enc->release();
+                        r.encoderFallbacks.push_back(e.name);
+                    }
+                }
+                if (!opened) bgraDirect = false;
             }
-        }
+            swNv12 = false;  // software MFT fed CPU NV12, muxed by the same pass-through writer as hardware
+            if (!opened) {
+                conv = GpuConvert{};
+                auto enc = std::make_unique<HwEncoder>();
+                unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
+                if (enc->openSoftware(W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) { hw = std::move(enc); swNv12 = true; opened = true; }
+                else { enc->release(); opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err); }
+                r.encoderUsed = L"Software (Media Foundation H.264)";
+                if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
+            }
+            if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return false; }
+            const bool scaling = W != (src->w & ~1u) || H != (src->h & ~1u);
+            if (!zeroCopy && !swNv12 && scaling) {  // CPU / RGB path can't scale: encode native instead
+                { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str());
+                W = src->w & ~1u; H = src->h & ~1u;
+                opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
+                if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return false; }
+            }
 
-        mark(L"writer_prewarm");
-        if (opt_.warmupOnly) { r.message = L"warm-up done"; { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); return; }
+            mark(L"encoder");
+            // ---- textures ----
+            // Ring of encode surfaces so the async encoder never reads a texture we're overwriting.
+            ed = td; ed.Width = W; ed.Height = H; ed.MiscFlags = 0;
+            if (zeroCopy && !bgraDirect) ed.Format = DXGI_FORMAT_NV12;
+            for (auto& t : ring) if (FAILED(dev->CreateTexture2D(&ed, nullptr, &t))) { r.message = L"CreateTexture2D(ring) failed"; return false; }
+            // Zero-copy safety net: last good NV12 frame (separate texture, survives processor rebuilds) and a
+            // BGRA staging texture for the CPU fallback if the GPU video processor keeps failing.
+            if (swNv12) {
+                D3D11_TEXTURE2D_DESC sd = td; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                if (FAILED(dev->CreateTexture2D(&sd, nullptr, &cpuStaging))) { r.message = L"CreateTexture2D(cpuStaging) failed"; return false; }
+                nv12Cpu.resize((size_t)W * H * 3 / 2);
+            }
+            if (zeroCopy) {
+                if (!bgraDirect && FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return false; }
+            }
+            if (!zeroCopy && !swNv12) {
+                D3D11_TEXTURE2D_DESC sd = ed; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) { r.message = L"CreateTexture2D(staging) failed"; return false; }
+            }
+            box = D3D11_BOX{0, 0, 0, W, H, 1};
+
+            // ---- pre-warm: the pass-through MP4 writer opens on the first encoded frame; load the MP4 sink and the
+            // AAC encoder once now so that open doesn't stall the paced loop (CI saw ~250 ms -> 8 dropped frames).
+            if (hw && !g_writerWarm.exchange(true)) {  // once per process (DLL/MFT load); later starts skip it
+                wchar_t tp[MAX_PATH], tf[MAX_PATH];
+                if (GetTempPathW(MAX_PATH, tp) && GetTempFileNameW(tp, L"crw", 0, tf)) {
+                    std::wstring warm = std::wstring(tf) + L".mp4";
+                    {
+                        Writer pw; pw.wantAudio = wr.wantAudio; std::wstring e3;
+                        ComPtr<IMFMediaType> vt = hw->muxType();
+                        pw.openPassthrough(warm, vt.Get(), e3);
+                        pw.sw.Reset();
+                    }
+                    DeleteFileW(warm.c_str()); DeleteFileW(tf);
+                }
+            }
+
+            mark(L"writer_prewarm");
+            return true;
+            };
+
+        if (opt_.warmupOnly) {
+            setup();
+            r.message = L"warm-up done"; { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); return;
+        }
+        auto setupF = std::async(std::launch::async, [&] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            bool ok = setup();
+            CoUninitialize();
+            return ok;
+        });
+        struct SetupJoin { std::future<bool>& f; ~SetupJoin() { if (f.valid()) f.wait(); } } setupJoin{setupF};
 
         // ---- paced loop: high-res waitable timer, duplicate last frame when nothing new ----
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -979,26 +1029,78 @@ void Recorder::run() {
         QueryPerformanceCounter(&t0);
         startQpc_ = t0.QuadPart;
         started_ = true;
-        mark(L"first_frame");
         r.startMs = (double)(t0.QuadPart - pressQ) * 1000.0 / qf.QuadPart;
-        if (opt_.notify) if (!opt_.warmupOnly) PostMessageW(opt_.notify, WM_APP_RECORDER_STARTED, 0, 0);
+        mixer.setOrigin(t0.QuadPart, freq.QuadPart);  // audio is placed against the same QPC zero
+        if (opt_.notify && haveFrame) PostMessageW(opt_.notify, WM_APP_RECORDER_STARTED, 0, 0);
+
+        // ---- encoder still initialising: keep the timeline running, buffer distinct frames (bounded) ----
+        struct Pending { long long idx; int slot; };
+        std::vector<Pending> backlog;
+        std::vector<ComPtr<ID3D11Texture2D>> slots;
+        const size_t kMaxSlots = 30;
+        size_t bi = 0;
+        {
+            bool fresh = true;
+            int lastSlot = -1;
+            D3D11_TEXTURE2D_DESC bd = td; bd.MiscFlags = 0;
+            while (haveFrame && !stop_ && setupF.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                long long due = (now.QuadPart - t0.QuadPart) * opt_.fps / freq.QuadPart;
+                if (due < next) {
+                    long long target = t0.QuadPart + next * freq.QuadPart / opt_.fps;
+                    LONGLONG waitMs = (target - now.QuadPart) * 1000 / freq.QuadPart;
+                    bool got = false;
+                    if (!src->acquire(ctx.Get(), latest.Get(), (UINT)(waitMs > 1 ? waitMs - 1 : 1), got)) { r.message = L"Capture failed"; break; }
+                    if (got) { ++capArrivals; fresh = true; }
+                    continue;
+                }
+                if (fresh || lastSlot < 0) {
+                    if (slots.size() < kMaxSlots) {
+                        ComPtr<ID3D11Texture2D> t;
+                        if (SUCCEEDED(dev->CreateTexture2D(&bd, nullptr, &t))) { ctx->CopyResource(t.Get(), latest.Get()); slots.push_back(t); lastSlot = (int)slots.size() - 1; }
+                    }
+                    fresh = false;
+                }
+                if (lastSlot >= 0) while (next <= due) backlog.push_back({next++, lastSlot});
+            }
+        }
+        bool setupOk = setupF.get();
+        {
+            LARGE_INTEGER q; QueryPerformanceCounter(&q);
+            wchar_t b[160];
+            swprintf(b, 160, L"first_frame=%.0fms(after press) setup_done=%.0fms(after press, overlapped) buffered=%zu/%zu ",
+                     r.startMs, (double)(q.QuadPart - pressQ) * 1000.0 / qf.QuadPart, backlog.size(), slots.size());
+            r.latencyLog += b;
+        }
+        if (!setupOk) return;
+        if (!backlog.empty()) next = backlog.front().idx;
         HRESULT whr = S_OK;
         long long pauseBegin = 0;  // worker's own clock: QPC when it first observed Paused
+        bool windowClosed = false;
         while (!stop_ && haveFrame && r.message.empty()) {
+            if (src->ended()) { windowClosed = true; break; }  // captured window closed: finish and keep the file
             if (fsm_.isPaused()) {
                 // Keep capture warm (drain frames) but write nothing; the media clock does not advance.
                 if (!pauseBegin) { LARGE_INTEGER pb; QueryPerformanceCounter(&pb); pauseBegin = pb.QuadPart; }
                 bool got = false;
                 if (!src->acquire(ctx.Get(), latest.Get(), 20, got)) { r.message = L"Capture failed"; break; }
-                mixer.discard();
+                mixer.setPaused(true);
                 continue;
             }
             if (pauseBegin) {  // shift the pacing origin by exactly the pause the worker saw: no "missed" frames
                 LARGE_INTEGER pe; QueryPerformanceCounter(&pe);
                 t0.QuadPart += pe.QuadPart - pauseBegin;
                 pauseBegin = 0;
+                mixer.setOrigin(t0.QuadPart, freq.QuadPart);
+                mixer.setPaused(false);
+                if (opt_.pauseTones) mixer.addMute(next * dur, next * dur + 3500000, true);  // resume tone
                 ++r.pauses;
             }
+            if (bi < backlog.size()) {  // encode what was captured while the encoder was initialising
+                ctx->CopyResource(latest.Get(), slots[backlog[bi].slot].Get());
+                next = backlog[bi].idx; ++bi;
+                if (bi == backlog.size()) { slots.clear(); }
+            } else {
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             long long due = (now.QuadPart - t0.QuadPart) * opt_.fps / freq.QuadPart;
@@ -1018,6 +1120,7 @@ void Recorder::run() {
                 continue;
             }
             if (due > next + 1) { unsigned long long skip = (unsigned long long)(due - next - 1); r.late += skip; r.dropped += skip; next = due - 1; }
+            }
             if (cursorByGdi) drawCursor(latest.Get(), origin);
             ID3D11Texture2D* t = ring[next % RING].Get();
             LARGE_INTEGER cs0; QueryPerformanceCounter(&cs0);
@@ -1114,6 +1217,12 @@ void Recorder::run() {
             if (!got) ++r.duplicated;  // reuse last frame
         }
         if (timer) CloseHandle(timer);
+        {
+            std::wstring ev = src->events();
+            if (windowClosed) ev += L"captured window closed: recording ended and saved; ";
+            if (!ev.empty()) r.encoderLog += L"window: " + ev + L"\n";
+            r.windowClosed = windowClosed;
+        }
         fsm_.beginFinish();
         LARGE_INTEGER tEnd; QueryPerformanceCounter(&tEnd);
         {

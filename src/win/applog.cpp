@@ -5,6 +5,8 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <atomic>
+#include <cwctype>
 #include <vector>
 
 namespace cr {
@@ -37,12 +39,46 @@ void trimIfBig(const std::wstring& p) {
     if (start + 1 < n) fwrite(buf.data() + start + 1, 1, n - start - 1, f);
     fclose(f);
 }
+HANDLE g_crashFile = INVALID_HANDLE_VALUE;  // opened up front: the crash path takes no locks, allocates nothing
+std::atomic<bool> g_crashed{false};
 LONG WINAPI crashFilter(EXCEPTION_POINTERS* e) {
-    wchar_t b[200];
-    swprintf(b, 200, L"CRASH: exception 0x%08lX at %p", e && e->ExceptionRecord ? (unsigned long)e->ExceptionRecord->ExceptionCode : 0ul,
-             e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionAddress : nullptr);
-    appLog(b);
+    if (g_crashed.exchange(true) || g_crashFile == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
+    char b[160];
+    int n = wsprintfA(b, "CRASH [pid %lu tid %lu]: exception 0x%08lX at %p\r\n", GetCurrentProcessId(), GetCurrentThreadId(),
+                      e && e->ExceptionRecord ? (unsigned long)e->ExceptionRecord->ExceptionCode : 0ul,
+                      e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionAddress : nullptr);
+    DWORD w = 0;
+    if (n > 0) WriteFile(g_crashFile, b, (DWORD)n, &w, nullptr);  // FILE_APPEND_DATA handle: atomic append
     return EXCEPTION_CONTINUE_SEARCH;
+}
+// Cross-process lock for append + trim (the app, the CLI and a second launch can all write).
+struct XLock {
+    HANDLE h;
+    XLock() : h(CreateMutexW(nullptr, FALSE, L"Local\\CastRecorder.Log")) { if (h) { DWORD r = WaitForSingleObject(h, 2000); if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) { CloseHandle(h); h = nullptr; } } }
+    ~XLock() { if (h) { ReleaseMutex(h); CloseHandle(h); } }
+};
+// %USERPROFILE%\... -> %USERPROFILE%\... (case-insensitive), so shared logs don't carry the user name.
+std::wstring redact(std::wstring s) {
+    wchar_t up[MAX_PATH]; DWORD n = GetEnvironmentVariableW(L"USERPROFILE", up, MAX_PATH);
+    if (!n || n >= MAX_PATH) return s;
+    std::wstring u(up, n), lo = s, ul = u;
+    for (auto& c : lo) c = towlower(c);
+    for (auto& c : ul) c = towlower(c);
+    for (size_t p = lo.find(ul); p != std::wstring::npos; p = lo.find(ul, p + 13)) {
+        s.replace(p, u.size(), L"%USERPROFILE%"); lo.replace(p, u.size(), L"%userprofile%");
+    }
+    // the bare user name (e.g. in a JSON-escaped path) too
+    const wchar_t* bs = wcsrchr(up, L'\\');
+    if (bs && bs[1]) {
+        std::wstring name = bs + 1, nl = name;
+        for (auto& c : nl) c = towlower(c);
+        if (nl.size() >= 3) for (size_t p = lo.find(L"\\" + nl); p != std::wstring::npos; p = lo.find(L"\\" + nl, p + 1)) {
+            size_t e = p + 1 + nl.size();
+            if (e < lo.size() && lo[e] != L'\\' && lo[e] != L'/' && lo[e] != L'"') continue;
+            s.replace(p + 1, name.size(), L"<user>"); lo.replace(p + 1, name.size(), L"<user>");
+        }
+    }
+    return s;
 }
 }  // namespace
 
@@ -66,6 +102,7 @@ void setAppLogPath(const std::wstring& p) { std::lock_guard<std::mutex> g(g_m); 
 void appLog(const std::wstring& line) {
     std::wstring p = appLogPath();
     std::lock_guard<std::mutex> g(g_m);
+    XLock xl;
     trimIfBig(p);
     FILE* f = _wfopen(p.c_str(), L"ab");
     if (!f) return;
@@ -73,7 +110,7 @@ void appLog(const std::wstring& line) {
     char ts[64];
     snprintf(ts, sizeof ts, "%04d-%02d-%02d %02d:%02d:%02d.%03d [%lu] ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
              st.wSecond, st.wMilliseconds, (unsigned long)GetCurrentProcessId());
-    std::string body = utf8(line);
+    std::string body = utf8(redact(line));
     // indent continuation lines so each entry stays readable
     std::string out = ts;
     for (char c : body) { if (c == '\n') out += "\r\n    "; else if (c != '\r') out += c; }
@@ -83,5 +120,9 @@ void appLog(const std::wstring& line) {
     fclose(f);
 }
 
-void installCrashLogger() { SetUnhandledExceptionFilter(crashFilter); }
+void installCrashLogger() {
+    std::wstring p = appLogPath();
+    g_crashFile = CreateFileW(p.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    SetUnhandledExceptionFilter(crashFilter);
+}
 }  // namespace cr

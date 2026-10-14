@@ -13,6 +13,11 @@ public:
     WgcCapture();
     ~WgcCapture();
     bool start(ID3D11Device* dev, HMONITOR mon, bool cursor, std::wstring& err);
+    // Single window (CreateForWindow). Output size is fixed at start; if the window is resized the content is
+    // copied at 1:1 into the top-left and the rest cleared. Minimized: no new frames (last frame is held).
+    bool startWindow(ID3D11Device* dev, HWND hwnd, bool cursor, std::wstring& err);
+    bool closed() const;       // captured window/item went away
+    std::wstring takeEvents(); // "minimized", "restored", "resized WxH", "closed"
     bool copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew);
     UINT width() const;
     UINT height() const;

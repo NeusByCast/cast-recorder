@@ -27,3 +27,7 @@ BEGIN
     VALUE "Translation", 0x409, 1200
   END
 END
+// Procedural tones (scripts/make-sounds.py): start chime, stop chime, pause/resume tick.
+IDR_SND_START WAVE "sounds/start.wav"
+IDR_SND_STOP WAVE "sounds/stop.wav"
+IDR_SND_TICK WAVE "sounds/tick.wav"
