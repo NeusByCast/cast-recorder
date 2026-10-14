@@ -821,10 +821,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     enableDpiAwareness();
     for (int i = 1; i < argc; ++i)
         // Any option other than --minimized goes to the console CLI, which validates it (never opens the window).
-        if (wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i], L"/?") == 0)) {
+if (wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i], L"/?") == 0)) {
             int rc = runCli(argc, argv);
             CoUninitialize();
-            return rc;
+            // GUI-subsystem processes sometimes lose WinMain's return code under Start-Process; be explicit.
+            ExitProcess((UINT)rc);
         }
     bool minimized = false;
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--minimized") == 0) minimized = true;
