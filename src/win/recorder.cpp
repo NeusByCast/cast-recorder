@@ -1507,7 +1507,7 @@ bool ffmpegCopy(const std::wstring& ffmpeg, const std::wstring& in, const std::w
                 const std::vector<std::wstring>& names, std::wstring& err) {
     // The absolute path goes in lpApplicationName so CreateProcess can't resolve a different ffmpeg.exe.
     std::wstring cmd = L"\"" + ffmpeg + L"\" -hide_banner -loglevel error -y -i \"" + in + L"\" -map 0 -c copy";
-    for (size_t k = 0; k < names.size(); ++k) cmd += L" -metadata:s:a:" + std::to_wstring(k) + L" title=\"" + names[k] + L"\"";
+    for (size_t k = 0; k < names.size(); ++k) cmd += L" -metadata:s:a:" + std::to_wstring(k) + L" title=\"" + names[k] + L"\" -metadata:s:a:" + std::to_wstring(k) + L" handler_name=\"" + names[k] + L"\"";
     size_t dot = out.find_last_of(L'.');
     std::wstring ext = dot == std::wstring::npos ? L"" : out.substr(dot);
     for (auto& c : ext) c = (wchar_t)towlower(c);
