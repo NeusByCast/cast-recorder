@@ -25,6 +25,7 @@
 #include "hwenc.h"
 #include "audio.h"
 #include "applog.h"
+#include "windows_enum.h"
 #include <future>
 #include <map>
 #include <mutex>
