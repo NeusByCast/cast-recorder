@@ -144,7 +144,10 @@ jobs:
             "measured fps=$fps duration=$dur"
             # Nominal rate must be exact; the average may dip slightly when the GPU-less runner drops a few late frames on the real desktop (<6%; the strict fps check is on the test pattern below).
             $rr = ($info | Select-String 'r_frame_rate=(\d+)/(\d+)').Matches[0].Groups
-            if ([double]$rr[1].Value / [double]$rr[2].Value -ne ${{ matrix.fps }}) { throw "nominal rate is not ${{ matrix.fps }}" }
+            $nominal = [double]$rr[1].Value / [double]$rr[2].Value
+            # MP4 stores the exact rate; MKV's r_frame_rate is ffprobe's guess from ms timestamps: same tolerance as the achieved-fps check
+            if ($c -eq 'mp4') { if ($nominal -ne ${{ matrix.fps }}) { throw "nominal rate is not ${{ matrix.fps }}" } }
+            elseif ($nominal -lt ${{ matrix.fps }} * 0.94 -or $nominal -gt ${{ matrix.fps }} + 0.5) { throw "$c nominal rate $nominal is not ~${{ matrix.fps }}" }
             if ($fps -lt ${{ matrix.fps }} * 0.94 -or $fps -gt ${{ matrix.fps }} + 0.5) { throw "expected ~${{ matrix.fps }} fps, got $fps" }
             if ([math]::Abs($dur - 4.0) -gt 0.5) { throw "expected ~4 s, got $dur" }
             if (-not ($info -match 'codec_name=h264')) { throw "not H.264" }
