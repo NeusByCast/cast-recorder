@@ -554,6 +554,7 @@ Recorder::~Recorder() {
     stop();
     if (!waitUntilIdle(3000)) abort();
     waitUntilIdle(2000);
+    if (th_.joinable()) { if (workers_.load() == 0) th_.join(); else th_.detach(); }  // never std::terminate
     if (doneEvent_) CloseHandle(doneEvent_);
 }
 
