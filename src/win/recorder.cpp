@@ -26,6 +26,9 @@
 #include "hwenc.h"
 #include "audio.h"
 #include "applog.h"
+#ifdef CR_HAVE_WGC
+#include <winrt/base.h>
+#endif
 #include <shellapi.h>
 #include "windows_enum.h"
 #include <future>
@@ -607,19 +610,29 @@ std::wstring activeTempFor(const std::wstring& out) {
     for (auto& a : g_jActive) if (a.first == out) return a.second;
     return {};
 }
+static std::wstring fullLower(const std::wstring& d) {
+    wchar_t b[MAX_PATH * 4]; DWORD n = GetFullPathNameW(d.c_str(), MAX_PATH * 4, b, nullptr);
+    std::wstring s = n && n < MAX_PATH * 4 ? std::wstring(b, n) : d;
+    while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    for (auto& c : s) { c = (wchar_t)towlower(c); if (c == L'/') c = L'\\'; }
+    return s;
+}
+static bool sameDir(const std::wstring& a, const std::wstring& b) { return !b.empty() && fullLower(a) == fullLower(b); }
 static bool recycle(const std::wstring& p) {
     std::wstring dbl = p; dbl.push_back(L'\0');
     SHFILEOPSTRUCTW op{}; op.wFunc = FO_DELETE; op.pFrom = dbl.c_str();
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted && GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES;
 }
-int sweepTempJournal(std::wstring& log) {
+int sweepTempJournal(const std::wstring& outputDir, std::wstring& log) {
     std::lock_guard<std::mutex> g(g_jm);
     int n = 0;
     for (auto& p : journalRead()) {
         size_t sl = p.find_last_of(L"\\/");
         if (!isAppTempName(sl == std::wstring::npos ? p : p.substr(sl + 1))) continue;  // only our own temp names
-        if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        const DWORD at = GetFileAttributesW(p.c_str());
+        if (at == INVALID_FILE_ATTRIBUTES || (at & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE))) continue;  // regular files only
+        if (sl == std::wstring::npos || !sameDir(p.substr(0, sl), outputDir)) continue;  // only inside the output folder
         if (recycle(p)) { ++n; log += L"startup: moved leftover temp file to the Recycle Bin: " + p + L"\n"; }
     }
     DeleteFileW(journalPath().c_str());
@@ -1580,6 +1593,18 @@ void Recorder::run() {
         r.ok = false; r.message = L"Recording stopped after an internal error (the file keeps what was written)";
         if (!sessionTmp_.empty() && fileSizeOf(sessionTmp_) > 0) r.file = sessionTmp_;
         logThreadException(L"recorder", e.what());
+    }
+#ifdef CR_HAVE_WGC
+    catch (const winrt::hresult_error& e) {  // WinRT (capture) errors are not std::exception
+        r.ok = false; r.message = L"Recording stopped after a capture error (the file keeps what was written)";
+        if (!sessionTmp_.empty() && fileSizeOf(sessionTmp_) > 0) r.file = sessionTmp_;
+        appLog(L"thread recorder: winrt::hresult_error 0x" + [&] { wchar_t b[16]; swprintf(b, 16, L"%08X", (unsigned)e.code().value); return std::wstring(b); }() + L" " + std::wstring(e.message().c_str()));
+    }
+#endif
+    catch (...) {
+        r.ok = false; r.message = L"Recording stopped after an internal error (the file keeps what was written)";
+        if (!sessionTmp_.empty() && fileSizeOf(sessionTmp_) > 0) r.file = sessionTmp_;
+        logThreadException(L"recorder", "unknown exception");
     }
 
     // Skip MF/COM teardown if anything was abandoned (a detached Finalize/Close may still be inside MF).

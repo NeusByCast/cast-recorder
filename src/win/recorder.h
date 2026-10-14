@@ -99,7 +99,7 @@ bool isAppTempName(const std::wstring& fileName);         // "*.castrec-tmp*.*"
 std::wstring makeTempFor(const std::wstring& out);        // fresh journaled temp next to `out`
 void releaseTemp(const std::wstring& tmp);
 std::wstring activeTempFor(const std::wstring& out);      // temp currently being written for `out` (progress)
-int sweepTempJournal(std::wstring& log);                  // startup: recycle journaled leftovers of a killed run
+int sweepTempJournal(const std::wstring& outputDir, std::wstring& log);                  // startup: recycle journaled leftovers of a killed run
 void logThreadException(const wchar_t* name, const char* what);
 // Runs f, logging and swallowing any exception (worker threads must never terminate the process).
 template <class F> void guardedRun(const wchar_t* name, F&& f) {

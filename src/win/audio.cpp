@@ -98,6 +98,7 @@ void AudioMixer::Shared::event(const std::wstring& e) {
     if (events.size() < 4000) events += e + L"; ";
 }
 
+std::function<void(bool)>& audioThreadErrorHandler() { static std::function<void(bool)> f; return f; }
 AudioFx& audioFx() { static AudioFx f; return f; }
 
 // gain -> noise suppression -> gate on a mono downmix; push-to-talk / mute silence. Returns the output peak.
@@ -312,7 +313,9 @@ struct AudioSource {
         if (buf.size() > maxS) { size_t d = buf.size() - maxS; buf.erase(buf.begin(), buf.begin() + d); bufStart += d / 2; }
     }
     void loop() {
-        cr::guardedRun(L"audio-capture", [&] { loopImpl(); });
+        bool ok = false;
+        cr::guardedRun(L"audio-capture", [&] { loopImpl(); ok = true; });
+        if (!ok) { auto& cb = audioThreadErrorHandler(); if (cb) cb(isMic); }
     }
     void loopImpl() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);

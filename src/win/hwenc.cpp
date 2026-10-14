@@ -2,6 +2,7 @@
 // hybrid laptops can bind the encoder of one GPU to the D3D device of another (both AMD on iGPU+dGPU
 // systems: same VEN_1002, different LUID) and then stall forever in ProcessInput/Finalize.
 #include "hwenc.h"
+#include "recorder.h"
 #include <dxgi.h>
 #include <mferror.h>
 #include <oleauto.h>
@@ -490,7 +491,7 @@ bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h
     struct St { std::atomic<int> state{0}; std::wstring log; bool ok = false; };  // 0 running, 1 done, 2 abandoned
     auto st = std::make_shared<St>();
     ComPtr<IDXGIAdapter> adRef = ad;
-    std::thread t([st, adRef, info, w, h, fps]() mutable {
+    std::thread t([st, adRef, info, w, h, fps]() mutable { cr::guardedRun(L"hw-probe", [&] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ComPtr<ID3D11Device> pdev; ComPtr<ID3D11DeviceContext> pctx;
         HRESULT hr = D3D11CreateDevice(adRef.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
@@ -543,6 +544,8 @@ bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h
             enc->leak(); enc.release();  // caller gave up on us: never touch the MFT again
             pdev.Detach(); pctx.Detach();
         }
+    });
+        int running = 0; st->state.compare_exchange_strong(running, 1);  // threw: report "done, failed" instead of a timeout
     });
     ULONGLONG end = GetTickCount64() + timeoutMs;
     while (st->state.load() == 0 && GetTickCount64() < end) Sleep(10);

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include "capture_wgc.h"
+#include "recorder.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -39,7 +40,7 @@ bool GpuPreview::start(HWND parent, const RECT& rc, bool cursor) {
                              rc.bottom - rc.top, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!child_) return false;
     quit_ = false; failed_ = false; live_ = false;
-    th_ = std::thread(&GpuPreview::run, this, cursor);
+    th_ = std::thread([this, cursor] { cr::guardedRun(L"preview", [&] { run(cursor); }); });
     return true;
 #endif
 }

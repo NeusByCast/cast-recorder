@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +43,8 @@ struct AudioFx {
     static float take(std::atomic<float>& a) { return a.exchange(0.f); }
 };
 AudioFx& audioFx();
+// Called (on the audio thread) when a capture thread ended with an exception; arg: true = microphone.
+std::function<void(bool)>& audioThreadErrorHandler();
 
 struct AudioSource;
 struct DeviceNotifier;

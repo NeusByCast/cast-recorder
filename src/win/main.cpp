@@ -120,7 +120,7 @@ constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3, HK_MIC = 4, HK_REPLAY = 5, HK_SHOT = 6;
 constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2, TIMER_SELFTEST = 3, TIMER_FRAME = 6, TIMER_TOAST = 7, TIMER_RESCAN = 8, TIMER_HKTEST = 9, TIMER_REPLAYRESTART = 10;
 constexpr UINT WM_APP_REPLAY_DONE = WM_APP + 45, WM_APP_REPLAY_SAVED = WM_APP + 46, WM_APP_SHOT_SAVED = WM_APP + 47, WM_APP_REMUX_DONE = WM_APP + 48,
-               WM_APP_META = WM_APP + 50, WM_APP_DIRCHANGE = WM_APP + 51;
+               WM_APP_META = WM_APP + 50, WM_APP_DIRCHANGE = WM_APP + 51, WM_APP_AUDIOERR = WM_APP + 52;
 constexpr int BASE_W = 1100, BASE_H = 700, MIN_W = 960, MIN_H = 620;  // v2 SPEC: Window
 // UI watchdog > worst-case teardown: capture Close 2 s + Finalize (8000/2) + 3 s margin. It only covers a stuck
 // Finalize: MKV conversion / remux run later in the background file queue, never under this watchdog, and the
@@ -310,9 +310,10 @@ std::wstring settingsDiff(const Settings& a, const Settings& b) {
 }
 // Startup: move journaled leftovers of a killed remux / conversion to the Recycle Bin. Only files this app created
 // (listed in %APPDATA%\\Cast Recorder\\temp-files.journal, named *.castrec-tmp*) - never user files.
+std::wstring outputDir();
 void sweepPartFiles() {
     std::wstring log;
-    int n = sweepTempJournal(log);
+    int n = sweepTempJournal(outputDir(), log);
     if (n) cr::appLog(log + L"startup: recycled " + std::to_wstring(n) + L" leftover temp file(s)");
 }
 std::wstring redactTitle(const std::wstring& t);
@@ -1593,7 +1594,7 @@ void scanRecordings() {
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             std::wstring n = fd.cFileName, ln = lowerW(n);
-            if (isAppTempName(ln) || ln.find(L"castrec-") == 0 || ln.find(L".tmp.") != std::wstring::npos) continue;
+            if (isAppTempName(ln)) continue;  // exactly the names rename refuses
             if (!live.empty() && lowerW(dir + L"\\" + n) == live) continue;
             RecItem it;
             it.path = dir + L"\\" + n; it.ext = lowerExt(n);
@@ -3468,6 +3469,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
+    case WM_APP_AUDIOERR:
+        setStatus(wp ? L"Microphone capture stopped after an internal error (see log)" : L"System audio capture stopped after an internal error (see log)", toRef(T_ERR));
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
     case WM_APP_REPLAY_SAVED: {
         std::unique_ptr<ReplaySaved> r((ReplaySaved*)lp);
         g.replaySaving = false;
@@ -4307,6 +4312,7 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     }
     g.s.fps = normalizeFps(g.s.fps);
     sweepPartFiles();
+    audioThreadErrorHandler() = [](bool mic) { if (g.hwnd) PostMessageW(g.hwnd, WM_APP_AUDIOERR, mic ? 1 : 0, 0); };
     prewarmCaptureAsync();
     applyTheme();
     if (g_selftestHotkeys) { g.s.replayEnabled = true; g.s.replaySeconds = 10; g_hkTestHook = [](int e) { g_hkEvents.push_back(e); }; }
