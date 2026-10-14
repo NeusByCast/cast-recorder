@@ -138,10 +138,10 @@ jobs:
             $fps = [double]$avg[1].Value / [double]$avg[2].Value
             $dur = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $out)
             "measured fps=$fps duration=$dur"
-            # Nominal rate must be exact; the average may dip slightly when the GPU-less runner drops a few late frames (<3%).
+            # Nominal rate must be exact; the average may dip slightly when the GPU-less runner drops a few late frames on the real desktop (<6%; the strict fps check is on the test pattern below).
             $rr = ($info | Select-String 'r_frame_rate=(\d+)/(\d+)').Matches[0].Groups
             if ([double]$rr[1].Value / [double]$rr[2].Value -ne ${{ matrix.fps }}) { throw "nominal rate is not ${{ matrix.fps }}" }
-            if ($fps -lt ${{ matrix.fps }} * 0.97 -or $fps -gt ${{ matrix.fps }} + 0.5) { throw "expected ~${{ matrix.fps }} fps, got $fps" }
+            if ($fps -lt ${{ matrix.fps }} * 0.94 -or $fps -gt ${{ matrix.fps }} + 0.5) { throw "expected ~${{ matrix.fps }} fps, got $fps" }
             if ([math]::Abs($dur - 4.0) -gt 0.5) { throw "expected ~4 s, got $dur" }
             if (-not ($info -match 'codec_name=h264')) { throw "not H.264" }
             # Full decode: every packet must decode with zero errors (catches missing SPS/PPS, bad moov, non-keyframe start).
@@ -186,14 +186,18 @@ jobs:
           if ($nf -lt $fps * 5 * 0.95) { throw "only $nf frames for 5 s at $fps" }
           # Compare against an ideal BT.709 limited-range 4:2:0 reference (exact float math, written by the app),
           # so the score measures our conversion + the encoder, not 4:2:0 subsampling or ffmpeg's RGB matrix.
-          $refIn = @('-f','rawvideo','-pix_fmt','yuv420p','-s','1280x720','-stream_loop','-1','-i',$ref)
-          $ss = & ffmpeg -hide_banner -i $out @refIn -lavfi "[0:v]format=yuv420p[a];[a][1:v]ssim" -shortest -f null - 2>&1 | Select-String 'All:([\d.]+)' | Select-Object -Last 1
-          $ps = & ffmpeg -hide_banner -i $out @refIn -lavfi "[0:v]format=yuv420p[a];[a][1:v]psnr" -shortest -f null - 2>&1 | Select-String 'PSNR y:([\d.inf]+).*average:([\d.inf]+)' | Select-Object -Last 1
+          $dec = "$PWD\rec\quality-$fps.yuv"
+          & ffmpeg -v error -i $out -f rawvideo -pix_fmt yuv420p -y $dec
+          $raw = @('-f','rawvideo','-pix_fmt','yuv420p','-s','1280x720')
+          # raw vs raw: no implicit range/matrix conversion inside ffmpeg; the reference frame is looped by the filter
+          $ss = & ffmpeg -hide_banner @raw -i $dec @raw -i $ref -lavfi "[1:v]loop=-1:1:0[r];[0:v][r]ssim=shortest=1" -f null - 2>&1 | Select-String 'All:([\d.]+)' | Select-Object -Last 1
+          $ps = & ffmpeg -hide_banner @raw -i $dec @raw -i $ref -lavfi "[1:v]loop=-1:1:0[r];[0:v][r]psnr=shortest=1" -f null - 2>&1 | Select-String 'PSNR y:([\d.inf]+)' | Select-Object -Last 1
+          Remove-Item $dec
           $ssim = [double]$ss.Matches[0].Groups[1].Value
           $psnrS = $ps.Matches[0].Groups[1].Value; $psnr = if ($psnrS -eq 'inf') { 99 } else { [double]$psnrS }
           "quality: SSIM=$ssim PSNR-Y=$psnr dB"
-          if ($ssim -lt 0.97) { throw "SSIM $ssim < 0.97 (warping / artifacts / starved bitrate)" }
-          if ($psnr -lt 38) { throw "PSNR-Y $psnr dB < 38" }
+          if ($ssim -lt 0.98) { throw "SSIM $ssim < 0.98 (warping / artifacts / starved bitrate)" }
+          if ($psnr -lt 40) { throw "PSNR-Y $psnr dB < 40" }
       - name: ffmpeg hijack probe (a fake ffmpeg.exe in the working folder must not run)
         if: matrix.fps == 30
         shell: pwsh
