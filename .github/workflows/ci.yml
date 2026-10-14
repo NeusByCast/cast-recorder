@@ -88,6 +88,21 @@ jobs:
           $slog = "$PWD\rec\start-stop-${{ matrix.fps }}.txt"
           if (Test-Path $slog) { Get-Content $slog } else { throw "start-stop log missing" }
           if (-not (Select-String -Path $slog -Pattern '^ok=1' -Quiet)) { throw "start-stop smoke failed (log)" }
+          # Stuck-Finalize: hang longer than the Finalize half-budget; must return Idle, temp gone, no second start.
+          if (${{ matrix.fps }} -eq 30) {
+            $hangOut = "$PWD\rec\hang.mp4"
+            $hangLog = "$PWD\rec\hang.txt"
+            $pH = Start-Process $exe.FullName -ArgumentList "--record 1 --fps 30 --encoder software --allow-synthetic --test-hang-finalize 8000 --out `"$hangOut`" --log `"$hangLog`"" -Wait -PassThru
+            if (Test-Path $hangLog) { Get-Content $hangLog } else { throw "hang log missing" }
+            if (-not (Select-String -Path $hangLog -Pattern 'abandoned=1' -Quiet)) { throw "expected abandoned=1 on hang-finalize" }
+            if (Test-Path $hangOut) { throw "incomplete hang.mp4 should have been deleted" }
+            if (Test-Path "$hangOut.part.mp4") { throw "leftover hang.part.mp4" }
+            $p2 = Start-Process $exe.FullName -ArgumentList "--record 1 --encoder software --allow-synthetic --out `"$PWD\rec\after-hang.mp4`" --log `"$PWD\rec\after-hang.txt`"" -Wait -PassThru
+            Get-Content "$PWD\rec\after-hang.txt" -ErrorAction SilentlyContinue
+            if (Select-String -Path "$PWD\rec\after-hang.txt" -Pattern '^ok=1' -Quiet) { throw "second start after abandon should be refused" }
+            $pR = Start-Process $exe.FullName -ArgumentList "--render-ui `"$PWD\rec\ui-idle.bmp`" --ui-state idle --log `"$PWD\rec\ui.txt`"" -Wait -PassThru
+            if (-not (Test-Path "$PWD\rec\ui-idle.bmp")) { throw "ui-idle.bmp missing" }
+          }
           foreach ($c in @('mp4','mkv')) {
             $out = "$PWD\rec\smoke-${{ matrix.fps }}.$c"
             $log = "$PWD\rec\smoke-${{ matrix.fps }}-$c.txt"
