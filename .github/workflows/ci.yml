@@ -138,7 +138,10 @@ jobs:
             $fps = [double]$avg[1].Value / [double]$avg[2].Value
             $dur = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $out)
             "measured fps=$fps duration=$dur"
-            if ([math]::Abs($fps - ${{ matrix.fps }}) -gt 0.5) { throw "expected ${{ matrix.fps }} fps, got $fps" }
+            # Nominal rate must be exact; the average may dip slightly when the GPU-less runner drops a few late frames (<3%).
+            $rr = ($info | Select-String 'r_frame_rate=(\d+)/(\d+)').Matches[0].Groups
+            if ([double]$rr[1].Value / [double]$rr[2].Value -ne ${{ matrix.fps }}) { throw "nominal rate is not ${{ matrix.fps }}" }
+            if ($fps -lt ${{ matrix.fps }} * 0.97 -or $fps -gt ${{ matrix.fps }} + 0.5) { throw "expected ~${{ matrix.fps }} fps, got $fps" }
             if ([math]::Abs($dur - 4.0) -gt 0.5) { throw "expected ~4 s, got $dur" }
             if (-not ($info -match 'codec_name=h264')) { throw "not H.264" }
             # Full decode: every packet must decode with zero errors (catches missing SPS/PPS, bad moov, non-keyframe start).
