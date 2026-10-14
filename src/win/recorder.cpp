@@ -1176,9 +1176,11 @@ void Recorder::run() {
         HRESULT whr = S_OK;
         long long pauseBegin = 0;  // worker's own clock: QPC when it first observed Paused
         bool windowClosed = false;
-        while (!stop_ && haveFrame && r.message.empty()) {
+        // A stop that lands while the encoder is still initialising still writes what was captured up to it.
+        while ((!stop_ || bi < backlog.size()) && haveFrame && r.message.empty()) {
             if (src->ended()) { windowClosed = true; break; }  // captured window closed: finish and keep the file
             if (fsm_.isPaused()) {
+                if (stop_) break;
                 // Keep capture warm (drain frames) but write nothing; the media clock does not advance.
                 if (!pauseBegin) { LARGE_INTEGER pb; QueryPerformanceCounter(&pb); pauseBegin = pb.QuadPart; }
                 bool got = false;
