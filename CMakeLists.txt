@@ -26,11 +26,13 @@ add_test(NAME unit COMMAND cr_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR
 add_executable(cr_qa_edge tests/qa_edge.cpp)
 target_link_libraries(cr_qa_edge PRIVATE cr_core)
 add_test(NAME qa_edge COMMAND cr_qa_edge WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+add_executable(cr_fsm tests/test_fsm.cpp)
+add_test(NAME fsm COMMAND cr_fsm WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 if(WIN32)
   add_executable(CastRecorder WIN32 src/win/main.cpp src/win/recorder.cpp src/win/capture_wgc.cpp res/app.rc)
   target_compile_definitions(CastRecorder PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_link_libraries(CastRecorder PRIVATE cr_core d3d11 dxgi mfplat mfreadwrite mfuuid ole32 shell32 shlwapi uuid dwmapi user32 gdi32)
+  target_link_libraries(CastRecorder PRIVATE cr_core d3d11 dxgi mfplat mfreadwrite mfuuid ole32 shell32 shlwapi uuid dwmapi user32 gdi32 winmm)
   if(MSVC)
     target_compile_definitions(CastRecorder PRIVATE CR_HAVE_WGC)
     target_compile_options(CastRecorder PRIVATE /W3 /permissive- /utf-8)
@@ -43,6 +45,7 @@ if(WIN32)
     target_link_options(CastRecorder PRIVATE /guard:cf /DEPENDENTLOADFLAG:0x800 /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT)
     # Static CRT: no VC++ redistributable needed on the target PC.
     target_compile_options(cr_qa_edge PRIVATE /utf-8)
+    # cr_fsm is header-only logic, no special flags
     set_property(TARGET CastRecorder cr_core cr_tests cr_qa_edge PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   else()
     target_compile_options(CastRecorder PRIVATE -Wall -municode)

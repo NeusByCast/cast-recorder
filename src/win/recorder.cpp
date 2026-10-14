@@ -251,7 +251,7 @@ std::wstring exeDir() {
     return k == std::wstring::npos ? L"." : s.substr(0, k);
 }
 
-bool remux(const std::wstring& ffmpeg, const std::wstring& in, const std::wstring& out) {
+bool remux(const std::wstring& ffmpeg, const std::wstring& in, const std::wstring& out, DWORD timeoutMs) {
     // The absolute path goes in lpApplicationName so CreateProcess can't resolve a different ffmpeg.exe.
     std::wstring cmd = L"\"" + ffmpeg + L"\" -hide_banner -loglevel error -y -i \"" + in + L"\" -c copy \"" + out + L"\"";
     STARTUPINFOW si{sizeof si};
@@ -259,9 +259,10 @@ bool remux(const std::wstring& ffmpeg, const std::wstring& in, const std::wstrin
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
     buf.push_back(0);
     if (!CreateProcessW(ffmpeg.c_str(), buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
-    if (WaitForSingleObject(pi.hProcess, 120000) == WAIT_TIMEOUT) {
+    DWORD wait = timeoutMs ? timeoutMs : 8000;
+    if (WaitForSingleObject(pi.hProcess, wait) == WAIT_TIMEOUT) {
         TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 5000);
+        WaitForSingleObject(pi.hProcess, 2000);
     }
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
@@ -311,27 +312,71 @@ std::wstring describeHardwareEncoders() {
     return s;
 }
 
-Recorder::~Recorder() { stop(); join(); }
+Recorder::Recorder() {
+    doneEvent_ = CreateEventW(nullptr, TRUE, TRUE, nullptr);  // starts signaled (Idle)
+}
+Recorder::~Recorder() {
+    stop();
+    if (!waitUntilIdle(3000)) abort();
+    waitUntilIdle(2000);
+    if (doneEvent_) CloseHandle(doneEvent_);
+}
+
+void Recorder::signalDone() {
+    // Only the first caller (worker exit or abort) transitions to Idle and notifies.
+    bool expected_busy = fsm_.busy();
+    fsm_.toIdle();
+    started_ = true;
+    if (doneEvent_) SetEvent(doneEvent_);
+    if (expected_busy && opt_.notify) PostMessageW(opt_.notify, WM_APP_RECORDER_DONE, 0, 0);
+}
 
 bool Recorder::start(const RecordOptions& o) {
-    if (running_) return false;
-    join();
+    // A previous abort may have detached a worker still inside Finalize — wait briefly.
+    for (int i = 0; i < 40 && workers_.load() > 0; ++i) Sleep(50);
+    if (workers_.load() > 0) return false;
+    if (!fsm_.tryStart()) return false;
+    if (th_.joinable()) th_.join();
     opt_ = o;
     opt_.fps = normalizeFps(o.fps);
+    if (!opt_.finalizeTimeoutMs) opt_.finalizeTimeoutMs = 8000;
     result_ = RecordResult{};
     stop_ = false;
     started_ = false;
-    running_ = true;
-    LARGE_INTEGER q;
-    QueryPerformanceCounter(&q);
-    startQpc_ = q.QuadPart;
+    if (doneEvent_) ResetEvent(doneEvent_);
     th_ = std::thread([this] { run(); });
     return true;
 }
-void Recorder::stop() { stop_ = true; }
-void Recorder::join() { if (th_.joinable()) th_.join(); }
+
+void Recorder::stop() {
+    stop_ = true;
+    fsm_.requestStop();  // Recording -> Stopping (idempotent if already Stopping/Finishing)
+}
+
+bool Recorder::waitUntilIdle(DWORD timeoutMs) {
+    if (!doneEvent_) return !fsm_.busy();
+    return WaitForSingleObject(doneEvent_, timeoutMs) == WAIT_OBJECT_0;
+}
+
+void Recorder::abort() {
+    stop_ = true;
+    fsm_.requestStop();
+    // Give Finalize / remux their remaining budget, then detach so Exit always works.
+    waitUntilIdle(2000);
+    if (th_.joinable() && workers_.load() > 0) {
+        th_.detach();
+        result_.timedOut = true;
+        if (result_.message.empty()) result_.message = L"Recording cancelled";
+    }
+    if (fsm_.busy()) signalDone();
+}
+
+void Recorder::join() {
+    if (th_.joinable()) th_.join();
+}
+
 double Recorder::elapsedSeconds() const {
-    if (!running_ || !started_) return 0;
+    if (!fsm_.isRecording() || !started_) return 0;  // freeze the clock once Stopping
     LARGE_INTEGER q, f;
     QueryPerformanceCounter(&q);
     QueryPerformanceFrequency(&f);
@@ -339,6 +384,12 @@ double Recorder::elapsedSeconds() const {
 }
 
 void Recorder::run() {
+    workers_.fetch_add(1);
+    struct WorkerGuard {
+        std::atomic<int>& w;
+        explicit WorkerGuard(std::atomic<int>& x) : w(x) {}
+        ~WorkerGuard() { w.fetch_sub(1); }
+    } workerGuard{workers_};
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -528,34 +579,86 @@ void Recorder::run() {
             if (!got) ++r.duplicated;
         }
         if (timer) CloseHandle(timer);
-        src.reset();
-        HRESULT fh = r.frames ? wr.sw->Finalize() : E_FAIL;
-        wr = Writer{};
-        if (FAILED(fh)) { if (r.message.empty()) r.message = r.frames ? hrMsg(L"Finalize", fh) : L"No frames recorded"; DeleteFileW(tmp.c_str()); return; }
-        r.file = tmp;
-        if (opt_.container != Container::MP4) {
-            std::wstring ff = findFfmpeg();
-            if (!ff.empty() && remux(ff, tmp, opt_.outputPath)) { DeleteFileW(tmp.c_str()); r.file = opt_.outputPath; }
-            else {
-                DeleteFileW(opt_.outputPath.c_str());  // partial output from a failed remux
-                // Replace only the file name's extension, never a dot in a directory name.
-                std::wstring mp4 = opt_.outputPath;
-                size_t slash = mp4.find_last_of(L"\\/"), dot = mp4.find_last_of(L'.');
-                if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash)) mp4.resize(dot);
-                mp4 += L".mp4";
-                if (MoveFileExW(tmp.c_str(), mp4.c_str(), MOVEFILE_REPLACE_EXISTING)) r.file = mp4;
-                else r.file = tmp;  // keep the recording rather than lose it
-                r.message = ff.empty() ? L"ffmpeg.exe not found, saved as MP4" : L"ffmpeg remux failed, saved as MP4";
+        fsm_.beginFinish();
+
+        // Tear down capture off the critical path with a short budget — WGC Close can stall.
+        {
+            Source* raw = src.release();
+            if (raw) {
+                std::atomic<bool> closed{false};
+                std::thread closer([&] { delete raw; closed = true; });
+                for (int i = 0; i < 40 && !closed; ++i) Sleep(50);  // ~2 s
+                if (closed) closer.join();
+                else closer.detach();  // abandon a stuck Close rather than hang forever
             }
         }
-        r.ok = r.message.empty() || r.message.rfind(L"ffmpeg", 0) == 0;
+
+        // Finalize with a hard timeout. IMFSinkWriter::Finalize is the usual hang point.
+        HRESULT fh = E_FAIL;
+        if (r.frames && wr.sw) {
+            auto sw = wr.sw;  // keep a ref on the helper thread
+            std::atomic<bool> finDone{false};
+            std::atomic<HRESULT> fhr{E_FAIL};
+            std::thread fin([&] {
+                HRESULT h = sw->Finalize();
+                fhr = h;
+                finDone = true;
+            });
+            DWORD budget = opt_.finalizeTimeoutMs ? opt_.finalizeTimeoutMs / 2 : 4000;
+            DWORD waited = 0;
+            while (!finDone && waited < budget) { Sleep(50); waited += 50; }
+            if (!finDone) {
+                // Abandon the writer: release our refs and detach the stuck Finalize thread.
+                r.timedOut = true;
+                r.message = L"Finalize timed out — file may be incomplete";
+                wr.sw.Reset();
+                wr.mgr.Reset();
+                sw.Reset();
+                fin.detach();
+                DeleteFileW(tmp.c_str());
+                // Fall through: still signalDone so the UI recovers.
+            } else {
+                fin.join();
+                fh = fhr.load();
+                wr = Writer{};
+            }
+        } else {
+            wr = Writer{};
+            if (!r.frames && r.message.empty()) r.message = L"No frames recorded";
+        }
+
+        if (!r.timedOut) {
+            if (FAILED(fh) && r.frames) {
+                if (r.message.empty()) r.message = hrMsg(L"Finalize", fh);
+                DeleteFileW(tmp.c_str());
+            } else if (SUCCEEDED(fh) && r.frames) {
+                r.file = tmp;
+                if (opt_.container != Container::MP4) {
+                    std::wstring ff = findFfmpeg();
+                    DWORD remuxBudget = opt_.finalizeTimeoutMs ? opt_.finalizeTimeoutMs / 2 : 4000;
+                    if (!ff.empty() && remux(ff, tmp, opt_.outputPath, remuxBudget)) {
+                        DeleteFileW(tmp.c_str());
+                        r.file = opt_.outputPath;
+                    } else {
+                        DeleteFileW(opt_.outputPath.c_str());
+                        std::wstring mp4 = opt_.outputPath;
+                        size_t slash = mp4.find_last_of(L"\\/"), dot = mp4.find_last_of(L'.');
+                        if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash)) mp4.resize(dot);
+                        mp4 += L".mp4";
+                        if (MoveFileExW(tmp.c_str(), mp4.c_str(), MOVEFILE_REPLACE_EXISTING)) r.file = mp4;
+                        else r.file = tmp;
+                        if (ff.empty()) r.message = L"ffmpeg.exe not found, saved as MP4";
+                        else { r.message = L"ffmpeg remux failed, saved as MP4"; DeleteFileW(tmp.c_str()); }
+                    }
+                }
+            }
+        }
+        r.ok = r.frames > 0 && !r.timedOut && (r.message.empty() || r.message.find(L"saved as MP4") != std::wstring::npos);
     }();
 
     MFShutdown();
     if (SUCCEEDED(hrCo)) CoUninitialize();
-    started_ = true;  // unblock waiters even on failure
-    running_ = false;
-    if (opt_.notify) PostMessageW(opt_.notify, WM_APP_RECORDER_DONE, 0, 0);
+    signalDone();
 }
 
 }  // namespace cr

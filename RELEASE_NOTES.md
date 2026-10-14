@@ -1,6 +1,6 @@
-## 1.0.1
+## 1.0
 
-- Hardened ffmpeg lookup and DLL loading (no cwd hijack; CFG)
-- Validated CLI (`--help`, exit code 2 on bad args); recordings match the requested duration
-- Stricter settings JSON; remux cleanup and safer uninstaller
-- Nbc QA edge-case suite in CI
+- Stop hotkey and Stop button always end the recording; finalize/remux cannot hang the UI (hard timeout)
+- Exit from the tray always works, even while finishing a file
+- Soft click on start and stop
+- Reliable recording clock and duration; hardened ffmpeg lookup and CLI validation

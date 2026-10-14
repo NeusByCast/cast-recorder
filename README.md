@@ -18,4 +18,4 @@ ctest --test-dir build -C Release
 iscc /DAppVersion=<ver> /DBinDir=..\build\Release installer\CastRecorder.iss
 ```
 
-Version lives in `src/win/version.h`. Unit tests also build on Linux. Known limits: primary monitor only, no audio, MKV/MOV need ffmpeg on PATH.
+Version lives in `src/win/version.h` (1.0, 1.1, …). Unit tests also build on Linux. Known limits: primary monitor only, no audio, MKV/MOV need ffmpeg on PATH.

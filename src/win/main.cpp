@@ -18,6 +18,9 @@
 #include "recorder.h"
 #include "resource.h"
 #include "version.h"
+#include "click_wav.h"
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 
 using namespace cr;
 
@@ -196,9 +199,33 @@ std::wstring outputDir() { return g.s.outputDir.empty() ? defaultOutputDir() : W
 
 void setStatus(const std::wstring& s, COLORREF c) { g.status = s; g.statusColor = c; InvalidateRect(g.hwnd, nullptr, FALSE); }
 
+void playClick() {
+    // Soft embedded click; async so start/stop never block. Falls back to a quiet system asterisk if needed.
+    if (!PlaySoundW(reinterpret_cast<LPCWSTR>(kClickWav), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT))
+        PlaySoundW(L"SystemNotification", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+}
+
+// Always succeeds within a few seconds: stop → wait → abort → destroy. Never join forever on the UI thread.
+void forceQuit() {
+    g.quitting = true;
+    g.rec.stop();
+    setStatus(L"Closing\u2026", C_MUTED);
+    // Pump a little so STOP is visible; waitUntilIdle doesn't run the message loop, so poll briefly.
+    ULONGLONG end = GetTickCount64() + 5000;
+    while (g.rec.running() && GetTickCount64() < end) {
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        if (!g.rec.waitUntilIdle(50)) Sleep(10);
+    }
+    if (g.rec.running()) g.rec.abort();
+    g.rec.waitUntilIdle(500);
+    DestroyWindow(g.hwnd);
+}
+
+
 // ---------- recording ----------
 void startRecording() {
-    if (g.rec.running()) return;
+    if (g.rec.running()) return;  // busy (recording/stopping/finishing)
     std::wstring dir = outputDir();
     SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
     if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) { setStatus(L"Can't create the save folder", C_ERR); return; }
@@ -211,13 +238,26 @@ void startRecording() {
     o.fps = g.s.fps; o.quality = g.s.quality; o.encoder = g.s.encoder; o.container = g.s.container;
     o.captureCursor = g.s.captureCursor; o.notify = g.hwnd;
     o.outputPath = dir + L"\\" + name + W(extension(g.s.container));
-    g.rec.start(o);
+    registerAll();  // ensure hotkeys are live (re-bind after any capture-field unregister)
+    if (!g.rec.start(o)) { setStatus(L"Already recording", C_WARN); return; }
+    playClick();
     SetTimer(g.hwnd, TIMER_TICK, 250, nullptr);
     setStatus(L"Recording\u2026", C_REC);
     trayUpdate(NIM_MODIFY);
 }
-void stopRecording() { if (g.rec.running()) { g.rec.stop(); setStatus(L"Finishing file\u2026", C_MUTED); } }
-void toggleRecording() { g.rec.running() ? stopRecording() : startRecording(); }
+void stopRecording() {
+    if (!g.rec.running()) return;
+    if (g.rec.state() == RecState::Finishing || g.rec.state() == RecState::Stopping) return;
+    playClick();
+    g.rec.stop();
+    setStatus(L"Finishing file\u2026", C_MUTED);
+    trayUpdate(NIM_MODIFY);
+}
+void toggleRecording() {
+    // isRecording() so a second hotkey during Stopping/Finishing does not start again.
+    if (g.rec.isRecording()) stopRecording();
+    else if (!g.rec.running()) startRecording();
+}
 void openFolder() {
     std::wstring d = outputDir();
     SHCreateDirectoryExW(nullptr, d.c_str(), nullptr);
@@ -324,8 +364,9 @@ void paint(HDC dc, RECT client) {
     // Record card
     RECT card{pad, y, W_ - pad, y + S(84)};
     round(dc, card, C_CARD, C_BORDER, 14);
-    bool rec = g.rec.running();
-    std::wstring head = rec ? L"Recording" : L"Ready to record";
+    bool rec = g.rec.isRecording();
+    bool finishing = g.rec.state() == RecState::Stopping || g.rec.state() == RecState::Finishing;
+    std::wstring head = rec ? L"Recording" : finishing ? L"Finishing file…" : L"Ready to record";
     wchar_t sub[160];
     if (rec) {
         int sec = (int)g.rec.elapsedSeconds();
@@ -344,7 +385,7 @@ void paint(HDC dc, RECT client) {
     RECT rb{card.right - S(156), card.top + S(22), card.right - S(20), card.top + S(62)};
     bool hov = g.hover == H_RECORD;
     round(dc, rb, rec ? (hov ? C_SEG_H : C_SEG) : (hov ? C_REC_H : C_REC), rec ? C_BORDER : (hov ? C_REC_H : C_REC), 12);
-    text(dc, rec ? L"Stop" : L"Start recording", rb, g.fBody, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    text(dc, (rec || finishing) ? (finishing ? L"Finishing…" : L"Stop") : L"Start recording", rb, g.fBody, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     addRegion(rb, H_RECORD);
     y = card.bottom + S(24);
 
@@ -518,7 +559,7 @@ void trayMenu() {
     if (c == 1) toggleRecording();
     else if (c == 2) openFolder();
     else if (c == 3) showWindow();
-    else if (c == 4) { g.quitting = true; if (g.rec.running()) g.rec.stop(); else DestroyWindow(g.hwnd); }
+    else if (c == 4) { forceQuit(); }
 }
 
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -596,10 +637,26 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == HK_FOLDER) openFolder();
         return 0;
     case WM_TIMER:
-        if (wp == TIMER_TICK) InvalidateRect(h, nullptr, FALSE);
+        if (wp == TIMER_TICK) {
+            static ULONGLONG finishSince = 0;
+            RecState st = g.rec.state();
+            if (st == RecState::Stopping || st == RecState::Finishing) {
+                if (!finishSince) finishSince = GetTickCount64();
+                else if (GetTickCount64() - finishSince > 10000) {
+                    finishSince = 0;
+                    g.rec.abort();
+                    setStatus(L"Stopped (finalize took too long)", C_WARN);
+                    KillTimer(h, TIMER_TICK);
+                    trayUpdate(NIM_MODIFY);
+                }
+            } else finishSince = 0;
+            InvalidateRect(h, nullptr, FALSE);
+        }
         return 0;
     case WM_APP_RECORDER_DONE: {
-        g.rec.join();
+        // Thread has already signaled Idle (or abort did). Join only if it exited cleanly — never block the UI.
+        g.rec.waitUntilIdle(100);
+        if (!g.rec.running()) { /* joinable worker may still be detach-cleanup */ }
         KillTimer(h, TIMER_TICK);
         const RecordResult& r = g.rec.result();
         if (r.ok) {
@@ -608,8 +665,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (!r.message.empty()) msg2 += L"  \u00b7  " + r.message;
             if (r.late) msg2 += L"  \u00b7  " + std::to_wstring(r.late) + L" late frames";
             setStatus(msg2, C_OK);
-        } else setStatus(L"Recording failed: " + r.message, C_ERR);
+        } else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, C_WARN);
+        else setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), C_ERR);
         trayUpdate(NIM_MODIFY);
+        InvalidateRect(h, nullptr, FALSE);
         if (g.quitting) DestroyWindow(h);
         return 0;
     }
@@ -619,6 +678,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP + 2:  // second instance asked us to show
         showWindow();
+        return 0;
+    case WM_CLOSE:
+        // Taskbar close / Alt+F4: hide to tray. Full exit goes through forceQuit (tray Exit).
+        ShowWindow(h, SW_HIDE);
         return 0;
     case WM_DESTROY:
         unregisterAll();
@@ -734,9 +797,10 @@ int runCli(int argc, wchar_t** argv) {
     while (r.running() && !r.started()) Sleep(5);
     const ULONGLONG ms = (ULONGLONG)(secs * 1000.0);
     const ULONGLONG end = GetTickCount64() + ms;
-    while (r.running() && GetTickCount64() < end) Sleep(5);
+    while (r.isRecording() && GetTickCount64() < end) Sleep(5);
     r.stop();
-    r.join();
+    if (!r.waitUntilIdle(15000)) r.abort();
+    r.waitUntilIdle(2000);
     const RecordResult& res = r.result();
     char summary[4096];
     snprintf(summary, sizeof summary, "ok=%d frames=%llu duplicated=%llu late=%llu\ncapture=%s\nencoder=%s\nfile=%s\nmessage=%s\n",
@@ -817,7 +881,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     g.rec.stop();
-    g.rec.join();
+    if (!g.rec.waitUntilIdle(3000)) g.rec.abort();
+    g.rec.waitUntilIdle(1000);
     if (mtx) CloseHandle(mtx);
     CoUninitialize();
     LocalFree(argv);
