@@ -123,7 +123,7 @@ jobs:
             $late = (Select-String -Path $pLog -Pattern 'late=(\d+)').Matches[0].Groups[1].Value
             if ([int]$late -gt 3) { throw "pause was counted as $late late frames" }
           }
-          foreach ($c in @('mp4','mkv')) {
+          foreach ($c in @('mp4','mkv','mov')) {
             $out = "$PWD\rec\smoke-${{ matrix.fps }}.$c"
             $log = "$PWD\rec\smoke-${{ matrix.fps }}-$c.txt"
             # The runner has a desktop session but no GPU; --allow-synthetic falls back to a test pattern only if screen capture is unavailable.
@@ -141,6 +141,14 @@ jobs:
             if ([math]::Abs($fps - ${{ matrix.fps }}) -gt 0.5) { throw "expected ${{ matrix.fps }} fps, got $fps" }
             if ([math]::Abs($dur - 4.0) -gt 0.5) { throw "expected ~4 s, got $dur" }
             if (-not ($info -match 'codec_name=h264')) { throw "not H.264" }
+            # Full decode: every packet must decode with zero errors (catches missing SPS/PPS, bad moov, non-keyframe start).
+            $dec = & ffmpeg -hide_banner -v error -xerror -i $out -f null - 2>&1
+            if ($LASTEXITCODE -ne 0 -or $dec) { $dec; throw "$c does not decode cleanly" }
+            $nf = [int](ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 $out)
+            "decoded frames=$nf"
+            if ($nf -lt (${{ matrix.fps }} * 3)) { throw "$c decoded only $nf frames" }
+            if (-not (Select-String -Path $log -Pattern 'encoder=Software' -Quiet)) { throw "unexpected encoder" }
+            if (-not (Select-String -Path $log -Pattern 'SetInputType\(NV12\): 0x00000000 ok' -Quiet)) { throw "software encoder did not go through the pass-through MFT writer" }
           }
       - name: ffmpeg hijack probe (a fake ffmpeg.exe in the working folder must not run)
         if: matrix.fps == 30
