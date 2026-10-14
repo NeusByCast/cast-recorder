@@ -642,7 +642,13 @@ UINT dpiFor(HWND h) {
 
 // --record <seconds> [--fps N] [--encoder auto|nvenc|amf|qsv|software] [--container mp4|mkv|mov] [--out file] [--allow-synthetic]
 int runCli(int argc, wchar_t** argv) {
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) { freopen("CONOUT$", "w", stdout); freopen("CONOUT$", "w", stderr); }
+    // Keep redirected stdout (CI) as is; otherwise print to the parent console if there is one.
+    HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
+    if ((so == nullptr || so == INVALID_HANDLE_VALUE) && AttachConsole(ATTACH_PARENT_PROCESS)) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+    }
+    std::wstring logPath;
     double secs = 5;
     RecordOptions o;
     Settings s;
@@ -658,6 +664,7 @@ int runCli(int argc, wchar_t** argv) {
         else if (a == L"--quality") fromString(next(), o.quality);
         else if (a == L"--out") o.outputPath = W(next());
         else if (a == L"--allow-synthetic") o.allowSynthetic = true;
+        else if (a == L"--log") logPath = W(next());
     }
     if (o.outputPath.empty()) {
         std::wstring d = s.outputDir.empty() ? defaultOutputDir() : W(s.outputDir);
@@ -671,9 +678,15 @@ int runCli(int argc, wchar_t** argv) {
     r.stop();
     r.join();
     const RecordResult& res = r.result();
-    printf("ok=%d frames=%llu duplicated=%llu late=%llu\ncapture=%s\nencoder=%s\nfile=%s\nmessage=%s\n", res.ok ? 1 : 0, res.frames,
-           res.duplicated, res.late, U(res.captureUsed).c_str(), U(res.encoderUsed).c_str(), U(res.file).c_str(), U(res.message).c_str());
+    char summary[4096];
+    snprintf(summary, sizeof summary, "ok=%d frames=%llu duplicated=%llu late=%llu\ncapture=%s\nencoder=%s\nfile=%s\nmessage=%s\n",
+             res.ok ? 1 : 0, res.frames, res.duplicated, res.late, U(res.captureUsed).c_str(), U(res.encoderUsed).c_str(),
+             U(res.file).c_str(), U(res.message).c_str());
+    fputs(summary, stdout);
     fflush(stdout);
+    if (!logPath.empty()) {
+        if (FILE* f = _wfopen(logPath.c_str(), L"wb")) { fputs(summary, f); fclose(f); }
+    }
     return res.ok ? 0 : 1;
 }
 

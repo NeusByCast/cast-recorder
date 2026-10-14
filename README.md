@@ -31,7 +31,7 @@ A lightweight Windows screen recorder built for gaming: GPU capture, hardware H.
 CastRecorder.exe --record 4 --fps 60 --encoder software --container mkv --quality high --out C:\tmp\test.mkv [--allow-synthetic]
 CastRecorder.exe --minimized      # start in the tray
 ```
-`--record` runs headless, prints the capture method, encoder, frame counts and file, and exits with 0 on success. `--allow-synthetic` falls back to a generated test pattern if screen capture is unavailable (CI only).
+`--record` runs headless, prints the capture method, encoder, frame counts and file, and exits with 0 on success. `--log file` also writes that summary to a file. `--allow-synthetic` falls back to a generated test pattern if screen capture is unavailable (CI only).
 
 ## Build
 
