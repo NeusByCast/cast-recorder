@@ -30,7 +30,7 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.0 /DBinDir=..\build\Release installer\CastRecorder.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.1 /DBinDir=..\build\Release installer\CastRecorder.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist
       - uses: actions/upload-artifact@v4
@@ -61,24 +61,66 @@ jobs:
           $bin = (Get-ChildItem "$env:RUNNER_TEMP\ff" -Recurse -Filter ffprobe.exe | Select-Object -First 1).DirectoryName
           Add-Content $env:GITHUB_PATH $bin
           & "$bin\ffprobe.exe" -version | Select-Object -First 1
+      - name: CLI argument validation
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $p = Start-Process $exe -ArgumentList "--help --log `"$env:RUNNER_TEMP\help.txt`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "--help exit $($p.ExitCode)" }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\help.txt" -Pattern 'Usage:' -Quiet)) { throw "--help printed no usage" }
+          $cases = @('--record 0', '--record -3', '--record abc', '--record 100000', '--record 2 --fps 25',
+                     '--record 2 --container avi', '--record 2 --encoder foo', '--record 2 --quality max',
+                     '--record 2 --bogus', '--record', '--fps 30', '--record 2 --out "Q:\nope\x.mp4"')
+          foreach ($c in $cases) {
+            $p = Start-Process $exe -ArgumentList "$c --log `"$env:RUNNER_TEMP\bad.txt`"" -Wait -PassThru
+            "$c -> exit $($p.ExitCode): $((Get-Content "$env:RUNNER_TEMP\bad.txt" -ErrorAction SilentlyContinue | Select-Object -First 1))"
+            if ($p.ExitCode -ne 2) { throw "expected exit 2 for '$c'" }
+          }
       - name: Record 4 s with the software encoder
         shell: pwsh
         run: |
           $exe = Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1
+          New-Item -ItemType Directory rec -Force | Out-Null
           foreach ($c in @('mp4','mkv')) {
-            $out = "$env:RUNNER_TEMP\smoke-${{ matrix.fps }}.$c"
+            $out = "$PWD\rec\smoke-${{ matrix.fps }}.$c"
+            $log = "$PWD\rec\smoke-${{ matrix.fps }}-$c.txt"
             # The runner has a desktop session but no GPU; --allow-synthetic falls back to a test pattern only if screen capture is unavailable.
-            $p = Start-Process $exe.FullName -ArgumentList "--record 4 --fps ${{ matrix.fps }} --encoder software --quality medium --container $c --allow-synthetic --out `"$out`" --log `"$env:RUNNER_TEMP\rec-$c.txt`"" -Wait -PassThru
-            if (Test-Path "$env:RUNNER_TEMP\rec-$c.txt") { Get-Content "$env:RUNNER_TEMP\rec-$c.txt" }
+            $p = Start-Process $exe.FullName -ArgumentList "--record 4 --fps ${{ matrix.fps }} --encoder software --quality medium --container $c --allow-synthetic --out `"$out`" --log `"$log`"" -Wait -PassThru
+            if (Test-Path $log) { Get-Content $log }
             if ($p.ExitCode -ne 0) { throw "recorder exit code $($p.ExitCode)" }
             if (-not (Test-Path $out)) { throw "$out was not created" }
-            $rate = (ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate,r_frame_rate,codec_name,nb_frames -of default=nw=1 $out)
-            $rate
-            $avg = ($rate | Select-String 'avg_frame_rate=(\d+)/(\d+)').Matches[0].Groups
+            if (Test-Path "$out.part.mp4") { throw "leftover $out.part.mp4" }
+            $info = (ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate,r_frame_rate,codec_name,nb_frames -of default=nw=1 $out)
+            $info
+            $avg = ($info | Select-String 'avg_frame_rate=(\d+)/(\d+)').Matches[0].Groups
             $fps = [double]$avg[1].Value / [double]$avg[2].Value
             $dur = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $out)
             "measured fps=$fps duration=$dur"
             if ([math]::Abs($fps - ${{ matrix.fps }}) -gt 0.5) { throw "expected ${{ matrix.fps }} fps, got $fps" }
-            if ($dur -lt 2.5) { throw "duration too short: $dur" }
-            if (-not ($rate -match 'codec_name=h264')) { throw "not H.264" }
+            if ([math]::Abs($dur - 4.0) -gt 0.5) { throw "expected ~4 s, got $dur" }
+            if (-not ($info -match 'codec_name=h264')) { throw "not H.264" }
           }
+      - name: ffmpeg hijack probe (a fake ffmpeg.exe in the working folder must not run)
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory evil -Force | Out-Null
+          # Fake ffmpeg: whoami.exe exits 0 but writes no file. If it were picked up, no .mkv would be produced and the
+          # recorder would fall back to MP4. The real ffmpeg on PATH must be used instead.
+          Copy-Item "$env:WINDIR\System32\whoami.exe" evil\ffmpeg.exe
+          Push-Location evil
+          $p = Start-Process $exe -ArgumentList "--record 2 --encoder software --container mkv --allow-synthetic --out `"$PWD\x.mkv`" --log `"$PWD\x.txt`"" -Wait -PassThru -WorkingDirectory $PWD
+          Get-Content x.txt
+          Pop-Location
+          if ($p.ExitCode -ne 0) { throw "recorder exit code $($p.ExitCode)" }
+          if (-not (Test-Path evil\x.mkv)) { throw "x.mkv missing: the fake ffmpeg.exe from the working folder was used" }
+          $fmt = ffprobe -v error -show_entries format=format_name -of csv=p=0 evil\x.mkv
+          "format=$fmt"
+          if ($fmt -notmatch 'matroska') { throw "not MKV: $fmt" }
+          Copy-Item evil\x.txt rec\hijack-probe.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-recordings-${{ matrix.fps }}fps
+          path: rec/
