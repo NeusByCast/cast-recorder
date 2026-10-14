@@ -85,15 +85,16 @@ jobs:
           New-Item -ItemType Directory rec -Force | Out-Null
           # Explicit start→stop via CLI (the --record timer calls stop() then waitUntilIdle).
           $p0 = Start-Process $exe.FullName -ArgumentList "--record 1 --fps ${{ matrix.fps }} --encoder software --allow-synthetic --out `"$PWD\rec\start-stop-${{ matrix.fps }}.mp4`" --log `"$PWD\rec\start-stop-${{ matrix.fps }}.txt`"" -Wait -PassThru
-          if (Test-Path "$PWD\rec\start-stop-${{ matrix.fps }}.txt") { Get-Content "$PWD\rec\start-stop-${{ matrix.fps }}.txt" }
-          if ($p0.ExitCode -ne 0) { throw "start-stop smoke exit $($p0.ExitCode)" }
+          $slog = "$PWD\rec\start-stop-${{ matrix.fps }}.txt"
+          if (Test-Path $slog) { Get-Content $slog } else { throw "start-stop log missing" }
+          if (-not (Select-String -Path $slog -Pattern '^ok=1' -Quiet)) { throw "start-stop smoke failed (log)" }
           foreach ($c in @('mp4','mkv')) {
             $out = "$PWD\rec\smoke-${{ matrix.fps }}.$c"
             $log = "$PWD\rec\smoke-${{ matrix.fps }}-$c.txt"
             # The runner has a desktop session but no GPU; --allow-synthetic falls back to a test pattern only if screen capture is unavailable.
             $p = Start-Process $exe.FullName -ArgumentList "--record 4 --fps ${{ matrix.fps }} --encoder software --quality medium --container $c --allow-synthetic --out `"$out`" --log `"$log`"" -Wait -PassThru
-            if (Test-Path $log) { Get-Content $log }
-            if ($p.ExitCode -ne 0) { throw "recorder exit code $($p.ExitCode)" }
+            if (Test-Path $log) { Get-Content $log } else { throw "log missing for $c" }
+            if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { throw "recorder failed for $c (log)" }
             if (-not (Test-Path $out)) { throw "$out was not created" }
             if (Test-Path "$out.part.mp4") { throw "leftover $out.part.mp4" }
             $info = (ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate,r_frame_rate,codec_name,nb_frames -of default=nw=1 $out)
@@ -119,7 +120,7 @@ jobs:
           $p = Start-Process $exe -ArgumentList "--record 2 --encoder software --container mkv --allow-synthetic --out `"$PWD\x.mkv`" --log `"$PWD\x.txt`"" -Wait -PassThru -WorkingDirectory $PWD
           Get-Content x.txt
           Pop-Location
-          if ($p.ExitCode -ne 0) { throw "recorder exit code $($p.ExitCode)" }
+          if (-not (Select-String -Path evil\x.txt -Pattern '^ok=1' -Quiet)) { throw "hijack cwd probe failed (log)" }
           if (-not (Test-Path evil\x.mkv)) { throw "x.mkv missing: the fake ffmpeg.exe from the working folder was used" }
           $fmt = ffprobe -v error -show_entries format=format_name -of csv=p=0 evil\x.mkv
           "format=$fmt"
@@ -137,7 +138,7 @@ jobs:
           $p = Start-Process $exe -ArgumentList "--record 2 --encoder software --container mkv --allow-synthetic --out `"$PWD\y.mkv`" --log `"$PWD\y.txt`"" -Wait -PassThru -WorkingDirectory $PWD
           Get-Content y.txt
           Pop-Location
-          if ($p.ExitCode -ne 0) { throw "recorder exit code $($p.ExitCode)" }
+          if (-not (Select-String -Path evil-path\y.txt -Pattern '^ok=1' -Quiet)) { throw "hijack PATH probe failed (log)" }
           if (-not (Test-Path evil-path\y.mkv)) { throw "y.mkv missing: a relative PATH entry (.;) was used for ffmpeg" }
           $fmt = ffprobe -v error -show_entries format=format_name -of csv=p=0 evil-path\y.mkv
           "format=$fmt"
