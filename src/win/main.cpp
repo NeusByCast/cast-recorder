@@ -481,7 +481,7 @@ Layout layout(RECT c) {
 void dropdown(HDC dc, RECT r, int id) {
     bool locked = ddLocked(id), open = g.openDrop == id, hov = g.hover == id && !locked;
     round(dc, r, hov || open ? C_INPUT_H : C_INPUT, open ? C_ACCENT : kbFocused(id) ? C_BORDER_STRONG : C_BORDER, 6);
-    RECT t{r.left + S(10), r.top, r.right - S(26), r.bottom};
+    RECT t{r.left + S(10), r.top, r.right - S(34), r.bottom};  // clear of the arrow at any DPI
     text(dc, ddItem(id, ddSel(id)), t, g.fBody, locked ? C_DISABLED : C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     chevron(dc, r.right - S(14), (r.top + r.bottom) / 2, locked ? C_DISABLED : C_TEXT2);
     addRegion(r, id);
@@ -967,6 +967,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             size_t k = r.file.find_last_of(L'\\');
             std::wstring msg2 = L"Saved " + (k == std::wstring::npos ? r.file : r.file.substr(k + 1)) + L"  \u00b7  " + r.encoderUsed;
             if (!r.message.empty()) msg2 += L"  \u00b7  " + r.message;
+            if (r.cpuFallback) msg2 += L"  \u00b7  GPU conversion failed, finished on CPU";
             if (r.dropped) msg2 += L"  \u00b7  " + std::to_wstring(r.dropped) + L" dropped";
             setStatus(msg2, C_OK);
         } else if (r.abandoned) setStatus(L"Encoder got stuck, file discarded. Restart Cast Recorder to record again.", C_WARN);
@@ -1297,6 +1298,11 @@ if (wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i
     g.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     trayUpdate(NIM_ADD);
     registerAll();
+    if (g.s.hotkeysMigrated) {  // one-time notice; saving writes v2 so it won't show again
+        g.s.hotkeysMigrated = false;
+        save();
+        setStatus(L"Hotkeys changed to Ctrl+Shift+F9 / Ctrl+Shift+F10 (Alt+F9/F10 clash with NVIDIA). You can change them below.", C_WARN);
+    }
     g.status = L"Settings save automatically \u00b7 closing keeps Cast Recorder in the tray";
     if (!minimized && !g.s.startMinimized) ShowWindow(g.hwnd, SW_SHOW);
 

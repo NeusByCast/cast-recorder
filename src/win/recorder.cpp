@@ -19,6 +19,7 @@
 #include <memory>
 #include <vector>
 #include "capture_wgc.h"
+#include "../core/nv12.h"
 // Last: instantiate the CODECAPI_* GUIDs in this TU only.
 #include <initguid.h>
 #include <codecapi.h>
@@ -565,11 +566,11 @@ void Recorder::run() {
                 for (UINT j = 0; pick->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; ++j) {
                     DXGI_OUTPUT_DESC od{}; o->GetDesc(&od);
                     if (od.Monitor == mon) { output = o; origin = {od.DesktopCoordinates.left, od.DesktopCoordinates.top}; break; }
-                    if (!output) { output = o; origin = {od.DesktopCoordinates.left, od.DesktopCoordinates.top}; }
                     o.Reset();
                 }
-                // Primary monitor isn't on this GPU: capture the GPU's first display so WGC and DXGI agree.
-                if (output) { DXGI_OUTPUT_DESC od{}; output->GetDesc(&od); mon = od.Monitor; }
+                // Primary monitor only: if this GPU doesn't drive it, drop its other displays and capture the
+                // primary monitor cross-adapter (WGC), so --gpu changes the encoder/device, never the content.
+                if (output) { DXGI_OUTPUT_DESC od{}; output->GetDesc(&od); if (od.Monitor != mon) output.Reset(); }
             }
         }
         if (!adapter) {
@@ -692,6 +693,15 @@ void Recorder::run() {
         ComPtr<ID3D11Texture2D> ring[RING];
         ComPtr<ID3D11Texture2D> staging;
         for (auto& t : ring) if (FAILED(dev->CreateTexture2D(&ed, nullptr, &t))) { r.message = L"CreateTexture2D(ring) failed"; return; }
+        // Zero-copy safety net: last good NV12 frame (separate texture, survives processor rebuilds) and a
+        // BGRA staging texture for the CPU fallback if the GPU video processor keeps failing.
+        ComPtr<ID3D11Texture2D> lastGood, cpuStaging;
+        bool haveGood = false, cpuFallback = false;
+        long long failSince = 0;
+        std::vector<uint8_t> nv12Cpu;
+        if (zeroCopy) {
+            if (FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return; }
+        }
         if (!wr.gpu) {
             D3D11_TEXTURE2D_DESC sd = ed; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) { r.message = L"CreateTexture2D(staging) failed"; return; }
@@ -751,17 +761,49 @@ void Recorder::run() {
             if (cursorByGdi) drawCursor(latest.Get(), origin);
             ID3D11Texture2D* t = ring[next % RING].Get();
             ComPtr<IMFMediaBuffer> buf;
-            if (zeroCopy) {
+            if (zeroCopy && !cpuFallback) {
                 // GPU BGRA->NV12 (+scale) into the ring surface; no CPU readback.
-                if (!conv.convert(latest.Get())) {
-                    // Keep recording: re-send the last good NV12 frame, and rebuild the video processor
-                    // every 30 failures (device hiccup, mode change). Never stop the session for this.
+                bool okConv = conv.convert(latest.Get());
+                LARGE_INTEGER nowc; QueryPerformanceCounter(&nowc);
+                if (okConv) {
+                    ctx->CopyResource(lastGood.Get(), conv.nv12.Get());
+                    haveGood = true;
+                    failSince = 0;
+                } else {
                     ++r.convertFailures;
+                    if (!failSince) failSince = nowc.QuadPart;
                     if (r.convertFailures % 30 == 0) { GpuConvert fresh; if (fresh.init(dev.Get(), src->w, src->h, W, H)) conv = std::move(fresh); }
+                    if (nowc.QuadPart - failSince > 2 * freq.QuadPart) {
+                        // ~2 s of continuous failure: switch to CPU readback + CPU NV12 (same sink-writer input type).
+                        D3D11_TEXTURE2D_DESC sd = td; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        if (SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &cpuStaging))) { cpuFallback = true; r.cpuFallback = true; nv12Cpu.resize((size_t)W * H * 3 / 2); }
+                        else { r.message = L"GPU color conversion failed and the CPU fallback is unavailable"; break; }
+                    }
                 }
-                ctx->CopyResource(t, conv.nv12.Get());
-                whr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), t, 0, FALSE, &buf);
-                if (SUCCEEDED(whr)) { ComPtr<IMF2DBuffer> b2; if (SUCCEEDED(buf.As(&b2))) { DWORD len = 0; b2->GetContiguousLength(&len); buf->SetCurrentLength(len); } }
+                if (!cpuFallback) {
+                    if (haveGood) {  // never send a frame before the first good conversion
+                    ctx->CopyResource(t, lastGood.Get());
+                    whr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), t, 0, FALSE, &buf);
+                    if (SUCCEEDED(whr)) { ComPtr<IMF2DBuffer> b2; if (SUCCEEDED(buf.As(&b2))) { DWORD len = 0; b2->GetContiguousLength(&len); buf->SetCurrentLength(len); } }
+                    }
+                }
+            }
+            if (zeroCopy && cpuFallback) {
+                ctx->CopyResource(cpuStaging.Get(), latest.Get());
+                D3D11_MAPPED_SUBRESOURCE m{};
+                whr = ctx->Map(cpuStaging.Get(), 0, D3D11_MAP_READ, 0, &m);
+                if (SUCCEEDED(whr)) {
+                    bgraToNv12((const uint8_t*)m.pData, src->w, src->h, m.RowPitch, nv12Cpu.data(), W, H);
+                    ctx->Unmap(cpuStaging.Get(), 0);
+                    whr = MFCreateMemoryBuffer((DWORD)nv12Cpu.size(), &buf);
+                    BYTE* bp = nullptr;
+                    if (SUCCEEDED(whr) && SUCCEEDED(whr = buf->Lock(&bp, nullptr, nullptr))) {
+                        memcpy(bp, nv12Cpu.data(), nv12Cpu.size());
+                        buf->Unlock();
+                        buf->SetCurrentLength((DWORD)nv12Cpu.size());
+                    }
+                }
+                if (FAILED(whr)) { r.message = hrMsg(L"CPU fallback", whr); break; }
             } else if (wr.gpu) {
                 ctx->CopySubresourceRegion(t, 0, 0, 0, 0, latest.Get(), 0, &box);
                 whr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), t, 0, FALSE, &buf);
@@ -782,9 +824,9 @@ void Recorder::run() {
                     ctx->Unmap(staging.Get(), 0);
                 }
             }
-            if (SUCCEEDED(whr)) whr = wr.write(buf.Get(), next * dur, dur);
+            if (SUCCEEDED(whr) && buf) whr = wr.write(buf.Get(), next * dur, dur);
             if (FAILED(whr)) { r.message = hrMsg(L"WriteSample", whr); break; }
-            ++r.frames;
+            if (buf) ++r.frames;
             ++next;
             bool got = false;
             if (!src->acquire(ctx.Get(), latest.Get(), 0, got)) { r.message = L"Capture failed"; break; }
@@ -795,8 +837,8 @@ void Recorder::run() {
 
         {   // diagnostics: effective path
             wchar_t b[512];
-            swprintf(b, 512, L"adapter=%ls; output=%ls; encoder=%ls; zero_copy=%ls; size=%ux%u@%d; dropped=%llu; duplicated=%llu; convert_failures=%llu",
-                     adapterName.c_str(), output ? L"local" : L"cross-adapter", r.encoderUsed.c_str(), zeroCopy ? L"yes" : L"no", W, H, opt_.fps,
+            swprintf(b, 512, L"adapter=%ls; output=%ls; encoder=%ls; zero_copy=%ls; cpu_fallback=%ls; size=%ux%u@%d; dropped=%llu; duplicated=%llu; convert_failures=%llu",
+                     adapterName.c_str(), output ? L"local" : L"cross-adapter", r.encoderUsed.c_str(), zeroCopy ? L"yes" : L"no", r.cpuFallback ? L"yes" : L"no", W, H, opt_.fps,
                      r.dropped, r.duplicated, r.convertFailures);
             r.pathLog = b;
         }

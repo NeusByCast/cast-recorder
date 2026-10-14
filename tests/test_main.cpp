@@ -112,8 +112,9 @@ static void testSettings() {
     CHECK(Settings{}.toggleRecord == P("Ctrl+Shift+F9"));
     CHECK(Settings{}.pauseToggle == P("Ctrl+Shift+F10"));
     { Settings m; CHECK(fromJson("{\"version\":1,\"hotkeyToggleRecord\":\"Alt+F9\",\"hotkeyPause\":\"Alt+F10\"}", m));
-      CHECK(m.toggleRecord == P("Ctrl+Shift+F9")); CHECK(m.pauseToggle == P("Ctrl+Shift+F10")); }
-    { Settings m; CHECK(fromJson("{\"version\":1,\"hotkeyToggleRecord\":\"Alt+V\"}", m)); CHECK(m.toggleRecord == P("Alt+V")); }
+      CHECK(m.toggleRecord == P("Ctrl+Shift+F9")); CHECK(m.pauseToggle == P("Ctrl+Shift+F10")); CHECK(m.hotkeysMigrated);
+      Settings again; CHECK(fromJson(toJson(m), again)); CHECK(!again.hotkeysMigrated); }
+    { Settings m; CHECK(fromJson("{\"version\":1,\"hotkeyToggleRecord\":\"Alt+V\"}", m)); CHECK(m.toggleRecord == P("Alt+V")); CHECK(!m.hotkeysMigrated); }
     { Settings m; CHECK(fromJson("{\"version\":2,\"hotkeyToggleRecord\":\"Alt+F9\"}", m)); CHECK(m.toggleRecord == P("Alt+F9")); }
     { Settings m; CHECK(fromJson(toJson(Settings{}), m)); CHECK(m.toggleRecord == Settings{}.toggleRecord); }
     // Bitrates

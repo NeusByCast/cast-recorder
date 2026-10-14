@@ -24,6 +24,9 @@ struct Settings {
     OutputScale scale = OutputScale::Native;
     int gpuIndex = -1;                 // -1 Auto; else adapter ordinal
     unsigned bitrateCap = 0;           // 0 = uncapped beyond quality
+    // Transient (never written): set by fromJson when v1 Alt+F9/Alt+F10 defaults were replaced. The UI shows
+    // a one-time notice and saves at v2, so it never fires again.
+    bool hotkeysMigrated = false;
 };
 
 const char* toString(Encoder e);

@@ -27,6 +27,7 @@ struct RecordOptions {
 struct RecordResult {
     bool ok = false;
     bool timedOut = false;           // Finalize or remux hit the hard timeout
+    bool cpuFallback = false;        // GPU color conversion failed; switched to CPU NV12
     bool abandoned = false;          // stuck Finalize/Close; MF poisoned for process lifetime
     std::wstring message;
     std::wstring file;

@@ -266,8 +266,8 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     auto ver = m.find("version");
     bool v1 = ver == m.end() || ver->second.t != Value::Num || ver->second.n < 2;
     if (v1) {
-        if (s.toggleRecord == Hotkey{MOD_ALT_, 0x78}) s.toggleRecord = Settings{}.toggleRecord;
-        if (s.pauseToggle == Hotkey{MOD_ALT_, 0x79}) s.pauseToggle = Settings{}.pauseToggle;
+        if (s.toggleRecord == Hotkey{MOD_ALT_, 0x78}) { s.toggleRecord = Settings{}.toggleRecord; s.hotkeysMigrated = true; }
+        if (s.pauseToggle == Hotkey{MOD_ALT_, 0x79}) { s.pauseToggle = Settings{}.pauseToggle; s.hotkeysMigrated = true; }
     }
     // Two actions can't share one combo: keep Start/stop and clear the duplicate.
     if (!s.openFolder.empty() && s.openFolder == s.toggleRecord) s.openFolder = Hotkey{};
