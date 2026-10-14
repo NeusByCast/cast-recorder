@@ -30,7 +30,9 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=1.0.1 /DBinDir=..\build\Release installer\CastRecorder.iss
+          $v = (Select-String -Path src\win\version.h -Pattern 'CR_VERSION_STR\s+"([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$v /DBinDir=..\build\Release installer\CastRecorder.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist
       - uses: actions/upload-artifact@v4
@@ -119,6 +121,24 @@ jobs:
           "format=$fmt"
           if ($fmt -notmatch 'matroska') { throw "not MKV: $fmt" }
           Copy-Item evil\x.txt rec\hijack-probe.txt
+      - name: ffmpeg hijack probe (PATH starts with ".;" — relative entries must be ignored)
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory evil-path -Force | Out-Null
+          Copy-Item "$env:WINDIR\System32\whoami.exe" evil-path\ffmpeg.exe
+          Push-Location evil-path
+          $env:Path = ".;" + $env:Path
+          $p = Start-Process $exe -ArgumentList "--record 2 --encoder software --container mkv --allow-synthetic --out `"$PWD\y.mkv`" --log `"$PWD\y.txt`"" -Wait -PassThru -WorkingDirectory $PWD
+          Get-Content y.txt
+          Pop-Location
+          if ($p.ExitCode -ne 0) { throw "recorder exit code $($p.ExitCode)" }
+          if (-not (Test-Path evil-path\y.mkv)) { throw "y.mkv missing: a relative PATH entry (.;) was used for ffmpeg" }
+          $fmt = ffprobe -v error -show_entries format=format_name -of csv=p=0 evil-path\y.mkv
+          "format=$fmt"
+          if ($fmt -notmatch 'matroska') { throw "not MKV: $fmt" }
+          Copy-Item evil-path\y.txt rec\hijack-path-probe.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
