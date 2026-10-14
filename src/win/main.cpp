@@ -306,41 +306,23 @@ std::wstring settingsDiff(const Settings& a, const Settings& b) {
     }
     return d.empty() ? L"(no change)" : d;
 }
-// Leftover "<name>.part.<mp4|mkv|mov>" copies from a remux / conversion that was killed. Only runs while we hold the
-// single-instance mutex, so nothing can still be writing them; the source recordings are never touched.
-std::wstring outputDir();
+// Startup: move journaled leftovers of a killed remux / conversion to the Recycle Bin. Only files this app created
+// (listed in %APPDATA%\\Cast Recorder\\temp-files.journal, named *.castrec-tmp*) - never user files.
 void sweepPartFiles() {
-    std::wstring dir = outputDir();
-    int n = 0;
-    for (const wchar_t* ext : {L"mp4", L"mkv", L"mov"}) {
-        WIN32_FIND_DATAW fd{};
-        HANDLE f = FindFirstFileW((dir + L"\\*.part." + ext).c_str(), &fd);
-        if (f == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            if (DeleteFileW((dir + L"\\" + fd.cFileName).c_str())) ++n;
-        } while (FindNextFileW(f, &fd));
-        FindClose(f);
-    }
-    if (n) cr::appLog(L"startup: removed " + std::to_wstring(n) + L" leftover .part file(s) from " + dir);
+    std::wstring log;
+    int n = sweepTempJournal(log);
+    if (n) cr::appLog(log + L"startup: recycled " + std::to_wstring(n) + L" leftover temp file(s)");
 }
 std::wstring redactTitle(const std::wstring& t);
-// "sourceTitle": "<private window title>" -> "sourceTitle": title#hash (n chars)
-std::wstring redactSettingsDiff(const std::wstring& d) {
-    const std::wstring key = L"\"sourceTitle\": \"";
-    size_t k = d.find(key);
-    if (k == std::wstring::npos) return d;
-    size_t a = k + key.size(), e = d.find(L"; ", a);
-    if (e == std::wstring::npos) e = d.size();
-    size_t q = e; while (q > a && d[q - 1] != L'"') --q;
-    std::wstring v = q > a ? d.substr(a, q - 1 - a) : std::wstring();
-    return d.substr(0, k) + L"\"sourceTitle\": " + redactTitle(v) + d.substr(e);
-}
 void save() {
     if (g.hwnd) g.s.maximized = IsZoomed(g.hwnd) != 0;
     if (saveFile(U(g.settingsFile), g.s)) {
-        std::wstring d = settingsDiff(g_lastSaved, g.s);
-        if (d != L"(no change)") cr::appLog(L"settings saved: " + redactSettingsDiff(d));
+        // Redact the title in the Settings copies before anything is formatted: no splitting of logged text.
+        Settings a = g_lastSaved, b = g.s;
+        a.sourceTitle = U(redactTitle(W(a.sourceTitle))); b.sourceTitle = U(redactTitle(W(b.sourceTitle)));
+        if (a.sourceTitle == b.sourceTitle && g_lastSaved.sourceTitle != g.s.sourceTitle) b.sourceTitle += " (changed)";
+        std::wstring d = settingsDiff(a, b);
+        if (d != L"(no change)") cr::appLog(L"settings saved: " + d);
         g_lastSaved = g.s;
         return;
     }
@@ -896,11 +878,8 @@ const DisplayInfo* displayFor(HMONITOR m) {
 std::wstring g_srcTitle;  // window title for the field
 // Window titles can hold private text (document names, chats, URLs): the log gets a stable hash instead, the
 // settings file keeps the real title so the window can still be found again.
-std::wstring redactTitle(const std::wstring& t) {
-    uint32_t hsh = 2166136261u;
-    for (wchar_t c : t) { hsh ^= (uint32_t)c; hsh *= 16777619u; }
-    wchar_t b[48]; swprintf(b, 48, L"title#%08x (%u chars)", hsh, (unsigned)t.size());
-    return b;
+std::wstring redactTitle(const std::wstring& t) {  // length only: no content, no hash (a hash of a short title is guessable)
+    return L"(" + std::to_wstring(t.size()) + L" chars)";
 }
 HICON g_srcIcon = nullptr;
 std::wstring sourceText() {
@@ -1492,13 +1471,13 @@ void saveReplay() {
     std::wstring path = stampName(L"replay_", L".mp4", dir);
     g.replaySaving = true; g.replaySaveT = nowMs(); kickAnim();
     auto ring = g.ring; HWND h = g.hwnd;
-    std::thread([ring, path, h] {
+    std::thread([ring, path, h] { cr::guardedRun(L"ui-worker", [&] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         auto* r = new ReplaySaved{false, path, L"", 0};
         r->ok = ring->save(path, r->secs, r->err);
         if (!PostMessageW(h, WM_APP_REPLAY_SAVED, 0, (LPARAM)r)) delete r;
         if (SUCCEEDED(co)) CoUninitialize();
-    }).detach();
+    }); }).detach();
 }
 struct ShotSaved { bool ok; std::wstring path, err; int w, h; };
 std::atomic<int> g_shotsBusy{0};
@@ -1512,14 +1491,14 @@ void takeScreenshot() {
     bool all = g.target.kind == CaptureTarget::AllDisplays;
     HWND h = g.hwnd;
     ++g_shotsBusy;
-    std::thread([=] {
+    std::thread([=] { cr::guardedRun(L"ui-worker", [&] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         auto* r = new ShotSaved{false, path, L"", 0, 0};
         r->ok = saveScreenshot(win, mon, all, path, jpg, r->err, &r->w, &r->h);
         if (!PostMessageW(h, WM_APP_SHOT_SAVED, 0, (LPARAM)r)) delete r;
         --g_shotsBusy;
         if (SUCCEEDED(co)) CoUninitialize();
-    }).detach();
+    }); }).detach();
 }
 // ---------- inline text field (rename a recording / custom replay length) ----------
 struct EditState { int kind = 0; HWND hwnd = nullptr; RF rect; std::wstring path; WNDPROC orig = nullptr; HBRUSH br = nullptr; } g_edit;
@@ -1571,6 +1550,8 @@ void commitEdit(bool ok) {
         for (wchar_t c : t) if (c < 0x20) badc = true;
         std::wstring nu = old.substr(0, sl + 1) + t + old.substr(dot);
         if (badc) setStatus(L"A file name can't contain < > : \" / \\ | ? *", toRef(T_ERR));
+        else if ([&] { std::wstring l = t; for (auto& c : l) c = (wchar_t)towlower(c); return (l.size() >= 5 && l.compare(l.size() - 5, 5, L".part") == 0) || isAppTempName(l); }())
+            setStatus(L"Names ending in .part or containing .castrec-tmp are reserved for temporary files", toRef(T_ERR));
         else if (isReservedName(U(t))) setStatus(L"\u201c" + t + L"\u201d is reserved by Windows (CON, PRN, AUX, NUL, COM1\u20139, LPT1\u20139)", toRef(T_ERR));
         else if (old.size() - sl - 1 > 0 && nu.size() >= MAX_PATH) setStatus(L"That name is too long", toRef(T_ERR));
         else if (nu != old && !MoveFileW(old.c_str(), nu.c_str()))
@@ -1610,7 +1591,7 @@ void scanRecordings() {
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             std::wstring n = fd.cFileName, ln = lowerW(n);
-            if (ln.find(L".part.") != std::wstring::npos || ln.find(L"castrec-") == 0 || ln.find(L".tmp.") != std::wstring::npos) continue;
+            if (isAppTempName(ln) || ln.find(L"castrec-") == 0 || ln.find(L".tmp.") != std::wstring::npos) continue;
             if (!live.empty() && lowerW(dir + L"\\" + n) == live) continue;
             RecItem it;
             it.path = dir + L"\\" + n; it.ext = lowerExt(n);
@@ -1640,7 +1621,7 @@ void scanRecordings() {
 void metaWorker() {
     if (g_renderOnly || g_metaBusy.exchange(true)) return;
     HWND h = g.hwnd;
-    std::thread([h] {
+    std::thread([h] { cr::guardedRun(L"ui-worker", [&] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         for (;;) {
             std::wstring path;
@@ -1686,7 +1667,7 @@ void metaWorker() {
         }
         g_metaBusy = false;
         if (SUCCEEDED(co)) CoUninitialize();
-    }).detach();
+    }); }).detach();
 }
 // Folder watcher: FindFirstChangeNotification on the output folder, debounced refresh on the UI thread.
 HANDLE g_watchStop = nullptr; std::thread g_watchTh; std::wstring g_watchDir;
@@ -1700,7 +1681,7 @@ void startWatcher() {
     SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
     g_watchStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HANDLE stop = g_watchStop; HWND h = g.hwnd;
-    g_watchTh = std::thread([dir, stop, h] {
+    g_watchTh = std::thread([dir, stop, h] { cr::guardedRun(L"ui-worker", [&] {
         HANDLE ch = FindFirstChangeNotificationW(dir.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
         if (ch == INVALID_HANDLE_VALUE) return;
         HANDLE hs[2] = {stop, ch};
@@ -1709,7 +1690,7 @@ void startWatcher() {
             if (!FindNextChangeNotification(ch)) break;
         }
         FindCloseChangeNotification(ch);
-    });
+    }); });
 }
 // Background file jobs, one at a time, in order: manual / auto remux MKV -> MP4 (Media Foundation by default) and
 // post-processing of a just-saved recording (MKV conversion, track names). None of these can delete a saved file:
@@ -1730,7 +1711,7 @@ void remuxPumpLocked() {  // call with g_remuxM held
     if (g_remuxRun || g_remuxQueue.empty()) return;
     g_remuxRun = true;
     HWND h = g.hwnd;
-    std::thread([h] {
+    std::thread([h] { cr::guardedRun(L"ui-worker", [&] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         for (;;) {
             FileJob job;
@@ -1746,21 +1727,20 @@ void remuxPumpLocked() {  // call with g_remuxM held
             auto* r = new RemuxDone{false, job.in, L"", L"", job.post};
             if (job.post) {
                 const std::wstring& dst = job.pj.mkvPath.empty() ? job.pj.file : job.pj.mkvPath;
-                size_t dot = dst.find_last_of(L'.');
-                { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = dst.substr(0, dot) + L".part" + dst.substr(dot); }
+                { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = dst; }
                 std::wstring fin, plog;
                 r->ok = postProcessRecording(job.pj, fin, plog);
                 r->out = fin; r->err = plog;
                 cr::appLog(L"post-process " + job.pj.file + L": " + plog);
             } else {
                 r->out = remuxTarget(job.in);
-                { size_t dt = r->out.find_last_of(L'.'); std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = r->out.substr(0, dt) + L".part" + r->out.substr(dt); }
+                { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = r->out; }
                 r->ok = remuxFile(job.in, r->out, r->err, L"", 0);
             }
             if (!PostMessageW(h, WM_APP_REMUX_DONE, 0, (LPARAM)r)) delete r;
         }
         if (SUCCEEDED(co)) CoUninitialize();
-    }).detach();
+    }); }).detach();
 }
 bool remuxBusy() { std::lock_guard<std::mutex> l(g_remuxM); return g_remuxRun; }
 void queueRemux(const std::vector<std::wstring>& files) {
@@ -1786,7 +1766,7 @@ float remuxProgress(const std::wstring& path) {
     std::lock_guard<std::mutex> l(g_remuxM);
     if (path == g_remuxCur) {
         WIN32_FILE_ATTRIBUTE_DATA fa{};
-        unsigned long long o = GetFileAttributesExW(g_remuxOut.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
+        unsigned long long o = GetFileAttributesExW(activeTempFor(g_remuxOut).c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
         return g_remuxInSize ? std::min(0.99f, (float)o / (float)g_remuxInSize) : 0.f;
     }
     for (auto& q : g_remuxQueue) if (q.in == path) return -1;
@@ -2825,7 +2805,7 @@ void restartMeter() {
     if (g_meterTh.joinable()) g_meterTh.join();
     bool sys = g.s.systemAudio, mic = g.s.micEnabled;
     std::wstring mid = W(g.s.micDevice), sid = W(g.s.systemDevice);
-    g_meterTh = std::thread([sys, mic, mid, sid] {
+    g_meterTh = std::thread([sys, mic, mid, sid] { cr::guardedRun(L"ui-worker", [&] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         std::unique_ptr<AudioMixer> old;
         { std::lock_guard<std::mutex> l(g_meterM); old = std::move(g_meterMixer); }
@@ -2835,7 +2815,7 @@ void restartMeter() {
         if (sys || mic) m->start(sys, mic, mid, false, log, sid, false, true);
         { std::lock_guard<std::mutex> l(g_meterM); g_meterMixer = std::move(m); }
         if (SUCCEEDED(co)) CoUninitialize();
-    });
+    }); });
 }
 void stopMeter() {
     if (g_meterTh.joinable()) g_meterTh.join();
@@ -2846,7 +2826,7 @@ std::atomic<bool> g_pttQuit{false};
 std::thread g_pttTh;
 void syncPtt() { g_pttMods = g.s.pttKey.mods; g_pttVk = g.s.pttKey.vk; applyAudioFx(); }
 void startPttThread() {
-    g_pttTh = std::thread([] {  // held-key polling: works while other apps have focus, no hook needed
+    g_pttTh = std::thread([] { cr::guardedRun(L"ui-worker", [&] {  // held-key polling: works while other apps have focus, no hook needed
         while (!g_pttQuit.load()) {
             bool down = false;
             unsigned vk = g_pttVk.load(), mods = g_pttMods.load();
@@ -2861,7 +2841,7 @@ void startPttThread() {
             audioFx().pttDown = down;
             Sleep(10);
         }
-    });
+    }); });
 }
 
 // ---------- actions ----------

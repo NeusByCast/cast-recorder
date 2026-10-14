@@ -1,4 +1,5 @@
 #pragma once
+#include <exception>
 #include <windows.h>
 #include <atomic>
 #include <string>
@@ -93,7 +94,19 @@ struct PostJob {
 // Runs a PostJob (blocking; call off the UI thread). finalFile = the file to show afterwards (the MP4 if anything failed).
 bool postProcessRecording(const PostJob& j, std::wstring& finalFile, std::wstring& log);
 void setTestSlowPostMs(DWORD ms);  // test hook: post-processing takes this long first (simulates a ~5 GB copy)
-void prewarmCaptureAsync();  // cold-start mitigation: load the WGC runtime off the UI thread
+void prewarmCaptureAsync();
+bool isAppTempName(const std::wstring& fileName);         // "*.castrec-tmp*.*"
+std::wstring makeTempFor(const std::wstring& out);        // fresh journaled temp next to `out`
+void releaseTemp(const std::wstring& tmp);
+std::wstring activeTempFor(const std::wstring& out);      // temp currently being written for `out` (progress)
+int sweepTempJournal(std::wstring& log);                  // startup: recycle journaled leftovers of a killed run
+void logThreadException(const wchar_t* name, const char* what);
+// Runs f, logging and swallowing any exception (worker threads must never terminate the process).
+template <class F> void guardedRun(const wchar_t* name, F&& f) {
+    try { f(); }
+    catch (const std::exception& e) { logThreadException(name, e.what()); }
+    catch (...) { logThreadException(name, "unknown exception"); }
+}  // cold-start mitigation: load the WGC runtime off the UI thread
 void setTestLatePublishMs(DWORD ms);  // test hook: the worker publishes this late so abort() wins the claim
 int testLatePublishLost();           // how many workers lost the publish claim
 

@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "recorder.h"
 #include "micfx.h"
 #include <audioclient.h>
 #include <mmdeviceapi.h>
@@ -311,6 +312,9 @@ struct AudioSource {
         if (buf.size() > maxS) { size_t d = buf.size() - maxS; buf.erase(buf.begin(), buf.begin() + d); bufStart += d / 2; }
     }
     void loop() {
+        cr::guardedRun(L"audio-capture", [&] { loopImpl(); });
+    }
+    void loopImpl() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         std::vector<float> conv;
         while (!quit) {

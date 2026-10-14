@@ -26,6 +26,7 @@
 #include "hwenc.h"
 #include "audio.h"
 #include "applog.h"
+#include <shellapi.h>
 #include "windows_enum.h"
 #include <future>
 #include <map>
@@ -552,6 +553,84 @@ void setTestHangFinalizeMs(DWORD ms) { g_testHangFinalizeMs = ms; }
 std::atomic<DWORD> g_testSlowPostMs{0};
 void setTestSlowPostMs(DWORD ms) { g_testSlowPostMs = ms; }
 std::atomic<DWORD> g_testLatePublishMs{0};
+// ---- temp-file journal: only files this app created as "<name>.castrec-tmp<n>.<ext>" are ever swept ----
+namespace {
+std::mutex g_jm;
+std::vector<std::pair<std::wstring, std::wstring>> g_jActive;  // (final out, temp path)
+std::wstring journalPath() { return appDataDir() + L"\\temp-files.journal"; }
+std::vector<std::wstring> journalRead() {
+    std::vector<std::wstring> v;
+    FILE* f = _wfopen(journalPath().c_str(), L"rt, ccs=UTF-8");
+    if (!f) return v;
+    wchar_t line[4096];
+    while (fgetws(line, 4096, f)) { std::wstring s = line; while (!s.empty() && (s.back() == L'\n' || s.back() == L'\r')) s.pop_back(); if (!s.empty()) v.push_back(s); }
+    fclose(f);
+    return v;
+}
+void journalWriteLocked() {
+    std::vector<std::wstring> keep = journalRead();  // entries of earlier runs stay until the startup sweep
+    for (auto& a : g_jActive) if (std::find(keep.begin(), keep.end(), a.second) == keep.end()) keep.push_back(a.second);
+    // drop entries that no longer exist on disk (finished temps were renamed / removed)
+    std::vector<std::wstring> out;
+    for (auto& k : keep) if (GetFileAttributesW(k.c_str()) != INVALID_FILE_ATTRIBUTES || std::any_of(g_jActive.begin(), g_jActive.end(), [&](auto& a) { return a.second == k; })) out.push_back(k);
+    if (out.empty()) { DeleteFileW(journalPath().c_str()); return; }
+    FILE* f = _wfopen(journalPath().c_str(), L"wt, ccs=UTF-8");
+    if (!f) return;
+    for (auto& k : out) fwprintf(f, L"%ls\n", k.c_str());
+    fclose(f);
+}
+}  // namespace
+bool isAppTempName(const std::wstring& name) {
+    std::wstring l = name; for (auto& c : l) c = (wchar_t)towlower(c);
+    return l.find(L".castrec-tmp") != std::wstring::npos;
+}
+std::wstring makeTempFor(const std::wstring& out) {
+    size_t dot = out.find_last_of(L'.'), sl = out.find_last_of(L"\\/");
+    if (dot == std::wstring::npos || (sl != std::wstring::npos && dot < sl)) dot = out.size();
+    std::wstring t;
+    for (int k = 1; k < 1000; ++k) {  // never reuse (or delete) a file that is already there
+        t = out.substr(0, dot) + L".castrec-tmp" + (k > 1 ? std::to_wstring(k) : std::wstring()) + out.substr(dot);
+        if (GetFileAttributesW(t.c_str()) == INVALID_FILE_ATTRIBUTES) break;
+    }
+    std::lock_guard<std::mutex> g(g_jm);
+    g_jActive.push_back({out, t});
+    journalWriteLocked();
+    return t;
+}
+void releaseTemp(const std::wstring& tmp) {
+    std::lock_guard<std::mutex> g(g_jm);
+    g_jActive.erase(std::remove_if(g_jActive.begin(), g_jActive.end(), [&](auto& a) { return a.second == tmp; }), g_jActive.end());
+    journalWriteLocked();
+}
+std::wstring activeTempFor(const std::wstring& out) {
+    std::lock_guard<std::mutex> g(g_jm);
+    for (auto& a : g_jActive) if (a.first == out) return a.second;
+    return {};
+}
+static bool recycle(const std::wstring& p) {
+    std::wstring dbl = p; dbl.push_back(L'\0');
+    SHFILEOPSTRUCTW op{}; op.wFunc = FO_DELETE; op.pFrom = dbl.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted && GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES;
+}
+int sweepTempJournal(std::wstring& log) {
+    std::lock_guard<std::mutex> g(g_jm);
+    int n = 0;
+    for (auto& p : journalRead()) {
+        size_t sl = p.find_last_of(L"\\/");
+        if (!isAppTempName(sl == std::wstring::npos ? p : p.substr(sl + 1))) continue;  // only our own temp names
+        if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        if (recycle(p)) { ++n; log += L"startup: moved leftover temp file to the Recycle Bin: " + p + L"\n"; }
+    }
+    DeleteFileW(journalPath().c_str());
+    if (!g_jActive.empty()) journalWriteLocked();
+    return n;
+}
+
+void logThreadException(const wchar_t* name, const char* what) {
+    std::wstring w; for (const char* p = what; *p; ++p) w += (wchar_t)(unsigned char)*p;
+    appLog(std::wstring(L"thread ") + name + L": caught exception (" + w + L") - continuing without it");
+}
 void prewarmCaptureAsync() {
 #ifdef CR_HAVE_WGC
     WgcCapture::prewarmAsync();
@@ -1495,7 +1574,12 @@ void Recorder::run() {
         r.ok = r.frames > 0 && !r.timedOut && r.message.empty();
     }(); } catch (const std::bad_alloc&) {  // out of memory: stop cleanly, keep what reached the disk
         r.ok = false; r.message = L"Out of memory - recording stopped (the file keeps what was written)";
+        if (!sessionTmp_.empty() && fileSizeOf(sessionTmp_) > 0) r.file = sessionTmp_;  // toast + Open still work
         r.encoderLog += L"worker: std::bad_alloc caught\n";
+    } catch (const std::exception& e) {  // anything else: same graceful stop
+        r.ok = false; r.message = L"Recording stopped after an internal error (the file keeps what was written)";
+        if (!sessionTmp_.empty() && fileSizeOf(sessionTmp_) > 0) r.file = sessionTmp_;
+        logThreadException(L"recorder", e.what());
     }
 
     // Skip MF/COM teardown if anything was abandoned (a detached Finalize/Close may still be inside MF).
@@ -1639,18 +1723,18 @@ bool mfCopy(const std::wstring& in, const std::wstring& out, std::wstring& err) 
 
 static bool remuxFileDirect(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
                             const std::vector<std::wstring>& trackNames);
-// Writes to "<name>.part<ext>" and renames over `out` only when complete: a crash/kill never leaves a half file at `out`.
+// Writes to a fresh "<name>.castrec-tmp.<ext>" (journaled) and renames to `out` only when complete. Never replaces
+// or deletes a file that was already there: an existing `out` is an error.
 bool remuxFile(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
                const std::vector<std::wstring>& trackNames) {
-    size_t dot = out.find_last_of(L'.'), sl = out.find_last_of(L"\\/");
-    if (dot == std::wstring::npos || (sl != std::wstring::npos && dot < sl)) dot = out.size();
-    const std::wstring part = out.substr(0, dot) + L".part" + out.substr(dot);
-    DeleteFileW(part.c_str());
+    if (GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES) { err = L"output already exists"; return false; }
+    const std::wstring part = makeTempFor(out);
     bool ok = remuxFileDirect(in, part, err, engine, timeoutMs, trackNames) && fileSizeOf(part) > 0;
-    if (ok && !MoveFileExW(part.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (ok && !MoveFileExW(part.c_str(), out.c_str(), MOVEFILE_WRITE_THROUGH)) {
         err = L"rename failed (" + std::to_wstring(GetLastError()) + L")"; ok = false;
     }
-    if (!ok) DeleteFileW(part.c_str());
+    if (!ok) DeleteFileW(part.c_str());  // our own fresh temp only
+    releaseTemp(part);
     return ok;
 }
 static bool remuxFileDirect(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
@@ -1699,9 +1783,9 @@ bool postProcessRecording(const PostJob& j, std::wstring& finalFile, std::wstrin
     // Disk-bound stream copy: 60 s + 1 s per 20 MB. On timeout only the partial copy is removed.
     const DWORD budget = (DWORD)std::min<unsigned long long>(60000ull + sz / (20ull << 20) * 1000ull, 3600000ull);
     const bool mkv = !j.mkvPath.empty();
-    size_t dot = mkv ? j.mkvPath.find_last_of(L'.') : j.file.find_last_of(L'.');
     const std::wstring& dstp = mkv ? j.mkvPath : j.file;
-    std::wstring part = dstp.substr(0, dot) + L".part" + dstp.substr(dot);
+    if (mkv && GetFileAttributesW(dstp.c_str()) != INVALID_FILE_ATTRIBUTES) { log += L"post: " + dstp + L" already exists - kept the MP4\n"; return false; }
+    std::wstring part = makeTempFor(dstp);
     std::wstring err;
     bool ok = ffmpegCopy(ff, j.file, part, budget, j.trackNames, err) && fileSizeOf(part) > 0;
     if (ok) {
@@ -1711,7 +1795,9 @@ bool postProcessRecording(const PostJob& j, std::wstring& finalFile, std::wstrin
         if (ok) finalFile = dst;
         else err = L"rename failed (" + std::to_wstring(GetLastError()) + L")";
     }
-    if (!ok) { DeleteFileW(part.c_str()); log += L"post: " + std::wstring(mkv ? L"MKV conversion" : L"track naming") + L" failed (" + err + L") - kept " + j.file + L"\n"; }
+    if (!ok) DeleteFileW(part.c_str());
+    releaseTemp(part);
+    if (!ok) { log += L"post: " + std::wstring(mkv ? L"MKV conversion" : L"track naming") + L" failed (" + err + L") - kept " + j.file + L"\n"; }
     else log += std::wstring(L"post: ") + (mkv ? L"converted to MKV" : L"audio tracks named (mix / system / mic)") + L"\n";
     return ok;
 }
