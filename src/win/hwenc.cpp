@@ -153,6 +153,31 @@ bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT 
     logHr(log, L"MFT_MESSAGE_SET_D3D_MANAGER", hr);
     if (FAILED(hr)) return false;
 
+    return configure(w, h, fps, bitrate, high, log);
+}
+
+bool HwEncoder::openSoftware(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log) {
+    MFT_REGISTER_TYPE_INFO inInfo{MFMediaType_Video, MFVideoFormat_NV12}, outInfo{MFMediaType_Video, MFVideoFormat_H264};
+    IMFActivate** acts = nullptr; UINT32 n = 0;
+    HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, &inInfo, &outInfo, &acts, &n);
+    logHr(log, L"MFTEnumEx(software H.264)", hr);
+    if (FAILED(hr) || !n) { if (acts) CoTaskMemFree(acts); return false; }
+    act_ = acts[0];
+    for (UINT32 i = 0; i < n; ++i) acts[i]->Release();
+    CoTaskMemFree(acts);
+    label = str(act_.Get(), kMFT_FRIENDLY_NAME);
+    hr = act_->ActivateObject(IID_PPV_ARGS(&mft_));
+    logHr(log, L"ActivateObject(software)", hr);
+    if (FAILED(hr)) return false;
+    sync_ = true;
+    hr = mft_->GetStreamIDs(1, &inId_, 1, &outId_);
+    if (FAILED(hr)) { inId_ = 0; outId_ = 0; }
+    return configure(w, h, fps, bitrate, high, log);
+}
+
+bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log) {
+    HRESULT hr = S_OK;
+    w_ = w; h_ = h; fps_ = fps; br_ = bitrate;
     // Rate control / latency before types (some drivers lock these at SetOutputType).
     ComPtr<ICodecAPI> codec;
     if (SUCCEEDED(mft_->QueryInterface(kIID_ICodecAPI, (void**)codec.GetAddressOf())) && codec) {
@@ -181,6 +206,7 @@ bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT 
         logHr(log, L"SetOutputType(H264 Main)", hr);
     }
     if (FAILED(hr)) return false;
+    outType_->GetUINT32(MF_MT_MPEG2_PROFILE, &profile_);
 
     // Input: pick the MFT's own NV12 type (keeps its private attributes) and set our size/rate.
     ComPtr<IMFMediaType> inT;
@@ -240,14 +266,82 @@ HRESULT HwEncoder::processOutput(const OutputFn& out) {
         if (ob.pSample && !mine) ob.pSample->Release();
         return S_OK;
     }
-    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { if (ob.pSample && !mine) ob.pSample->Release(); return S_OK; }
+    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { if (ob.pSample && !mine) ob.pSample->Release(); return sync_ ? hr : S_OK; }
     if (FAILED(hr)) { if (ob.pSample && !mine) ob.pSample->Release(); return hr; }
     HRESULT ohr = S_OK;
-    if (ob.pSample) { ++outputs; ohr = out(ob.pSample); if (!mine) ob.pSample->Release(); }
+    if (ob.pSample) { ohr = deliver(ob.pSample, out); if (!mine) ob.pSample->Release(); }
     return ohr;
 }
 
+namespace {
+// Annex-B NAL walk: calls f(type, ptr-to-start-code, total length incl. start code).
+template <class F> void forNals(const BYTE* p, DWORD n, F f) {
+    DWORD i = 0;
+    auto sc = [&](DWORD k) -> DWORD { if (k + 3 <= n && p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 1) return 3;
+                                      if (k + 4 <= n && p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 0 && p[k + 3] == 1) return 4; return 0; };
+    while (i < n && !sc(i)) ++i;
+    while (i < n) {
+        DWORD l = sc(i), j = i + l;
+        while (j < n && !sc(j)) ++j;
+        if (i + l < n) f(p[i + l] & 0x1f, p + i, j - i);
+        i = j;
+    }
+}
+}  // namespace
+
+HRESULT HwEncoder::deliver(IMFSample* s, const OutputFn& out) {
+    ComPtr<IMFMediaBuffer> b;
+    if (FAILED(s->ConvertToContiguousBuffer(&b))) return S_OK;
+    BYTE* p = nullptr; DWORD len = 0;
+    if (FAILED(b->Lock(&p, nullptr, &len))) return S_OK;
+    bool idr = false; std::vector<BYTE> sps, pps;
+    forNals(p, len, [&](int t, const BYTE* q, DWORD l) {
+        if (t == 5) idr = true;
+        else if (t == 7 && sps.empty()) sps.assign(q, q + l);
+        else if (t == 8 && pps.empty()) pps.assign(q, q + l);
+    });
+    b->Unlock();
+    if (seqHeader_.empty() && !sps.empty() && !pps.empty()) { seqHeader_ = sps; seqHeader_.insert(seqHeader_.end(), pps.begin(), pps.end()); }
+    UINT32 clean = 0;
+    if (FAILED(s->GetUINT32(MFSampleExtension_CleanPoint, &clean))) clean = 0;
+    if (idr && !clean) { s->SetUINT32(MFSampleExtension_CleanPoint, TRUE); clean = 1; }
+    if (!gotKey_) {
+        if (!clean) return S_OK;  // the MP4/MKV must start on a keyframe
+        gotKey_ = true;
+    }
+    const LONGLONG dur = 10000000LL / fps_;
+    LONGLONG t = 0, d = 0;
+    if (FAILED(s->GetSampleTime(&t))) { t = nextTime_; s->SetSampleTime(t); }
+    if (FAILED(s->GetSampleDuration(&d)) || d <= 0) s->SetSampleDuration(dur);
+    nextTime_ = t + dur;
+    ++outputs;
+    return out(s);
+}
+
+ComPtr<IMFMediaType> HwEncoder::muxType() {
+    // Clean H.264 type for the pass-through writer, always carrying SPS/PPS (MF_MT_MPEG_SEQUENCE_HEADER).
+    ComPtr<IMFMediaType> cur = currentOutputType(), t;
+    MFCreateMediaType(&t);
+    t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    t->SetUINT32(MF_MT_AVG_BITRATE, br_);
+    t->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    t->SetUINT32(MF_MT_MPEG2_PROFILE, profile_);
+    MFSetAttributeSize(t.Get(), MF_MT_FRAME_SIZE, w_, h_);
+    MFSetAttributeRatio(t.Get(), MF_MT_FRAME_RATE, (UINT32)fps_, 1);
+    MFSetAttributeRatio(t.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    UINT32 sz = 0;
+    std::vector<BYTE> hdr;
+    if (cur && SUCCEEDED(cur->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &sz)) && sz) { hdr.resize(sz); cur->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), sz, nullptr); }
+    if (hdr.empty()) hdr = seqHeader_;
+    if (!hdr.empty()) t->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), (UINT32)hdr.size());
+    return t;
+}
+
 HRESULT HwEncoder::pump(const OutputFn& out) {
+    if (sync_) {
+        for (;;) { HRESULT hr = processOutput(out); if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return S_OK; if (FAILED(hr)) return hr; }
+    }
     for (;;) {
         ComPtr<IMFMediaEvent> e;
         HRESULT hr = ev_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &e);
@@ -263,6 +357,13 @@ HRESULT HwEncoder::pump(const OutputFn& out) {
 }
 
 HRESULT HwEncoder::encode(IMFSample* s, const OutputFn& out) {
+    if (sync_) {
+        HRESULT hr = mft_->ProcessInput(inId_, s, 0);
+        if (hr == MF_E_NOTACCEPTING) { hr = pump(out); if (SUCCEEDED(hr)) hr = mft_->ProcessInput(inId_, s, 0); }
+        if (FAILED(hr)) return hr;
+        ++inputs;
+        return pump(out);
+    }
     HRESULT hr = pump(out);
     if (FAILED(hr)) return hr;
     if (needInput_ <= 0) { ++backpressureDrops; return S_FALSE; }
@@ -278,6 +379,7 @@ bool HwEncoder::drain(const OutputFn& out, DWORD timeoutMs) {
     if (!mft_) return true;
     mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     if (FAILED(mft_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0))) return false;
+    if (sync_) return SUCCEEDED(pump(out));
     ULONGLONG end = GetTickCount64() + timeoutMs;
     while (!drained_ && GetTickCount64() < end) {
         if (FAILED(pump(out))) return false;

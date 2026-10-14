@@ -29,6 +29,8 @@ public:
     // Creates and configures the MFT. Order: D3D manager -> output type -> input type -> codec api -> streaming.
     bool open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h, int fps, unsigned bitrate, bool high,
               std::wstring& log);
+    // Microsoft software H.264 MFT (synchronous), same driver + same pass-through MP4 writer as hardware.
+    bool openSoftware(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log);
     // Non-blocking: pumps events, submits the sample if the MFT wants input. Returns S_FALSE if the frame was
     // dropped because the encoder hasn't asked for input (counts as backpressure, never blocks).
     HRESULT encode(IMFSample* s, const OutputFn& out);
@@ -39,12 +41,20 @@ public:
     IMFMediaType* outputType() { return outType_.Get(); }
     // Output type as the MFT currently reports it (may carry MF_MT_MPEG_SEQUENCE_HEADER after the first frame).
     Microsoft::WRL::ComPtr<IMFMediaType> currentOutputType();
+    Microsoft::WRL::ComPtr<IMFMediaType> muxType();
     void release();  // shut down normally
     void leak();     // abandon a stalled MFT without touching it again
     std::wstring label;
     unsigned long long inputs = 0, outputs = 0, backpressureDrops = 0;
 private:
+    bool configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log);
     HRESULT processOutput(const OutputFn& out);
+    HRESULT deliver(IMFSample* s, const OutputFn& out);
+    bool sync_ = false;
+    bool gotKey_ = false;
+    std::vector<BYTE> seqHeader_;
+    UINT w_ = 0, h_ = 0; int fps_ = 30; unsigned br_ = 0; UINT32 profile_ = 77;
+    LONGLONG nextTime_ = 0;
     Microsoft::WRL::ComPtr<IMFTransform> mft_;
     Microsoft::WRL::ComPtr<IMFMediaEventGenerator> ev_;
     Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> mgr_;

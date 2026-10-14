@@ -691,15 +691,19 @@ void Recorder::run() {
                 }
             } else if (!encs.empty()) elog += L"GPU NV12 conversion unavailable: hardware path skipped\n";
         }
+        bool swNv12 = false;  // software MFT fed CPU NV12, muxed by the same pass-through writer as hardware
         if (!opened) {
             conv = GpuConvert{};
-            opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
+            auto enc = std::make_unique<HwEncoder>();
+            unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
+            if (enc->openSoftware(W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) { hw = std::move(enc); swNv12 = true; opened = true; }
+            else { enc->release(); opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err); }
             r.encoderUsed = L"Software (Media Foundation H.264)";
             if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
         }
         if (!opened) { wr = Writer{}; DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
         const bool scaling = W != (src->w & ~1u) || H != (src->h & ~1u);
-        if (!zeroCopy && scaling) {  // CPU / RGB path can't scale: encode native instead
+        if (!zeroCopy && !swNv12 && scaling) {  // CPU / RGB path can't scale: encode native instead
             wr = Writer{}; DeleteFileW(tmp.c_str());
             W = src->w & ~1u; H = src->h & ~1u;
             opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
@@ -710,7 +714,7 @@ void Recorder::run() {
         HRESULT muxHr = S_OK;
         auto muxOut = [&](IMFSample* es) -> HRESULT {
             if (!wr.sw) {
-                ComPtr<IMFMediaType> ot = hw->currentOutputType();
+                ComPtr<IMFMediaType> ot = hw->muxType();
                 std::wstring e2;
                 if (!wr.openPassthrough(tmp, ot.Get(), e2)) { wr = Writer{}; muxHr = E_FAIL; err = e2; return E_FAIL; }
             }
@@ -742,10 +746,15 @@ void Recorder::run() {
         bool haveGood = false, cpuFallback = false;
         long long failSince = 0;
         std::vector<uint8_t> nv12Cpu;
+        if (swNv12) {
+            D3D11_TEXTURE2D_DESC sd = td; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(dev->CreateTexture2D(&sd, nullptr, &cpuStaging))) { r.message = L"CreateTexture2D(cpuStaging) failed"; return; }
+            nv12Cpu.resize((size_t)W * H * 3 / 2);
+        }
         if (zeroCopy) {
             if (FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return; }
         }
-        if (!zeroCopy) {
+        if (!zeroCopy && !swNv12) {
             D3D11_TEXTURE2D_DESC sd = ed; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) { r.message = L"CreateTexture2D(staging) failed"; return; }
         }
@@ -831,7 +840,7 @@ void Recorder::run() {
                     }
                 }
             }
-            if (zeroCopy && cpuFallback) {
+            if ((zeroCopy && cpuFallback) || swNv12) {
                 ctx->CopyResource(cpuStaging.Get(), latest.Get());
                 D3D11_MAPPED_SUBRESOURCE m{};
                 whr = ctx->Map(cpuStaging.Get(), 0, D3D11_MAP_READ, 0, &m);
