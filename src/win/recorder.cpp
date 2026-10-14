@@ -22,6 +22,10 @@
 #include "capture_wgc.h"
 #include "hwenc.h"
 #include "audio.h"
+#include "applog.h"
+#include <future>
+#include <map>
+#include <mutex>
 #include <deque>
 #include <timeapi.h>
 #include "../core/nv12.h"
@@ -529,6 +533,18 @@ std::wstring describeHardwareEncoders() {
     return s;
 }
 
+// Process-wide encoder probe cache: (adapter LUID, encoder ordinal, input format) -> worked?
+// Filled by the startup warm-up so pressing Record never waits on probes (3 AMD MFTs x ~1.5-2.5 s each).
+static std::mutex g_probeM;
+static std::map<std::wstring, bool> g_probe;
+static std::wstring probeKey(ID3D11Device* dev, const HwEncoderInfo& e) {
+    ComPtr<IDXGIDevice> d; ComPtr<IDXGIAdapter> a; DXGI_ADAPTER_DESC ad{};
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d))) && SUCCEEDED(d->GetAdapter(&a))) a->GetDesc(&ad);
+    wchar_t b[128];
+    swprintf(b, 128, L"%08lX:%08lX/%d/%ls/%d", (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart, e.index, e.vendor.c_str(), e.argb ? 1 : 0);
+    return b;
+}
+
 static AbandonLatch& processLatch() { static AbandonLatch* l = new AbandonLatch; return *l; }  // never destroyed
 
 Recorder::Recorder() : abandon_(processLatch()) {
@@ -597,7 +613,7 @@ void Recorder::abort() {
         fsm_.toIdle();
         started_ = true;
         if (doneEvent_) SetEvent(doneEvent_);
-        if (opt_.notify) PostMessageW(opt_.notify, WM_APP_RECORDER_DONE, 0, 0);
+        if (opt_.notify) PostMessageW(opt_.notify, opt_.warmupOnly ? WM_APP_WARMUP_DONE : WM_APP_RECORDER_DONE, 0, 0);
     });
 }
 
@@ -663,6 +679,16 @@ void Recorder::run() {
     RecordResult r;
     bool abandonedMf = false;
     std::wstring err;
+    LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+    long long lastMark = opt_.pressQpc;
+    if (!lastMark) { LARGE_INTEGER q; QueryPerformanceCounter(&q); lastMark = q.QuadPart; }
+    const long long pressQ = lastMark;
+    auto mark = [&](const wchar_t* stage) {
+        LARGE_INTEGER q; QueryPerformanceCounter(&q);
+        wchar_t b[96]; swprintf(b, 96, L"%ls=%.0fms ", stage, (double)(q.QuadPart - lastMark) * 1000.0 / qf.QuadPart);
+        r.latencyLog += b; lastMark = q.QuadPart;
+    };
+    mark(L"thread_start");
 
     [&] {
         // ---- device on the adapter that owns the primary monitor (or an explicit gpuIndex) ----
@@ -724,6 +750,7 @@ void Recorder::run() {
         if (FAILED(hr))
             hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
         if (FAILED(hr)) { r.message = hrMsg(L"D3D11CreateDevice", hr); return; }
+        mark(L"device");
         ComPtr<ID3D10Multithread> mt;
         if (SUCCEEDED(dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
         UINT adapterVendor = 0;
@@ -731,6 +758,19 @@ void Recorder::run() {
             ComPtr<IDXGIDevice> dxgiDev; ComPtr<IDXGIAdapter> ad;
             if (SUCCEEDED(dev.As(&dxgiDev)) && SUCCEEDED(dxgiDev->GetAdapter(&ad))) { DXGI_ADAPTER_DESC d{}; ad->GetDesc(&d); adapterVendor = d.VendorId; }
         }
+
+        // Audio devices open in parallel with capture/encoder setup (WASAPI init is 50-150 ms per device).
+        // The start tone is muted out of system audio: it plays when the first frame arrives (t0), so 350 ms
+        // after t0 covers its 160 ms + output latency. Nothing waits on the tone.
+        AudioMixer mixer;
+        std::wstring alog;
+        mixer.systemMuteUntil = 3500000;
+        auto audioReady = std::async(std::launch::async, [&] {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (!opt_.warmupOnly) mixer.start(opt_.systemAudio, opt_.mic, opt_.micId, opt_.testTone, alog);
+            CoUninitialize();
+        });
+        struct AudioJoin { std::future<void>& f; ~AudioJoin() { if (f.valid()) f.wait(); } } audioJoin{audioReady};
 
         // ---- capture source: WGC -> Desktop Duplication -> synthetic (tests only) ----
         std::unique_ptr<Source> src;
@@ -753,19 +793,16 @@ void Recorder::run() {
         }
         if (!src) { r.message = L"Screen capture unavailable: " + (capErr.empty() ? std::wstring(L"no output") : capErr); return; }
         r.captureUsed = src->name();
+        mark(L"capture_init");
         UINT W = 0, H = 0;  // encoded size (even; optionally downscaled)
         scaledSize(opt_.scale, src->w, src->h, W, H);
 
         // ---- audio (system loopback + mic), mixed on the video media clock ----
-        AudioMixer mixer;
-        {
-            std::wstring alog;
-            mixer.start(opt_.systemAudio, opt_.mic, opt_.micId, opt_.testTone, alog);
-            mixer.systemMuteUntil = 3500000;  // 350 ms: the start tone (160 ms) + device latency
-            r.encoderLog += alog;
-        }
+        audioReady.wait();
+        r.encoderLog += alog;
+        mark(L"audio_wait");
         Writer wr;
-        wr.wantAudio = mixer.active();
+        wr.wantAudio = mixer.active() || opt_.warmupOnly;
         r.hasAudio = wr.wantAudio;
         std::deque<std::pair<long long, std::vector<short>>> audioPending;  // until the lazy writer opens
         HRESULT audioHr = S_OK;
@@ -809,7 +846,17 @@ void Recorder::run() {
             if (!encs.empty()) {
                 for (auto& e : encs) {
                     elog += L"probe " + e.name + L"\n";
-                    if (!probeHwEncoder(dev.Get(), e, W, H, opt_.fps, 2500, elog)) { r.encoderFallbacks.push_back(e.name); continue; }
+                    const std::wstring key = probeKey(dev.Get(), e);
+                    int cached = -1;
+                    { std::lock_guard<std::mutex> g(g_probeM); auto it = g_probe.find(key); if (it != g_probe.end()) cached = it->second ? 1 : 0; }
+                    if (cached == 0) { elog += L"probe " + e.name + L": cached FAIL, skipped\n"; r.encoderFallbacks.push_back(e.name); continue; }
+                    if (cached == 1) elog += L"probe " + e.name + L": cached OK\n";
+                    else {
+                        bool okp = probeHwEncoder(dev.Get(), e, W, H, opt_.fps, 2500, elog);
+                        { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp; }
+                        mark(L"probe");
+                        if (!okp) { r.encoderFallbacks.push_back(e.name); continue; }
+                    }
                     auto enc = std::make_unique<HwEncoder>();
                     unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
                     if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) {
@@ -859,6 +906,7 @@ void Recorder::run() {
         LONGLONG lastOutTick = 0;
         unsigned long long lastOutCount = 0;
 
+        mark(L"encoder");
         // ---- textures ----
         D3D11_TEXTURE2D_DESC td{};
         td.Width = src->w; td.Height = src->h; td.MipLevels = 1; td.ArraySize = 1;
@@ -910,6 +958,9 @@ void Recorder::run() {
             }
         }
 
+        mark(L"writer_prewarm");
+        if (opt_.warmupOnly) { r.message = L"warm-up done"; { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); return; }
+
         // ---- paced loop: high-res waitable timer, duplicate last frame when nothing new ----
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
@@ -927,6 +978,9 @@ void Recorder::run() {
         QueryPerformanceCounter(&t0);
         startQpc_ = t0.QuadPart;
         started_ = true;
+        mark(L"first_frame");
+        r.startMs = (double)(t0.QuadPart - pressQ) * 1000.0 / qf.QuadPart;
+        if (opt_.notify) if (!opt_.warmupOnly) PostMessageW(opt_.notify, WM_APP_RECORDER_STARTED, 0, 0);
         HRESULT whr = S_OK;
         long long pauseBegin = 0;  // worker's own clock: QPC when it first observed Paused
         while (!stop_ && haveFrame && r.message.empty()) {
@@ -1092,6 +1146,8 @@ void Recorder::run() {
             swprintf(b, 512, L"; capture_fps=%.1f; encode_fps=%.1f; convert_ms=%.2f; encode_ms=%.2f; audio=%ls; audio_underrun_frames=%llu",
                      r.captureFps, r.encodeFps, r.convertMsAvg, r.encodeMsAvg, r.hasAudio ? L"aac" : L"none", mixer.underrunFrames);
             r.pathLog += b;
+            swprintf(b, 512, L"; start_ms=%.0f; latency=[%ls]", r.startMs, r.latencyLog.c_str());
+            r.pathLog += b;
         }
 
         // ---- capture teardown with budget; on timeout the helper owns the Source (leak > UAF) ----
@@ -1198,7 +1254,7 @@ void Recorder::run() {
         fsm_.toIdle();
         started_ = true;
         if (doneEvent_) SetEvent(doneEvent_);
-        if (opt_.notify) PostMessageW(opt_.notify, WM_APP_RECORDER_DONE, 0, 0);
+        if (opt_.notify) PostMessageW(opt_.notify, opt_.warmupOnly ? WM_APP_WARMUP_DONE : WM_APP_RECORDER_DONE, 0, 0);
     });
     // abort() already published for this session: our output is stale, remove any file we produced.
     if (!won && !r.file.empty()) DeleteFileW(r.file.c_str());

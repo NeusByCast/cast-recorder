@@ -27,6 +27,8 @@ struct RecordOptions {
     bool mic = false;
     std::wstring micId;              // empty = default microphone
     bool testTone = false;           // CI: synthetic 440 Hz audio source
+    bool warmupOnly = false;         // run setup (device, capture, probes, writer/AAC load) and exit before recording
+    long long pressQpc = 0;          // QPC when the user asked to record (latency breakdown)
     HWND notify = nullptr;           // WM_APP_RECORDER_DONE when the recording thread exits
     DWORD finalizeTimeoutMs = 8000;  // hard cap on Finalize (and separately on remux)
 };
@@ -43,6 +45,8 @@ struct RecordResult {
     std::wstring encoderLog;         // per-step HRESULTs: enumeration, probe, MFT setup, drain
     std::vector<std::wstring> encoderFallbacks;  // hardware encoders that failed the probe / setup
     bool encoderStalled = false;
+    std::wstring latencyLog;         // press -> first frame breakdown
+    double startMs = 0;              // press -> first captured frame
     std::wstring pathLog;            // adapter / encoder / zero-copy / drops for diagnostics
     bool hasAudio = false;
     double captureFps = 0, encodeFps = 0, convertMsAvg = 0, encodeMsAvg = 0;
@@ -50,6 +54,8 @@ struct RecordResult {
 };
 
 constexpr UINT WM_APP_RECORDER_DONE = WM_APP + 40;
+constexpr UINT WM_APP_RECORDER_STARTED = WM_APP + 42;  // first frame captured: play the start tone now
+constexpr UINT WM_APP_WARMUP_DONE = WM_APP + 43;
 
 class Recorder {
 public:

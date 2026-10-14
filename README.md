@@ -18,3 +18,10 @@ iscc /DAppVersion=<ver> /DBinDir=..\build\Release installer\CastRecorder.iss
 ```
 
 Version lives in `src/win/version.h`. Known limits: primary monitor only, no audio.
+
+## Diagnostics
+
+Everything (settings load/save, startup encoder warm-up/probe cache, every recording's encoder/path/audio
+stats, the press-to-first-frame latency breakdown, crashes) goes to one file:
+`%APPDATA%\Cast Recorder\CastRecorder.log` — click **Log** in the title bar to open it (the path is also copied).
+The file is trimmed to the newest ~1 MB once it passes 2 MB.

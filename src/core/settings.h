@@ -25,6 +25,7 @@ struct Settings {
     bool micEnabled = false;
     std::string micDevice;             // UTF-8 endpoint id; empty = default microphone
     bool startMinimized = false;
+    bool maximized = false;          // window state, restored at launch
     OutputScale scale = OutputScale::Native;
     int gpuIndex = -1;                 // -1 Auto; else adapter ordinal
     unsigned bitrateCap = 0;           // 0 = uncapped beyond quality
