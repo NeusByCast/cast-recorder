@@ -153,6 +153,22 @@ Issue validate(const Hotkey& hk) {
         if (r.mods == m && r.vk == hk.vk) return {Severity::Error, r.why};
     const bool typing = (hk.vk >= 'A' && hk.vk <= 'Z') || (hk.vk >= '0' && hk.vk <= '9') || hk.vk == 0x20 ||
                         hk.vk == 0x0D || hk.vk == 0x08 || hk.vk == 0x09 || (hk.vk >= 0xBA && hk.vk <= 0xDE);
+    // Overlay/recorder defaults of GPU vendor apps: they usually win the combo while a game runs.
+    static const R overlay[] = {
+        {MOD_ALT_, 0x78, "Alt+F9 is NVIDIA ShadowPlay's record toggle"},
+        {MOD_ALT_, 0x79, "Alt+F10 is NVIDIA's instant replay save"},
+        {MOD_ALT_, 'Z', "Alt+Z opens the NVIDIA overlay"},
+        {MOD_ALT_, 0x70, "Alt+F1 is NVIDIA's screenshot key"},
+        {MOD_ALT_, 'R', "Alt+R toggles NVIDIA's performance overlay"},
+        {MOD_ALT_ | MOD_SHIFT_, 0x7B, "Alt+Shift+F12 is NVIDIA's stats overlay"},
+        {MOD_CTRL_ | MOD_SHIFT_, 'E', "Ctrl+Shift+E starts AMD Adrenalin recording"},
+        {MOD_CTRL_ | MOD_SHIFT_, 'R', "Ctrl+Shift+R is AMD's instant replay"},
+        {MOD_CTRL_ | MOD_SHIFT_, 'S', "Ctrl+Shift+S saves an AMD instant replay"},
+        {MOD_CTRL_ | MOD_SHIFT_, 'I', "Ctrl+Shift+I takes an AMD screenshot"},
+        {MOD_CTRL_ | MOD_SHIFT_, 'O', "Ctrl+Shift+O toggles AMD's metrics overlay"},
+    };
+    for (const R& r : overlay)
+        if (r.why && r.mods == m && r.vk == hk.vk) return {Severity::Warning, std::string(r.why) + " - it may not reach Cast Recorder"};
     if (typing && (m == 0 || m == MOD_SHIFT_))
         return {Severity::Warning, "This key is used for typing and will be blocked everywhere"};
     if (m == 0 && hk.vk != 0x2C && !(hk.vk >= 0x70 && hk.vk <= 0x87) && !(hk.vk >= 0xAD && hk.vk <= 0xB3))

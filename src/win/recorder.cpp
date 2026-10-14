@@ -421,7 +421,9 @@ std::wstring describeHardwareEncoders() {
     return s;
 }
 
-Recorder::Recorder() {
+static AbandonLatch& processLatch() { static AbandonLatch* l = new AbandonLatch; return *l; }  // never destroyed
+
+Recorder::Recorder() : abandon_(processLatch()) {
     doneEvent_ = CreateEventW(nullptr, TRUE, TRUE, nullptr);  // starts signaled (Idle)
 }
 Recorder::~Recorder() {
@@ -499,10 +501,18 @@ bool Recorder::pause() {
 }
 
 bool Recorder::resume() {
+    if (!fsm_.isPaused()) return false;
     long long ps = pausedQpc_.load();
-    if (!fsm_.resume()) return false;
     LARGE_INTEGER q; QueryPerformanceCounter(&q);
-    if (ps) pausedTotal_ += q.QuadPart - ps;
+    // UI clock only: count pause time after the recording clock started (not warm-up), and publish it
+    // before the state flips so elapsedSeconds() never sees Recording with a stale total.
+    long long from = ps;
+    if (!started_ || startQpc_.load() == 0) from = q.QuadPart;      // whole pause was during warm-up
+    else if (from < startQpc_.load()) from = startQpc_.load();
+    long long add = ps ? q.QuadPart - from : 0;
+    if (add < 0) add = 0;
+    pausedTotal_ += add;
+    if (!fsm_.resume()) { pausedTotal_ -= add; return false; }
     pausedQpc_ = 0;
     return true;
 }
@@ -517,7 +527,9 @@ double Recorder::elapsedSeconds() const {
     QueryPerformanceCounter(&q);
     QueryPerformanceFrequency(&f);
     long long end = isPaused() && pausedQpc_.load() ? pausedQpc_.load() : q.QuadPart;
-    return double(end - startQpc_ - pausedTotal_) / double(f.QuadPart);
+    if (end < startQpc_.load()) end = startQpc_.load();  // paused during warm-up
+    double v = double(end - startQpc_ - pausedTotal_) / double(f.QuadPart);
+    return v > 0 ? v : 0;
 }
 
 void Recorder::run() {
@@ -556,6 +568,8 @@ void Recorder::run() {
                     if (!output) { output = o; origin = {od.DesktopCoordinates.left, od.DesktopCoordinates.top}; }
                     o.Reset();
                 }
+                // Primary monitor isn't on this GPU: capture the GPU's first display so WGC and DXGI agree.
+                if (output) { DXGI_OUTPUT_DESC od{}; output->GetDesc(&od); mon = od.Monitor; }
             }
         }
         if (!adapter) {
@@ -573,6 +587,10 @@ void Recorder::run() {
                 }
                 if (!output) adapter.Reset();
             }
+        }
+        if (!output) {  // selected GPU drives no display (e.g. laptop dGPU): WGC copies across adapters
+            MONITORINFO mi{sizeof mi};
+            if (GetMonitorInfoW(mon, &mi)) origin = {mi.rcMonitor.left, mi.rcMonitor.top};
         }
         if (adapterName.empty() && adapter) { DXGI_ADAPTER_DESC1 ad{}; adapter->GetDesc1(&ad); adapterName = ad.Description; }
         ComPtr<ID3D11Device> dev;
@@ -698,17 +716,20 @@ void Recorder::run() {
         startQpc_ = t0.QuadPart;
         started_ = true;
         HRESULT whr = S_OK;
-        long long pauseApplied = 0;  // pausedTotal_ already folded into t0
+        long long pauseBegin = 0;  // worker's own clock: QPC when it first observed Paused
         while (!stop_ && haveFrame && r.message.empty()) {
             if (fsm_.isPaused()) {
                 // Keep capture warm (drain frames) but write nothing; the media clock does not advance.
+                if (!pauseBegin) { LARGE_INTEGER pb; QueryPerformanceCounter(&pb); pauseBegin = pb.QuadPart; }
                 bool got = false;
                 if (!src->acquire(ctx.Get(), latest.Get(), 20, got)) { r.message = L"Capture failed"; break; }
                 continue;
             }
-            {   // fold any completed pause into the pacing origin so timestamps stay continuous
-                long long pt = pausedTotal_.load();
-                if (pt != pauseApplied) { t0.QuadPart += pt - pauseApplied; pauseApplied = pt; }
+            if (pauseBegin) {  // shift the pacing origin by exactly the pause the worker saw: no "missed" frames
+                LARGE_INTEGER pe; QueryPerformanceCounter(&pe);
+                t0.QuadPart += pe.QuadPart - pauseBegin;
+                pauseBegin = 0;
+                ++r.pauses;
             }
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
@@ -732,7 +753,12 @@ void Recorder::run() {
             ComPtr<IMFMediaBuffer> buf;
             if (zeroCopy) {
                 // GPU BGRA->NV12 (+scale) into the ring surface; no CPU readback.
-                if (!conv.convert(latest.Get())) { r.message = L"VideoProcessorBlt failed"; break; }
+                if (!conv.convert(latest.Get())) {
+                    // Keep recording: re-send the last good NV12 frame, and rebuild the video processor
+                    // every 30 failures (device hiccup, mode change). Never stop the session for this.
+                    ++r.convertFailures;
+                    if (r.convertFailures % 30 == 0) { GpuConvert fresh; if (fresh.init(dev.Get(), src->w, src->h, W, H)) conv = std::move(fresh); }
+                }
                 ctx->CopyResource(t, conv.nv12.Get());
                 whr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), t, 0, FALSE, &buf);
                 if (SUCCEEDED(whr)) { ComPtr<IMF2DBuffer> b2; if (SUCCEEDED(buf.As(&b2))) { DWORD len = 0; b2->GetContiguousLength(&len); buf->SetCurrentLength(len); } }
@@ -769,9 +795,9 @@ void Recorder::run() {
 
         {   // diagnostics: effective path
             wchar_t b[512];
-            swprintf(b, 512, L"adapter=%ls; encoder=%ls; zero_copy=%ls; size=%ux%u@%d; dropped=%llu; duplicated=%llu",
-                     adapterName.c_str(), r.encoderUsed.c_str(), zeroCopy ? L"yes" : L"no", W, H, opt_.fps,
-                     r.dropped, r.duplicated);
+            swprintf(b, 512, L"adapter=%ls; output=%ls; encoder=%ls; zero_copy=%ls; size=%ux%u@%d; dropped=%llu; duplicated=%llu; convert_failures=%llu",
+                     adapterName.c_str(), output ? L"local" : L"cross-adapter", r.encoderUsed.c_str(), zeroCopy ? L"yes" : L"no", W, H, opt_.fps,
+                     r.dropped, r.duplicated, r.convertFailures);
             r.pathLog = b;
         }
 

@@ -33,7 +33,7 @@ struct RecordResult {
     std::wstring encoderUsed;
     std::wstring captureUsed;
     std::wstring pathLog;            // adapter / encoder / zero-copy / drops for diagnostics
-    unsigned long long frames = 0, duplicated = 0, late = 0, dropped = 0;
+    unsigned long long frames = 0, duplicated = 0, late = 0, dropped = 0, pauses = 0, convertFailures = 0;
 };
 
 constexpr UINT WM_APP_RECORDER_DONE = WM_APP + 40;
@@ -71,7 +71,7 @@ private:
     std::thread th_;
     RecFsm fsm_;
     FinishClaim claim_;
-    AbandonLatch abandon_;
+    AbandonLatch& abandon_;        // process-wide: MF is per-process, so one poisoned session poisons all
     std::atomic<bool> stop_{false}, started_{false};
     std::atomic<int> workers_{0};  // live run() count (incl. detached)
     std::atomic<long long> startQpc_{0};

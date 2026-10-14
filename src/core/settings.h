@@ -16,9 +16,9 @@ struct Settings {
     Encoder encoder = Encoder::Auto;
     Container container = Container::MP4;
     std::string outputDir;              // UTF-8; empty = default (Videos\Cast Recorder)
-    Hotkey toggleRecord{MOD_ALT_, 0x78};              // Alt+F9
+    Hotkey toggleRecord{MOD_CTRL_ | MOD_SHIFT_, 0x78};  // Ctrl+Shift+F9 (Alt+F9 is NVIDIA ShadowPlay)
     Hotkey openFolder{MOD_ALT_ | MOD_SHIFT_, 0x78};   // Alt+Shift+F9 (no UI field; still registered)
-    Hotkey pauseToggle{MOD_ALT_, 0x79};               // Alt+F10
+    Hotkey pauseToggle{MOD_CTRL_ | MOD_SHIFT_, 0x79};  // Ctrl+Shift+F10
     bool captureCursor = true;
     bool startMinimized = false;
     OutputScale scale = OutputScale::Native;

@@ -89,6 +89,8 @@ constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3;
 constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2;
 constexpr int BASE_W = 760, BASE_H = 560, MIN_W = 640, MIN_H = 480;
+// UI watchdog > worst-case teardown: capture Close 2 s + Finalize (8000/2) + remux (8000/2) + 3 s margin.
+constexpr ULONGLONG kWatchdogMs = 2000 + 8000 / 2 + 8000 / 2 + 3000;
 constexpr int TB_H = 40, PAD = 16, GAP = 16, PANEL_W = 280, HK_H = 72, BAR_H = 56;
 
 struct App {
@@ -202,6 +204,7 @@ void trayUpdate(DWORD msg) {
 // ---------- hotkeys ----------
 void unregisterAll() { UnregisterHotKey(g.hwnd, HK_TOGGLE); UnregisterHotKey(g.hwnd, HK_FOLDER); UnregisterHotKey(g.hwnd, HK_PAUSE); }
 void registerAll() {
+    if (g.rec.running()) return;  // the live session keeps its hotkeys; never unregister mid-recording
     unregisterAll();
     Hotkey* keys[2] = {&g.s.toggleRecord, &g.s.pauseToggle};
     const int ids[2] = {HK_TOGGLE, HK_PAUSE};
@@ -440,6 +443,22 @@ void ddSet(int id, int i) {
 }
 bool ddLocked(int id) { return g.rec.running() && id != H_NONE; }  // settings lock while a session is live
 
+// ---------- keyboard focus (Tab / Shift+Tab, arrows, Enter/Space) ----------
+const int kFocusOrder[] = {H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT, H_PATH, H_BROWSE, H_HK0, H_HK1, H_PAUSE, H_RECORD};
+int g_focus = H_NONE;
+int g_dropKb = -1;      // keyboard-highlighted item in the open dropdown  // keyboard focus; shown as a brighter border once Tab is used
+bool kbFocused(int id) { return g_focus == id; }
+bool focusable(int id) { return id != H_PAUSE || g.rec.isActive(); }
+void moveFocus(int dir) {
+    const int n = (int)(sizeof kFocusOrder / sizeof *kFocusOrder);
+    int i = 0;
+    for (; i < n && kFocusOrder[i] != g_focus; ++i) {}
+    for (int k = 0; k < n; ++k) {
+        i = g_focus == H_NONE && k == 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n;
+        if (focusable(kFocusOrder[i])) { g_focus = kFocusOrder[i]; return; }
+    }
+}
+
 // ---------- layout ----------
 struct Layout { RECT title, preview, panel, hk, bar, record, pause; };
 Layout layout(RECT c) {
@@ -461,7 +480,7 @@ Layout layout(RECT c) {
 
 void dropdown(HDC dc, RECT r, int id) {
     bool locked = ddLocked(id), open = g.openDrop == id, hov = g.hover == id && !locked;
-    round(dc, r, hov || open ? C_INPUT_H : C_INPUT, open ? C_ACCENT : C_BORDER, 6);
+    round(dc, r, hov || open ? C_INPUT_H : C_INPUT, open ? C_ACCENT : kbFocused(id) ? C_BORDER_STRONG : C_BORDER, 6);
     RECT t{r.left + S(10), r.top, r.right - S(26), r.bottom};
     text(dc, ddItem(id, ddSel(id)), t, g.fBody, locked ? C_DISABLED : C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     chevron(dc, r.right - S(14), (r.top + r.bottom) / 2, locked ? C_DISABLED : C_TEXT2);
@@ -555,16 +574,20 @@ void paintPanel(HDC dc, const Layout& L) {
     section(L"OUTPUT");
     row(L"Resolution", H_DD_RES);
     row(L"Container", H_DD_CONT);
-    // Save folder: path field + Browse
-    text(dc, L"Save folder", RECT{x, y, ctrlX - S(6), y + rowH}, g.fLabel, C_TEXT2);
-    RECT br{right - S(80) + S(8), y, right, y + rowH};
-    RECT pf{ctrlX, y, br.left - S(6), y + rowH};
-    round(dc, pf, g.hover == H_PATH ? C_INPUT_H : C_INPUT, C_BORDER, 6);
-    text(dc, outputDir(), RECT{pf.left + S(8), pf.top, pf.right - S(6), pf.bottom}, g.fSmall, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+    // Save folder: full-width path field (folder glyph + path) + Browse; the label column would clip it at 96 DPI.
+    RECT br{right - S(80), y, right, y + rowH};
+    RECT pf{x, y, br.left - S(8), y + rowH};
+    round(dc, pf, g.hover == H_PATH ? C_INPUT_H : C_INPUT, kbFocused(H_PATH) ? C_BORDER_STRONG : C_BORDER, 6);
+    {   // folder glyph
+        int gx = pf.left + S(10), gy = (pf.top + pf.bottom) / 2;
+        round(dc, RECT{gx, gy - S(4), gx + S(14), gy + S(6)}, C_TEXT2, C_TEXT2, 2);
+        fill(dc, RECT{gx, gy - S(6), gx + S(6), gy - S(3)}, C_TEXT2);
+    }
+    text(dc, outputDir(), RECT{pf.left + S(32), pf.top, pf.right - S(8), pf.bottom}, g.fSmall, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
     addRegion(pf, H_PATH);  // click opens the folder
     bool lock = g.rec.running();
-    round(dc, br, g.hover == H_BROWSE && !lock ? C_INPUT_H : C_ELEV, C_BORDER, 6);
-    text(dc, L"Browse\u2026", br, g.fLabel, lock ? C_DISABLED : C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    round(dc, br, g.hover == H_BROWSE && !lock ? C_INPUT_H : C_ELEV, kbFocused(H_BROWSE) ? C_BORDER_STRONG : C_BORDER, 6);
+    text(dc, L"Browse…", br, g.fLabel, lock ? C_DISABLED : C_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     addRegion(br, H_BROWSE);
 }
 
@@ -579,12 +602,14 @@ void paintHotkeys(HDC dc, const Layout& L) {
         text(dc, labels[i], RECT{cx, L.hk.top + S(12), cx + colW, L.hk.top + S(28)}, g.fLabel, C_TEXT2);
         RECT f{cx, midY - S(4), cx + S(160), midY + S(26)};
         if (f.right > cx + colW) f.right = cx + colW;
-        bool focus = g.capturing == i, hv = g.hover == H_HK0 + i;
-        round(dc, f, focus ? C_INPUT_H : C_INPUT, focus ? C_ACCENT : (hv ? C_BORDER_STRONG : C_BORDER), 6);
+        bool lockedHk = g.rec.running();
+        bool focus = g.capturing == i, hv = g.hover == H_HK0 + i && !lockedHk;
+        round(dc, f, focus ? C_INPUT_H : C_INPUT, focus ? C_ACCENT : (kbFocused(H_HK0 + i) ? C_BORDER_STRONG : hv ? C_BORDER_STRONG : C_BORDER), 6);
         std::wstring t; COLORREF tc = C_TEXT;
         if (focus) { t = g.liveMods ? modsText(g.liveMods) + L"\u2026" : L"Press a key\u2026"; tc = g.liveMods ? C_TEXT : C_MUTED; }
         else if (hks[i]->empty()) { t = L"Click to set"; tc = C_MUTED; }
         else t = W(format(*hks[i]));
+        if (lockedHk && !focus) tc = C_DISABLED;
         text(dc, t, f, g.fMono, tc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         addRegion(f, H_HK0 + i);
         std::wstring m = focus ? L"Esc cancels \u00b7 Backspace clears" : g.hkMsg[i];
@@ -626,6 +651,7 @@ void paintBar(HDC dc, const Layout& L) {
             fill(dc, RECT{cx + S(2), cy - S(6), cx + S(6), cy + S(6)}, C_TEXT);
         }
         text(dc, paused ? L"Resume" : L"Pause", RECT{cx + S(12), L.pause.top, L.pause.right - S(8), L.pause.bottom}, g.fBtn, C_TEXT);
+        if (kbFocused(H_PAUSE)) { RECT fr{L.pause.left - S(3), L.pause.top - S(3), L.pause.right + S(3), L.pause.bottom + S(3)}; ring(dc, fr, C_TEXT2, 12, 1); }
         addRegion(L.pause, H_PAUSE);
     }
     // Record / Stop, drawn in code
@@ -645,6 +671,7 @@ void paintBar(HDC dc, const Layout& L) {
         dot(dc, dx, cy, S(3), bg);
         text(dc, L"Record", RECT{dx + S(14), r.top, r.right - S(10), r.bottom}, g.fBtn, RGB(255, 255, 255));
     }
+    if (kbFocused(H_RECORD)) { RECT fr{r.left - S(3), r.top - S(3), r.right + S(3), r.bottom + S(3)}; ring(dc, fr, C_TEXT2, 12, 1); }
     addRegion(r, H_RECORD);
 }
 
@@ -659,7 +686,7 @@ void paintDropList(HDC dc, RECT client) {
     int sel = ddSel(g.openDrop);
     for (int i = 0; i < n; ++i) {
         RECT it{list.left + S(4), list.top + S(4) + i * ih, list.right - S(4), list.top + S(4) + (i + 1) * ih};
-        bool hv = g.hover == H_ITEM0 + i;
+        bool hv = g.hover == H_ITEM0 + i || g_dropKb == i;
         if (hv) round(dc, it, C_INPUT_H, C_INPUT_H, 4);
         if (i == sel) fill(dc, RECT{it.left + S(4), it.top + S(8), it.left + S(6), it.bottom - S(8)}, C_ACCENT);
         text(dc, ddItem(g.openDrop, i), RECT{it.left + S(12), it.top, it.right - S(6), it.bottom}, g.fBody, i == sel ? C_TEXT : C_TEXT2,
@@ -689,7 +716,7 @@ int hitTest(POINT p) {
 void endCapture() {
     g.capturing = -1;
     g.liveMods = 0;
-    registerAll();
+    if (!g.rec.running()) registerAll();  // never touch global hotkeys mid-recording
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
@@ -736,6 +763,7 @@ void click(int id) {
     if (g.openDrop != H_NONE) {
         int dd = g.openDrop;
         g.openDrop = H_NONE;
+        g_dropKb = -1;
         if (id >= H_ITEM0 && id < H_ITEM0 + ddCount(dd)) ddSet(dd, id - H_ITEM0);
         InvalidateRect(g.hwnd, nullptr, FALSE);
         if (id >= H_ITEM0 || id == dd) return;  // item picked, padding, or toggled closed
@@ -748,6 +776,7 @@ void click(int id) {
         if (ddLocked(id)) setStatus(L"Stop recording to change settings", C_TEXT2);
         else { if (id == H_DD_GPU) enumGpus(); g.openDrop = id; }
     } else if (id == H_HK0 || id == H_HK1) {
+        if (g.rec.running()) { setStatus(L"Stop recording to change hotkeys", C_TEXT2); InvalidateRect(g.hwnd, nullptr, FALSE); return; }
         g.capturing = id - H_HK0;
         g.liveMods = 0;
         unregisterAll();
@@ -861,9 +890,35 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (hotkeyKey((UINT)wp, true)) return 0;
         if (wp == VK_ESCAPE) {
-            if (g.openDrop != H_NONE) { g.openDrop = H_NONE; InvalidateRect(h, nullptr, FALSE); }
+            if (g.openDrop != H_NONE) { g.openDrop = H_NONE; g_dropKb = -1; InvalidateRect(h, nullptr, FALSE); }
             else ShowWindow(h, SW_HIDE);
             return 0;
+        }
+        if (msg == WM_KEYDOWN) {
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (g.openDrop != H_NONE) {  // list navigation
+                int n = ddCount(g.openDrop);
+                if (g_dropKb < 0) g_dropKb = ddSel(g.openDrop);
+                if (wp == VK_DOWN) g_dropKb = (g_dropKb + 1) % n;
+                else if (wp == VK_UP) g_dropKb = (g_dropKb + n - 1) % n;
+                else if (wp == VK_RETURN || wp == VK_SPACE) { int dd = g.openDrop; g.openDrop = H_NONE; ddSet(dd, g_dropKb); g_dropKb = -1; }
+                else if (wp == VK_TAB) { g.openDrop = H_NONE; g_dropKb = -1; moveFocus(shift ? -1 : 1); }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            if (wp == VK_TAB) { moveFocus(shift ? -1 : 1); InvalidateRect(h, nullptr, FALSE); return 0; }
+            if (g_focus >= H_DD_FPS && g_focus <= H_DD_CONT && (wp == VK_UP || wp == VK_DOWN) && !ddLocked(g_focus)) {
+                int n = ddCount(g_focus), i = ddSel(g_focus) + (wp == VK_DOWN ? 1 : -1);
+                if (i >= 0 && i < n) ddSet(g_focus, i);
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            if ((wp == VK_LEFT || wp == VK_RIGHT) && g_focus != H_NONE) { moveFocus(wp == VK_RIGHT ? 1 : -1); InvalidateRect(h, nullptr, FALSE); return 0; }
+            if ((wp == VK_RETURN || wp == VK_SPACE) && g_focus != H_NONE) {
+                if (g_focus >= H_DD_FPS && g_focus <= H_DD_CONT) g_dropKb = ddSel(g_focus);
+                click(g_focus);
+                return 0;
+            }
         }
         break;
     case WM_KEYUP: case WM_SYSKEYUP:
@@ -893,7 +948,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             RecState st = g.rec.state();
             if (st == RecState::Stopping || st == RecState::Finishing) {
                 if (!finishSince) finishSince = GetTickCount64();
-                else if (GetTickCount64() - finishSince > 10000) {
+                else if (GetTickCount64() - finishSince > kWatchdogMs) {
                     finishSince = 0;
                     g.rec.abort();
                     setStatus(L"Stopped (finalize took too long)", C_WARN);
@@ -1023,7 +1078,7 @@ int runCli(int argc, wchar_t** argv) {
         "  --out FILE           output file (its folder is created if needed)\n"
         "  --log FILE           also write the result summary to FILE\n"
         "  --allow-synthetic    use a test pattern if screen capture is unavailable (CI)\n"
-        "  --test-hang-finalize MS  (CI) delay Finalize to exercise the abandon path\n"
+        "  --pause-at S / --resume-at S  pause and resume at S seconds into the recording\n"
         "  --render-ui FILE.bmp  paint the settings window to a BMP (docs/CI)\n"
         "  --ui-state idle|dropdown\n"
         "  --help               show this help\n\n"
@@ -1032,6 +1087,7 @@ int runCli(int argc, wchar_t** argv) {
 
     double secs = -1;
     std::wstring renderPath, uiState = L"idle"; int renderDpi = 96;
+    double pauseAt = -1, resumeAt = -1;
     RecordOptions o;
     Settings s;
     loadFile(U(settingsPath()), s);
@@ -1050,7 +1106,7 @@ int runCli(int argc, wchar_t** argv) {
         if (a == L"--minimized") continue;
         if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality"
             && a != L"--out" && a != L"--log" && a != L"--scale" && a != L"--gpu" && a != L"--bitrate-cap"
-            && a != L"--test-hang-finalize" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi")
+            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi")
             return bad("unknown option " + U(a));
         if (!value(v)) return bad(U(a) + " needs a value");
         if (a == L"--record") {
@@ -1083,6 +1139,10 @@ int runCli(int argc, wchar_t** argv) {
             setTestHangFinalizeMs((DWORD)ms);
             // Finalize budget = finalizeTimeoutMs/2; keep it under the hang so abandon fires (~2 s).
             o.finalizeTimeoutMs = 2000;
+        } else if (a == L"--pause-at" || a == L"--resume-at") {
+            char* end = nullptr; double d = strtod(v.c_str(), &end);
+            if (v.empty() || !end || *end || !(d >= 0) || d > 86400) return bad(U(a) + " must be seconds 0..86400");
+            (a == L"--pause-at" ? pauseAt : resumeAt) = d;
         } else if (a == L"--render-ui") {
             if (v.empty()) return bad("--render-ui needs a .bmp path");
             renderPath = W(v);
@@ -1122,13 +1182,32 @@ int runCli(int argc, wchar_t** argv) {
         DWORD at = GetFileAttributesW((dir.size() == 2 ? dir + L"\\" : dir).c_str());
         if (at == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) return bad("--out folder doesn't exist and can't be created");
     }
+    // Share the GUI's single-instance mutex: never run a second capture/encode session beside the app.
+    HANDLE cliMtx = CreateMutexW(nullptr, TRUE, L"Local\\CastRecorder.SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (cliMtx) CloseHandle(cliMtx);
+        emit("ok=0\nmessage=Cast Recorder is already running; close it (tray > Exit) before using --record\n", stdout);
+        return 1;
+    }
     Recorder r;
     r.start(o);
     // The duration counts from the first captured frame, so the file is as long as requested.
     while (r.running() && !r.started()) Sleep(5);
+    // Wall-clock schedule from the first captured frame. --record is total wall time; pauses are inside it.
+    const ULONGLONG t0 = GetTickCount64();
     const ULONGLONG ms = (ULONGLONG)(secs * 1000.0);
-    const ULONGLONG end = GetTickCount64() + ms;
-    while (r.isRecording() && GetTickCount64() < end) Sleep(5);
+    bool pausedOnce = false, resumedOnce = false;
+    ULONGLONG pausedWall = 0, pauseStart = 0;
+    while (r.isActive() && GetTickCount64() - t0 < ms) {
+        ULONGLONG el = GetTickCount64() - t0;
+        if (pauseAt >= 0 && !pausedOnce && el >= (ULONGLONG)(pauseAt * 1000)) { if (r.pause()) { pauseStart = GetTickCount64(); } pausedOnce = true; }
+        if (resumeAt >= 0 && pausedOnce && !resumedOnce && el >= (ULONGLONG)(resumeAt * 1000)) {
+            if (r.resume() && pauseStart) pausedWall = GetTickCount64() - pauseStart;
+            resumedOnce = true;
+        }
+        Sleep(5);
+    }
+    if (pausedOnce && !resumedOnce && pauseStart) pausedWall = GetTickCount64() - pauseStart;
     r.stop();
     // Hang-finalize tests use a short finalize budget; give them headroom then abort.
     DWORD waitMs = 15000;
@@ -1137,6 +1216,7 @@ int runCli(int argc, wchar_t** argv) {
     for (int i = 0; i < 100 && abandonedFinalizeLive() > 0; ++i) Sleep(50);
     const RecordResult res = r.result();
     std::string extra = "state=" + std::string(toString(r.state())) + "\n";
+    if (pausedOnce) { char b[96]; snprintf(b, sizeof b, "paused_ms=%llu pauses=%llu\n", pausedWall, res.pauses); extra += b; }
     if (res.abandoned) {  // same process: MF is poisoned, a second session must be refused
         bool again = r.start(o);
         extra += again ? "second_start=accepted\n" : "second_start=refused\n";

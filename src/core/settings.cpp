@@ -223,7 +223,7 @@ struct Parser {
 std::string toJson(const Settings& s) {
     std::ostringstream o;
     o << "{\n"
-      << "  \"version\": 1,\n"
+      << "  \"version\": 2,\n"
       << "  \"fps\": " << s.fps << ",\n"
       << "  \"quality\": \"" << toString(s.quality) << "\",\n"
       << "  \"encoder\": \"" << toString(s.encoder) << "\",\n"
@@ -262,6 +262,13 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     if (str("hotkeyOpenFolder", v) && parse(v, hk) && validate(hk).severity != Severity::Error) s.openFolder = hk;
     if (str("hotkeyPause", v)) { if (v.empty()) s.pauseToggle = Hotkey{}; else if (parse(v, hk) && validate(hk).severity != Severity::Error) s.pauseToggle = hk; }
     if (!s.pauseToggle.empty() && (s.pauseToggle == s.toggleRecord || s.pauseToggle == s.openFolder)) s.pauseToggle = Hotkey{};
+    // v1 -> v2: replace the old defaults (NVIDIA ShadowPlay combos) only if the user never changed them.
+    auto ver = m.find("version");
+    bool v1 = ver == m.end() || ver->second.t != Value::Num || ver->second.n < 2;
+    if (v1) {
+        if (s.toggleRecord == Hotkey{MOD_ALT_, 0x78}) s.toggleRecord = Settings{}.toggleRecord;
+        if (s.pauseToggle == Hotkey{MOD_ALT_, 0x79}) s.pauseToggle = Settings{}.pauseToggle;
+    }
     // Two actions can't share one combo: keep Start/stop and clear the duplicate.
     if (!s.openFolder.empty() && s.openFolder == s.toggleRecord) s.openFolder = Hotkey{};
     boo("captureCursor", s.captureCursor);

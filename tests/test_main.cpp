@@ -61,6 +61,11 @@ static void testValidateConflicts() {
     CHECK(validate(P("Home")).severity == Severity::Warning);
     CHECK(validate(Hotkey{MOD_CTRL_, 0x11}).severity == Severity::Error);  // modifier as key
     CHECK(validate(Hotkey{}).severity == Severity::Ok);
+    // GPU vendor overlay defaults warn (they usually swallow the combo in games)
+    for (const char* k : {"Alt+F9", "Alt+F10", "Alt+Z", "Alt+F1", "Ctrl+Shift+E", "Ctrl+Shift+R", "Ctrl+Shift+S"})
+        CHECK(validate(P(k)).severity == Severity::Warning);
+    CHECK(validate(P("Ctrl+Shift+F9")).severity == Severity::Ok);
+    CHECK(validate(P("Ctrl+Shift+F10")).severity == Severity::Ok);
     std::vector<NamedHotkey> l = {{"rec", P("Alt+V")}, {"folder", P("Alt+F9")}, {"x", P("alt+v")}, {"y", Hotkey{}}, {"z", Hotkey{}}};
     auto c = findConflicts(l);
     CHECK_EQ(c.size(), (size_t)1);
@@ -103,6 +108,14 @@ static void testSettings() {
     Settings f; CHECK(loadFile(path, f)); CHECK_EQ(f.fps, 30); CHECK_EQ(f.outputDir, s.outputDir);
     std::remove(path);
     CHECK(!loadFile("does/not/exist.json", f)); CHECK_EQ(f.fps, 30);
+    // Defaults and v1 -> v2 hotkey migration (only untouched old defaults move)
+    CHECK(Settings{}.toggleRecord == P("Ctrl+Shift+F9"));
+    CHECK(Settings{}.pauseToggle == P("Ctrl+Shift+F10"));
+    { Settings m; CHECK(fromJson("{\"version\":1,\"hotkeyToggleRecord\":\"Alt+F9\",\"hotkeyPause\":\"Alt+F10\"}", m));
+      CHECK(m.toggleRecord == P("Ctrl+Shift+F9")); CHECK(m.pauseToggle == P("Ctrl+Shift+F10")); }
+    { Settings m; CHECK(fromJson("{\"version\":1,\"hotkeyToggleRecord\":\"Alt+V\"}", m)); CHECK(m.toggleRecord == P("Alt+V")); }
+    { Settings m; CHECK(fromJson("{\"version\":2,\"hotkeyToggleRecord\":\"Alt+F9\"}", m)); CHECK(m.toggleRecord == P("Alt+F9")); }
+    { Settings m; CHECK(fromJson(toJson(Settings{}), m)); CHECK(m.toggleRecord == Settings{}.toggleRecord); }
     // Bitrates
     CHECK(bitrateFor(Quality::High, 1920, 1080, 60) > bitrateFor(Quality::Medium, 1920, 1080, 60));
     CHECK(bitrateFor(Quality::High, 1920, 1080, 60) > bitrateFor(Quality::High, 1920, 1080, 30));
