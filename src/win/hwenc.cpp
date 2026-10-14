@@ -28,6 +28,8 @@ const GUID kCODECAPI_AVLowLatencyMode = {0x9c27891a, 0xed7a, 0x40e1, {0x88, 0xe8
 const GUID kCODECAPI_AVEncCommonRateControlMode = {0x1c0608e9, 0x370c, 0x4710, {0x8a, 0x58, 0xcb, 0x61, 0x81, 0xc4, 0x24, 0x23}};
 const GUID kCODECAPI_AVEncCommonMeanBitRate = {0xf7222374, 0x2144, 0x4815, {0xb5, 0x50, 0xa3, 0x7f, 0x8e, 0x12, 0xee, 0x52}};
 const GUID kCODECAPI_AVEncMPVDefaultBPictureCount = {0x8d390aac, 0xdc5c, 0x4200, {0xb5, 0x7f, 0x81, 0x4d, 0x04, 0xba, 0xba, 0xb2}};
+const GUID kCODECAPI_AVEncCommonMaxBitRate = {0x9651eae4, 0x39b9, 0x4ebf, {0x85, 0xef, 0xd7, 0xf4, 0x44, 0xec, 0x74, 0x65}};
+const GUID kCODECAPI_AVEncCommonQualityVsSpeed = {0x98332df8, 0x03cd, 0x476b, {0x89, 0xfa, 0x3f, 0x9e, 0x44, 0x2d, 0xec, 0x9f}};
 const GUID kCODECAPI_AVEncMPVGOPSize = {0x95f31b26, 0x95a4, 0x41aa, {0x93, 0x03, 0x24, 0x6a, 0x7f, 0xc6, 0xee, 0xf1}};
 
 typedef HRESULT(WINAPI* MFTEnum2Fn)(GUID, UINT32, const MFT_REGISTER_TYPE_INFO*, const MFT_REGISTER_TYPE_INFO*,
@@ -181,9 +183,13 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
     // Rate control / latency before types (some drivers lock these at SetOutputType).
     ComPtr<ICodecAPI> codec;
     if (SUCCEEDED(mft_->QueryInterface(kIID_ICodecAPI, (void**)codec.GetAddressOf())) && codec) {
-        setCodec(codec.Get(), kCODECAPI_AVEncCommonRateControlMode, VT_UI4, eAVEncCommonRateControlMode_CBR, L"CODECAPI RateControl=CBR", log);
+        // Peak-constrained VBR at a resolution/fps-scaled mean, quality-first preset, no low-latency mode
+        // (low-latency/CBR on AMF/QSV trades a lot of quality for latency we don't need when recording).
+        setCodec(codec.Get(), kCODECAPI_AVEncCommonRateControlMode, VT_UI4, eAVEncCommonRateControlMode_PeakConstrainedVBR, L"CODECAPI RateControl=PeakConstrainedVBR", log);
         setCodec(codec.Get(), kCODECAPI_AVEncCommonMeanBitRate, VT_UI4, bitrate, L"CODECAPI MeanBitRate", log);
-        setCodec(codec.Get(), kCODECAPI_AVLowLatencyMode, VT_BOOL, 1, L"CODECAPI LowLatencyMode", log);
+        setCodec(codec.Get(), kCODECAPI_AVEncCommonMaxBitRate, VT_UI4, (ULONG)((double)bitrate * 1.5), L"CODECAPI MaxBitRate", log);
+        setCodec(codec.Get(), kCODECAPI_AVEncCommonQualityVsSpeed, VT_UI4, high ? 100 : 60, L"CODECAPI QualityVsSpeed", log);
+        setCodec(codec.Get(), kCODECAPI_AVLowLatencyMode, VT_BOOL, 0, L"CODECAPI LowLatencyMode=off", log);
         setCodec(codec.Get(), kCODECAPI_AVEncMPVDefaultBPictureCount, VT_UI4, 0, L"CODECAPI BPictureCount=0", log);
         setCodec(codec.Get(), kCODECAPI_AVEncMPVGOPSize, VT_UI4, (ULONG)fps * 2, L"CODECAPI GOPSize", log);
     } else log += L"ICodecAPI not available\n";
@@ -195,6 +201,10 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
     outType_->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
     outType_->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     outType_->SetUINT32(MF_MT_MPEG2_PROFILE, high ? 100u : 77u);
+    outType_->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    outType_->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    outType_->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    outType_->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
     MFSetAttributeSize(outType_.Get(), MF_MT_FRAME_SIZE, w, h);
     MFSetAttributeRatio(outType_.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
     MFSetAttributeRatio(outType_.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -219,6 +229,10 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
     }
     if (!inT) { MFCreateMediaType(&inT); inT->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video); inT->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12); }
     inT->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    inT->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    inT->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    inT->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    inT->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
     MFSetAttributeSize(inT.Get(), MF_MT_FRAME_SIZE, w, h);
     MFSetAttributeRatio(inT.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
     MFSetAttributeRatio(inT.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -330,6 +344,10 @@ ComPtr<IMFMediaType> HwEncoder::muxType() {
     MFSetAttributeSize(t.Get(), MF_MT_FRAME_SIZE, w_, h_);
     MFSetAttributeRatio(t.Get(), MF_MT_FRAME_RATE, (UINT32)fps_, 1);
     MFSetAttributeRatio(t.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    t->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    t->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    t->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    t->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
     UINT32 sz = 0;
     std::vector<BYTE> hdr;
     if (cur && SUCCEEDED(cur->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &sz)) && sz) { hdr.resize(sz); cur->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), sz, nullptr); }
@@ -350,7 +368,7 @@ HRESULT HwEncoder::pump(const OutputFn& out) {
         MediaEventType t = MEUnknown; e->GetType(&t);
         HRESULT st = S_OK; e->GetStatus(&st);
         if (FAILED(st)) return st;
-        if (t == METransformNeedInput) ++needInput_;
+        if (t == METransformNeedInput) { ++needInput_; hr = submitQueued(); if (FAILED(hr)) return hr; }
         else if (t == METransformHaveOutput) { hr = processOutput(out); if (FAILED(hr)) return hr; }
         else if (t == METransformDrainComplete) drained_ = true;
     }
@@ -364,19 +382,34 @@ HRESULT HwEncoder::encode(IMFSample* s, const OutputFn& out) {
         ++inputs;
         return pump(out);
     }
+    // Queue a few frames instead of dropping when the MFT hasn't asked for input yet; only drop past 4 queued.
+    HRESULT result = S_OK;
+    queue_.emplace_back(s);
+    if (queue_.size() > 4) { queue_.erase(queue_.begin()); ++backpressureDrops; result = S_FALSE; }
     HRESULT hr = pump(out);
     if (FAILED(hr)) return hr;
-    if (needInput_ <= 0) { ++backpressureDrops; return S_FALSE; }
-    hr = mft_->ProcessInput(inId_, s, 0);
-    if (hr == MF_E_NOTACCEPTING) { ++backpressureDrops; return S_FALSE; }
-    if (FAILED(hr)) return hr;
-    --needInput_;
-    ++inputs;
-    return pump(out);
+    return result;
+}
+
+HRESULT HwEncoder::submitQueued() {
+    while (needInput_ > 0 && !queue_.empty()) {
+        HRESULT hr = mft_->ProcessInput(inId_, queue_.front().Get(), 0);
+        if (hr == MF_E_NOTACCEPTING) return S_OK;
+        if (FAILED(hr)) return hr;
+        queue_.erase(queue_.begin());
+        --needInput_;
+        ++inputs;
+    }
+    return S_OK;
 }
 
 bool HwEncoder::drain(const OutputFn& out, DWORD timeoutMs) {
     if (!mft_) return true;
+    if (!sync_) {  // feed what's still queued first
+        ULONGLONG qEnd = GetTickCount64() + timeoutMs / 2;
+        while (!queue_.empty() && GetTickCount64() < qEnd) { if (FAILED(pump(out))) return false; if (!queue_.empty()) Sleep(1); }
+    }
+    queue_.clear();
     mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     if (FAILED(mft_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0))) return false;
     if (sync_) return SUCCEEDED(pump(out));

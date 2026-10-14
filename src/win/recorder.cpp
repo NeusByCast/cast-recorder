@@ -21,6 +21,9 @@
 #include <vector>
 #include "capture_wgc.h"
 #include "hwenc.h"
+#include "audio.h"
+#include <deque>
+#include <timeapi.h>
 #include "../core/nv12.h"
 // Last: instantiate the CODECAPI_* GUIDs in this TU only.
 #include <initguid.h>
@@ -129,7 +132,23 @@ struct DuplicationSource : Source {
     }
 };
 
+}  // namespace
+// Static high-detail CI pattern (gradients, fine checkers, thin lines, color bars). Shared with --render-pattern.
+void testPattern(std::vector<uint32_t>& px, unsigned w, unsigned h) {
+    px.resize((size_t)w * h);
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x) {
+            uint32_t r, g, b;
+            if (y < h / 4) { unsigned bar = x * 8 / w; r = (bar & 1) ? 235 : 16; g = (bar & 2) ? 235 : 16; b = (bar & 4) ? 235 : 16; }
+            else if (y < h / 2) { r = x * 255 / w; g = (y - h / 4) * 255 / (h / 4); b = 255 - r; }
+            else if (y < 3 * h / 4) { uint32_t c = (((x >> 2) ^ (y >> 2)) & 1) ? 220 : 40; r = g = b = c; }
+            else { uint32_t c = (x % 16 == 0 || y % 16 == 0) ? 230 : 30; r = c; g = c; b = (x * 7 + y * 3) & 255; }
+            px[(size_t)y * w + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+}
+namespace {
 struct SyntheticSource : Source {
+    bool still = false;
     ComPtr<ID3D11Texture2D> staging;
     std::vector<uint32_t> px;
     unsigned n = 0;
@@ -144,6 +163,12 @@ struct SyntheticSource : Source {
     }
     bool acquire(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew) override {
         Sleep(timeoutMs ? (timeoutMs < 5 ? timeoutMs : 5) : 0);
+        if (still) {  // new frame every call (worst case for the encoder), identical content -> PSNR vs reference
+            if (!n++) { testPattern(px, w, h); ctx->UpdateSubresource(staging.Get(), 0, nullptr, px.data(), w * 4, 0); }
+            ctx->CopyResource(dst, staging.Get());
+            gotNew = true;
+            return true;
+        }
         ++n;
         for (UINT y = 0; y < h; ++y)
             for (UINT x = 0; x < w; ++x)
@@ -224,6 +249,13 @@ struct GpuConvert {
         vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &src);
         vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dst);
         vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &dst);
+        // Full-range RGB in -> BT.709 limited-range YCbCr out (matches what the encoder signals).
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE in{}; in.RGB_Range = 0; in.YCbCr_Matrix = 1;
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE out{}; out.Usage = 0; out.RGB_Range = 0; out.YCbCr_Matrix = 1;
+        out.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        vctx->VideoProcessorSetStreamColorSpace(vp.Get(), 0, &in);
+        vctx->VideoProcessorSetOutputColorSpace(vp.Get(), &out);
+        vctx->VideoProcessorSetStreamAutoProcessingMode(vp.Get(), 0, FALSE);
         ok = true;
         return true;
     }
@@ -326,10 +358,51 @@ struct Writer {
             }
         }
 
+        if (wantAudio && !addAudio(err)) return false;
         hr = sw->BeginWriting();
         if (FAILED(hr)) { err = hrMsg(L"BeginWriting", hr); return false; }
         return true;
     }
+    DWORD astream = 0;
+    bool audio = false;
+    // AAC 48 kHz stereo track encoded by the sink writer's AAC MFT from s16 PCM. Call before BeginWriting.
+    bool addAudio(std::wstring& err) {
+        ComPtr<IMFMediaType> o, i;
+        MFCreateMediaType(&o);
+        o->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        o->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        o->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        o->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
+        o->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AudioMixer::kChannels);
+        o->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);  // 192 kbps
+        o->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+        HRESULT hr = sw->AddStream(o.Get(), &astream);
+        MFCreateMediaType(&i);
+        i->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        i->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        i->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        i->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
+        i->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, AudioMixer::kChannels);
+        i->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        i->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AudioMixer::kRate * 4);
+        if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(astream, i.Get(), nullptr);
+        if (FAILED(hr)) { err = hrMsg(L"Audio stream (AAC)", hr); return false; }
+        audio = true;
+        return true;
+    }
+    HRESULT writeAudio(const std::vector<short>& pcm, LONGLONG t) {
+        if (!audio || pcm.empty()) return S_OK;
+        DWORD bytes = (DWORD)(pcm.size() * sizeof(short));
+        ComPtr<IMFMediaBuffer> b; ComPtr<IMFSample> s;
+        HRESULT hr = MFCreateMemoryBuffer(bytes, &b);
+        BYTE* p = nullptr;
+        if (SUCCEEDED(hr) && SUCCEEDED(hr = b->Lock(&p, nullptr, nullptr))) { memcpy(p, pcm.data(), bytes); b->Unlock(); b->SetCurrentLength(bytes); }
+        if (SUCCEEDED(hr)) hr = MFCreateSample(&s);
+        if (SUCCEEDED(hr)) { s->AddBuffer(b.Get()); s->SetSampleTime(t); s->SetSampleDuration((LONGLONG)(pcm.size() / 2) * 10000000LL / AudioMixer::kRate); }
+        if (SUCCEEDED(hr)) hr = sw->WriteSample(astream, s.Get());
+        return hr;
+    }
+    bool wantAudio = false;
     // Mux-only sink writer for samples already encoded by our own hardware MFT (no transforms inside MF).
     bool openPassthrough(const std::wstring& path, IMFMediaType* encOut, std::wstring& err) {
         ComPtr<IMFAttributes> a;
@@ -343,6 +416,7 @@ struct Writer {
         hr = sw->AddStream(encOut, &stream);
         if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(stream, encOut, nullptr);
         if (FAILED(hr)) { err = hrMsg(L"Passthrough stream", hr); return false; }
+        if (wantAudio && !addAudio(err)) return false;
         hr = sw->BeginWriting();
         if (FAILED(hr)) { err = hrMsg(L"BeginWriting(passthrough)", hr); return false; }
         return true;
@@ -562,7 +636,16 @@ void Recorder::run() {
     const unsigned gen = sessionGen_;
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     bool mfStarted = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  // leave games / UI the headroom
+    // 1 ms timer resolution (Sleep/waits would otherwise round to 15.6 ms and starve 60 fps pacing) + MMCSS "Capture".
+    timeBeginPeriod(1);
+    HANDLE mmcss = nullptr;
+    {
+        typedef HANDLE(WINAPI * AvSet)(LPCWSTR, LPDWORD);
+        HMODULE av = LoadLibraryExW(L"avrt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        DWORD task = 0;
+        if (av) if (auto f = (AvSet)GetProcAddress(av, "AvSetMmThreadCharacteristicsW")) mmcss = f(L"Capture", &task);
+        if (!mmcss) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
     RecordResult r;
     bool abandonedMf = false;
     std::wstring err;
@@ -640,23 +723,48 @@ void Recorder::run() {
         bool cursorByGdi = false;
         std::wstring capErr;
 #ifdef CR_HAVE_WGC
-        {
+        if (!opt_.forcePattern) {
             auto w = std::make_unique<WgcSourceAdapter>();
             if (w->init(dev.Get(), mon, opt_.captureCursor, capErr)) src = std::move(w);
         }
 #endif
-        if (!src && output) {
+        if (!src && output && !opt_.forcePattern) {
             auto d = std::make_unique<DuplicationSource>();
             if (d->init(dev.Get(), output.Get(), capErr)) { src = std::move(d); cursorByGdi = opt_.captureCursor; }
         }
-        if (!src && opt_.allowSynthetic) {
+        if (!src && (opt_.allowSynthetic || opt_.forcePattern)) {
             auto s = std::make_unique<SyntheticSource>();
+            s->still = opt_.forcePattern;
             if (s->init(dev.Get())) src = std::move(s);
         }
         if (!src) { r.message = L"Screen capture unavailable: " + (capErr.empty() ? std::wstring(L"no output") : capErr); return; }
         r.captureUsed = src->name();
         UINT W = 0, H = 0;  // encoded size (even; optionally downscaled)
         scaledSize(opt_.scale, src->w, src->h, W, H);
+
+        // ---- audio (system loopback + mic), mixed on the video media clock ----
+        AudioMixer mixer;
+        {
+            std::wstring alog;
+            mixer.start(opt_.systemAudio, opt_.mic, opt_.micId, opt_.testTone, alog);
+            r.encoderLog += alog;
+        }
+        Writer wr;
+        wr.wantAudio = mixer.active();
+        r.hasAudio = wr.wantAudio;
+        std::deque<std::pair<long long, std::vector<short>>> audioPending;  // until the lazy writer opens
+        HRESULT audioHr = S_OK;
+        auto pushAudio = [&](long long mediaTime, bool final) {
+            if (!wr.wantAudio) return;
+            mixer.micMuted = micMuted_.load();
+            std::vector<short> pcm; long long at = 0;
+            mixer.produce(mediaTime, final, pcm, at);
+            if (pcm.empty()) return;
+            if (!wr.sw) { audioPending.emplace_back(at, std::move(pcm)); return; }
+            while (!audioPending.empty()) { wr.writeAudio(audioPending.front().second, audioPending.front().first); audioPending.pop_front(); }
+            HRESULT ah = wr.writeAudio(pcm, at);
+            if (FAILED(ah)) audioHr = ah;
+        };
 
         // ---- encoder selection ----
         // Hardware: only encoders registered for THIS device's adapter (MFT_ENUM_ADAPTER_LUID), each one
@@ -666,7 +774,6 @@ void Recorder::run() {
         GpuConvert conv;
         bool zeroCopy = false;
         std::unique_ptr<HwEncoder> hw;
-        Writer wr;
         bool opened = false;
         std::wstring& elog = r.encoderLog;
         if (opt_.encoder != Encoder::Software && videoSupport) {
@@ -701,13 +808,13 @@ void Recorder::run() {
             r.encoderUsed = L"Software (Media Foundation H.264)";
             if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
         }
-        if (!opened) { wr = Writer{}; DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
+        if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
         const bool scaling = W != (src->w & ~1u) || H != (src->h & ~1u);
         if (!zeroCopy && !swNv12 && scaling) {  // CPU / RGB path can't scale: encode native instead
-            wr = Writer{}; DeleteFileW(tmp.c_str());
+            { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str());
             W = src->w & ~1u; H = src->h & ~1u;
             opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
-            if (!opened) { wr = Writer{}; DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
+            if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
         }
         // Encoded-sample sink for the hardware path: the MP4 writer is opened on the first output so it gets the
         // encoder's final output type (sequence header).
@@ -716,12 +823,14 @@ void Recorder::run() {
             if (!wr.sw) {
                 ComPtr<IMFMediaType> ot = hw->muxType();
                 std::wstring e2;
-                if (!wr.openPassthrough(tmp, ot.Get(), e2)) { wr = Writer{}; muxHr = E_FAIL; err = e2; return E_FAIL; }
+                if (!wr.openPassthrough(tmp, ot.Get(), e2)) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } muxHr = E_FAIL; err = e2; return E_FAIL; }
             }
             HRESULT h2 = wr.sw->WriteSample(wr.stream, es);
             if (FAILED(h2)) muxHr = h2;
             return h2;
         };
+        unsigned long long capArrivals = 0, convN = 0, encN = 0;
+        double convMs = 0, encMs = 0;
         LONGLONG lastOutTick = 0;
         unsigned long long lastOutCount = 0;
 
@@ -736,7 +845,7 @@ void Recorder::run() {
         // Ring of encode surfaces so the async encoder never reads a texture we're overwriting.
         D3D11_TEXTURE2D_DESC ed = td; ed.Width = W; ed.Height = H; ed.MiscFlags = 0;
         if (zeroCopy) ed.Format = DXGI_FORMAT_NV12;
-        const int RING = 8;
+        const int RING = 16;  // > encoder queue + in-flight, so the async MFT never reads a surface we overwrite
         ComPtr<ID3D11Texture2D> ring[RING];
         ComPtr<ID3D11Texture2D> staging;
         for (auto& t : ring) if (FAILED(dev->CreateTexture2D(&ed, nullptr, &t))) { r.message = L"CreateTexture2D(ring) failed"; return; }
@@ -785,6 +894,7 @@ void Recorder::run() {
                 if (!pauseBegin) { LARGE_INTEGER pb; QueryPerformanceCounter(&pb); pauseBegin = pb.QuadPart; }
                 bool got = false;
                 if (!src->acquire(ctx.Get(), latest.Get(), 20, got)) { r.message = L"Capture failed"; break; }
+                mixer.discard();
                 continue;
             }
             if (pauseBegin) {  // shift the pacing origin by exactly the pause the worker saw: no "missed" frames
@@ -801,6 +911,8 @@ void Recorder::run() {
                 LONGLONG waitMs = (target - now.QuadPart) * 1000 / freq.QuadPart;
                 bool got = false;
                 if (!src->acquire(ctx.Get(), latest.Get(), (UINT)(waitMs > 1 ? waitMs - 1 : 0), got)) { r.message = L"Capture failed"; break; }
+                if (got) ++capArrivals;
+                if (hw) { HRESULT ph = hw->pump(muxOut); if (FAILED(ph)) { r.message = hrMsg(L"Encoder", ph); break; } }
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart < target && timer) {
                     LARGE_INTEGER rel; rel.QuadPart = -((target - now.QuadPart) * 10000000LL / freq.QuadPart);
@@ -812,6 +924,7 @@ void Recorder::run() {
             if (due > next + 1) { unsigned long long skip = (unsigned long long)(due - next - 1); r.late += skip; r.dropped += skip; next = due - 1; }
             if (cursorByGdi) drawCursor(latest.Get(), origin);
             ID3D11Texture2D* t = ring[next % RING].Get();
+            LARGE_INTEGER cs0; QueryPerformanceCounter(&cs0);
             ComPtr<IMFMediaBuffer> buf;
             if (zeroCopy && !cpuFallback) {
                 // GPU BGRA->NV12 (+scale) into the ring surface; no CPU readback.
@@ -875,6 +988,8 @@ void Recorder::run() {
                 }
             }
             bool counted = buf != nullptr;
+            LARGE_INTEGER cs1; QueryPerformanceCounter(&cs1);
+            convMs += (double)(cs1.QuadPart - cs0.QuadPart) * 1000.0 / freq.QuadPart; ++convN;
             if (SUCCEEDED(whr) && buf && hw) {
                 ComPtr<IMFSample> smp;
                 whr = MFCreateSample(&smp);
@@ -886,21 +1001,40 @@ void Recorder::run() {
                 if (hw->outputs != lastOutCount || !lastOutTick) { lastOutCount = hw->outputs; lastOutTick = nw.QuadPart; }
                 else if (nw.QuadPart - lastOutTick > 2 * freq.QuadPart) { r.message = L"Hardware encoder stopped responding - recording ended early"; r.encoderStalled = true; break; }
             } else if (SUCCEEDED(whr) && buf) whr = wr.write(buf.Get(), next * dur, dur);
+            { LARGE_INTEGER cs2; QueryPerformanceCounter(&cs2); encMs += (double)(cs2.QuadPart - cs1.QuadPart) * 1000.0 / freq.QuadPart; ++encN; }
             if (FAILED(whr)) { r.message = hrMsg(L"WriteSample", whr); break; }
             if (counted) ++r.frames;
+            pushAudio((next + 1) * dur, false);
+            if (FAILED(audioHr)) { r.message = hrMsg(L"Audio", audioHr); break; }
             ++next;
             bool got = false;
             if (!src->acquire(ctx.Get(), latest.Get(), 0, got)) { r.message = L"Capture failed"; break; }
+            if (got) ++capArrivals;
             if (!got) ++r.duplicated;  // reuse last frame
         }
         if (timer) CloseHandle(timer);
         fsm_.beginFinish();
+        LARGE_INTEGER tEnd; QueryPerformanceCounter(&tEnd);
+        {
+            double secs = (double)(tEnd.QuadPart - t0.QuadPart) / freq.QuadPart;
+            if (secs > 0.1) { r.captureFps = capArrivals / secs; }
+            r.convertMsAvg = convN ? convMs / convN : 0; r.encodeMsAvg = encN ? encMs / encN : 0;
+        }
         if (hw) {
             if (!hw->drain(muxOut, 1500)) { elog += L"drain: timed out, encoder leaked\n"; hw->leak(); }
             else hw->release();
             hw.reset();
             if (!wr.sw) r.frames = 0;  // nothing ever came out of the encoder
         }
+        {
+            double secs = (double)next * dur / 1e7;
+            r.encodeFps = secs > 0.1 ? r.frames / secs : 0;
+        }
+        if (wr.sw) {
+            pushAudio(next * dur, true);
+            while (!audioPending.empty()) { wr.writeAudio(audioPending.front().second, audioPending.front().first); audioPending.pop_front(); }
+        }
+        mixer.stop();
 
         {   // diagnostics: effective path
             wchar_t b[512];
@@ -908,6 +1042,9 @@ void Recorder::run() {
                      adapterName.c_str(), output ? L"local" : L"cross-adapter", r.encoderUsed.c_str(), zeroCopy ? L"yes" : L"no", r.cpuFallback ? L"yes" : L"no", W, H, opt_.fps,
                      r.dropped, r.duplicated, r.convertFailures);
             r.pathLog = b;
+            swprintf(b, 512, L"; capture_fps=%.1f; encode_fps=%.1f; convert_ms=%.2f; encode_ms=%.2f; audio=%ls; audio_underrun_frames=%llu",
+                     r.captureFps, r.encodeFps, r.convertMsAvg, r.encodeMsAvg, r.hasAudio ? L"aac" : L"none", mixer.underrunFrames);
+            r.pathLog += b;
         }
 
         // ---- capture teardown with budget; on timeout the helper owns the Source (leak > UAF) ----
@@ -963,10 +1100,10 @@ void Recorder::run() {
                 g_abandonLive.fetch_sub(1);
                 fin.join();
                 fh = st->hr.load();
-                wr = Writer{};
+                { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; }
             }
         } else {
-            wr = Writer{};
+            { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; }
             if (!r.frames) { DeleteFileW(tmp.c_str()); if (r.message.empty()) r.message = L"No frames recorded"; }
         }
 
@@ -1000,6 +1137,11 @@ void Recorder::run() {
     }();
 
     // Skip MF/COM teardown if anything was abandoned (a detached Finalize/Close may still be inside MF).
+    timeEndPeriod(1);
+    if (mmcss) {
+        typedef BOOL(WINAPI * AvRev)(HANDLE);
+        if (auto f = (AvRev)GetProcAddress(GetModuleHandleW(L"avrt.dll"), "AvRevertMmThreadCharacteristics")) f(mmcss);
+    }
     if (!abandonedMf && !abandon_.poisoned.load()) {
         if (mfStarted) MFShutdown();
         if (SUCCEEDED(hrCo)) CoUninitialize();

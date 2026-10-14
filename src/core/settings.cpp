@@ -58,7 +58,8 @@ int normalizeFps(int fps) {
 
 unsigned bitrateFor(Quality q, int w, int h, int fps, unsigned cap) {
     // Bits per pixel per frame tuned for H.264 screen/game content (CBR-ish target).
-    double bpp = q == Quality::Low ? 0.04 : q == Quality::Medium ? 0.07 : q == Quality::High ? 0.11 : 0.17;
+    // ~1080p60: Low 9, Medium 19, High 41, Ultra 62 Mbps (game content needs far more than desktop video).
+    double bpp = q == Quality::Low ? 0.07 : q == Quality::Medium ? 0.15 : q == Quality::High ? 0.33 : 0.50;
     double br = bpp * (double)w * (double)h * (double)fps;
     if (br < 1e6) br = 1e6;
     if (br > 150e6) br = 150e6;
@@ -232,6 +233,10 @@ std::string toJson(const Settings& s) {
       << "  \"hotkeyToggleRecord\": \"" << esc(format(s.toggleRecord)) << "\",\n"
       << "  \"hotkeyOpenFolder\": \"" << esc(format(s.openFolder)) << "\",\n"
       << "  \"hotkeyPause\": \"" << esc(format(s.pauseToggle)) << "\",\n"
+      << "  \"hotkeyMicMute\": \"" << esc(format(s.micMute)) << "\",\n"
+      << "  \"systemAudio\": " << (s.systemAudio ? "true" : "false") << ",\n"
+      << "  \"micEnabled\": " << (s.micEnabled ? "true" : "false") << ",\n"
+      << "  \"micDevice\": \"" << esc(s.micDevice) << "\",\n"
       << "  \"captureCursor\": " << (s.captureCursor ? "true" : "false") << ",\n"
       << "  \"startMinimized\": " << (s.startMinimized ? "true" : "false") << ",\n"
       << "  \"scale\": \"" << toString(s.scale) << "\",\n"
@@ -271,6 +276,11 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     }
     // Two actions can't share one combo: keep Start/stop and clear the duplicate.
     if (!s.openFolder.empty() && s.openFolder == s.toggleRecord) s.openFolder = Hotkey{};
+    if (str("hotkeyMicMute", v)) { if (v.empty()) s.micMute = Hotkey{}; else if (parse(v, hk) && validate(hk).severity != Severity::Error) s.micMute = hk; }
+    if (!s.micMute.empty() && (s.micMute == s.toggleRecord || s.micMute == s.pauseToggle || s.micMute == s.openFolder)) s.micMute = Hotkey{};
+    boo("systemAudio", s.systemAudio);
+    boo("micEnabled", s.micEnabled);
+    str("micDevice", s.micDevice);
     boo("captureCursor", s.captureCursor);
     boo("startMinimized", s.startMinimized);
     if (str("scale", v)) fromString(v, s.scale);

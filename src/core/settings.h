@@ -19,7 +19,11 @@ struct Settings {
     Hotkey toggleRecord{MOD_CTRL_ | MOD_SHIFT_, 0x78};  // Ctrl+Shift+F9 (Alt+F9 is NVIDIA ShadowPlay)
     Hotkey openFolder{MOD_ALT_ | MOD_SHIFT_, 0x78};   // Alt+Shift+F9 (no UI field; still registered)
     Hotkey pauseToggle{MOD_CTRL_ | MOD_SHIFT_, 0x79};  // Ctrl+Shift+F10
+    Hotkey micMute{MOD_CTRL_ | MOD_SHIFT_, 0x7A};      // Ctrl+Shift+F11
     bool captureCursor = true;
+    bool systemAudio = true;           // WASAPI loopback of the default output device
+    bool micEnabled = false;
+    std::string micDevice;             // UTF-8 endpoint id; empty = default microphone
     bool startMinimized = false;
     OutputScale scale = OutputScale::Native;
     int gpuIndex = -1;                 // -1 Auto; else adapter ordinal

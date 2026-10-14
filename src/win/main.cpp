@@ -18,6 +18,7 @@
 #include "../core/settings.h"
 #include "recorder.h"
 #include "preview.h"
+#include "audio.h"
 #include "resource.h"
 #include "version.h"
 #include "click_wav.h"
@@ -71,7 +72,7 @@ const COLORREF C_BG = hex(0x0E1014), C_SURFACE = hex(0x161A20), C_ELEV = hex(0x1
 
 enum Hit {
     H_NONE = 0, H_MIN, H_CLOSE, H_RECORD, H_PAUSE, H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT,
-    H_BROWSE, H_PATH, H_HK0, H_HK1, H_ITEM0 = 100
+    H_DD_SYS, H_DD_MIC, H_BROWSE, H_PATH, H_HK0, H_HK1, H_HK2, H_MAX, H_MIC, H_ITEM0 = 100
 };
 struct Region { RECT rc; int id; };
 
@@ -87,12 +88,12 @@ const Container kCont[] = {Container::MP4, Container::MKV, Container::MOV};
 const wchar_t* kContL[] = {L"MP4", L"MKV", L"MOV"};
 
 constexpr UINT WM_TRAY = WM_APP + 1;
-constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3;
+constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3, HK_MIC = 4;
 constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2;
-constexpr int BASE_W = 760, BASE_H = 560, MIN_W = 640, MIN_H = 480;
+constexpr int BASE_W = 820, BASE_H = 600, MIN_W = 680, MIN_H = 540;
 // UI watchdog > worst-case teardown: capture Close 2 s + Finalize (8000/2) + remux (8000/2) + 3 s margin.
 constexpr ULONGLONG kWatchdogMs = 2000 + 8000 / 2 + 8000 / 2 + 3000;
-constexpr int TB_H = 40, PAD = 16, GAP = 16, PANEL_W = 280, HK_H = 72, BAR_H = 56;
+constexpr int TB_H = 40, PAD = 16, GAP = 12, PANEL_W = 280, HK_H = 48, BAR_H = 56;
 
 struct App {
     HINSTANCE inst{};
@@ -107,8 +108,10 @@ struct App {
     int hover = H_NONE, pressed = H_NONE;
     int capturing = -1;         // hotkey field being edited (0 start/stop, 1 pause), -1 none
     UINT liveMods = 0;
-    std::wstring hkMsg[2];
-    COLORREF hkMsgColor[2]{};
+    std::wstring hkMsg[3];
+    COLORREF hkMsgColor[3]{};
+    std::vector<AudioDevice> mics;  // index+2 in the Microphone dropdown (0 Off, 1 Default)
+    bool micMuted = false;
     std::wstring status;
     COLORREF statusColor = C_TEXT2;
     int openDrop = H_NONE;      // dropdown whose list is open
@@ -193,7 +196,8 @@ void enumGpus() {
 }
 
 // ---------- tray ----------
-void trayUpdate(DWORD msg) {
+void trayUpdate(DWORD) {}  // no tray icon: the window (taskbar) is the only surface
+[[maybe_unused]] static void trayUpdateUnused(DWORD msg) {
     NOTIFYICONDATAW n{sizeof n};
     n.hWnd = g.hwnd; n.uID = 1; n.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE; n.uCallbackMessage = WM_TRAY;
     n.hIcon = g.rec.running() ? g.icoTrayRec : g.icoTray;
@@ -204,27 +208,27 @@ void trayUpdate(DWORD msg) {
 }
 
 // ---------- hotkeys ----------
-void unregisterAll() { UnregisterHotKey(g.hwnd, HK_TOGGLE); UnregisterHotKey(g.hwnd, HK_FOLDER); UnregisterHotKey(g.hwnd, HK_PAUSE); }
+void unregisterAll() { UnregisterHotKey(g.hwnd, HK_TOGGLE); UnregisterHotKey(g.hwnd, HK_FOLDER); UnregisterHotKey(g.hwnd, HK_PAUSE); UnregisterHotKey(g.hwnd, HK_MIC); }
 void registerAll() {
     if (g.rec.running()) return;  // the live session keeps its hotkeys; never unregister mid-recording
     unregisterAll();
-    Hotkey* keys[2] = {&g.s.toggleRecord, &g.s.pauseToggle};
-    const int ids[2] = {HK_TOGGLE, HK_PAUSE};
-    for (int i = 0; i < 2; ++i) {
+    Hotkey* keys[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
+    const int ids[3] = {HK_TOGGLE, HK_PAUSE, HK_MIC};
+    for (int i = 0; i < 3; ++i) {
         const Hotkey& k = *keys[i];
         g.hkMsg[i].clear();
-        if (k.empty()) { g.hkMsg[i] = L"Not set"; g.hkMsgColor[i] = C_MUTED; continue; }
+        if (k.empty()) { g.hkMsgColor[i] = C_MUTED; continue; }
         Issue is = validate(k);
         if (is.severity == Severity::Error) { g.hkMsg[i] = W(is.message); g.hkMsgColor[i] = C_ERR; continue; }
-        if (i == 1 && k == g.s.toggleRecord) { g.hkMsg[i] = L"Same combo as Start / Stop"; g.hkMsgColor[i] = C_ERR; continue; }
+        if ((i == 1 && k == g.s.toggleRecord) || (i == 2 && (k == g.s.toggleRecord || k == g.s.pauseToggle))) { g.hkMsg[i] = L"Same combo as Start / Stop"; g.hkMsgColor[i] = C_ERR; continue; }
         if (!RegisterHotKey(g.hwnd, ids[i], k.mods | MOD_NOREPEAT, k.vk)) {
             g.hkMsg[i] = L"In use by another app"; g.hkMsgColor[i] = C_ERR; continue;
         }
         if (is.severity == Severity::Warning) { g.hkMsg[i] = W(is.message); g.hkMsgColor[i] = C_WARN; }
-        else { g.hkMsg[i] = L"Works in games"; g.hkMsgColor[i] = C_OK; }
+        else g.hkMsgColor[i] = C_OK;
     }
     // Open-folder combo has no field in the new layout but stays active if set and not clashing.
-    if (!g.s.openFolder.empty() && !(g.s.openFolder == g.s.toggleRecord) && !(g.s.openFolder == g.s.pauseToggle) &&
+    if (!g.s.openFolder.empty() && !(g.s.openFolder == g.s.toggleRecord) && !(g.s.openFolder == g.s.pauseToggle) && !(g.s.openFolder == g.s.micMute) &&
         validate(g.s.openFolder).severity != Severity::Error)
         RegisterHotKey(g.hwnd, HK_FOLDER, g.s.openFolder.mods | MOD_NOREPEAT, g.s.openFolder.vk);
 }
@@ -288,7 +292,7 @@ void forceQuit() {
     g.quitting = true;
     g.rec.stop();
     setStatus(L"Closing\u2026", C_TEXT2);
-    ULONGLONG end = GetTickCount64() + 5000;
+    ULONGLONG end = GetTickCount64() + kWatchdogMs;  // let the file finish saving before exit
     while (g.rec.running() && GetTickCount64() < end) {
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
@@ -314,10 +318,12 @@ void startRecording() {
     o.fps = g.s.fps; o.quality = g.s.quality; o.encoder = g.s.encoder; o.container = g.s.container;
     o.captureCursor = g.s.captureCursor; o.scale = g.s.scale; o.gpuIndex = g.s.gpuIndex; o.bitrateCap = g.s.bitrateCap;
     o.notify = g.hwnd;
+    o.systemAudio = g.s.systemAudio; o.mic = g.s.micEnabled; o.micId = W(g.s.micDevice);
     o.outputPath = dir + L"\\" + name + W(extension(g.s.container));
     registerAll();
     if (!g.rec.start(o)) { setStatus(L"Already recording", C_WARN); return; }
     g.gprev.setRecording(true);
+    g.rec.setMicMuted(g.micMuted);
     playClick();
     SetTimer(g.hwnd, TIMER_TICK, 250, nullptr);
     setStatus(L"Recording\u2026", C_ACCENT_B);
@@ -342,6 +348,12 @@ void togglePause() {
         else setStatus(L"Recording\u2026", C_ACCENT_B);
         trayUpdate(NIM_MODIFY);
     }
+}
+void toggleMic() {
+    g.micMuted = !g.micMuted;
+    g.rec.setMicMuted(g.micMuted);
+    if (!g.s.micEnabled) setStatus(L"Microphone is off (choose one in Microphone)", C_TEXT2);
+    else setStatus(g.micMuted ? L"Mic muted" : L"Mic on", g.micMuted ? C_WARN : C_OK);
 }
 void openFolder() {
     std::wstring d = outputDir();
@@ -430,6 +442,7 @@ int ddCount(int id) {
     switch (id) {
         case H_DD_FPS: return 3; case H_DD_QUAL: return 4; case H_DD_ENC: return 5;
         case H_DD_GPU: return 1 + (int)g.gpus.size(); case H_DD_RES: return 3; case H_DD_CONT: return 3;
+        case H_DD_SYS: return 2; case H_DD_MIC: return 2 + (int)g.mics.size();
     }
     return 0;
 }
@@ -438,6 +451,8 @@ std::wstring ddItem(int id, int i) {
         case H_DD_FPS: return kFpsL[i]; case H_DD_QUAL: return kQualL[i]; case H_DD_ENC: return kEncL[i];
         case H_DD_GPU: return i == 0 ? std::wstring(L"Auto (monitor's GPU)") : g.gpus[i - 1];
         case H_DD_RES: return kResL[i]; case H_DD_CONT: return kContL[i];
+        case H_DD_SYS: return i ? L"On" : L"Off";
+        case H_DD_MIC: return i == 0 ? std::wstring(L"Off") : i == 1 ? std::wstring(L"Default") : g.mics[i - 2].name;
     }
     return L"";
 }
@@ -447,6 +462,12 @@ int ddSel(int id) {
         case H_DD_QUAL: return (int)g.s.quality; case H_DD_ENC: return (int)g.s.encoder;
         case H_DD_GPU: return g.s.gpuIndex < 0 || g.s.gpuIndex >= (int)g.gpus.size() ? 0 : g.s.gpuIndex + 1;
         case H_DD_RES: return (int)g.s.scale; case H_DD_CONT: return (int)g.s.container;
+        case H_DD_SYS: return g.s.systemAudio ? 1 : 0;
+        case H_DD_MIC: {
+            if (!g.s.micEnabled) return 0;
+            for (size_t k = 0; k < g.mics.size(); ++k) if (U(g.mics[k].id) == g.s.micDevice) return (int)k + 2;
+            return 1;
+        }
     }
     return 0;
 }
@@ -455,13 +476,15 @@ void ddSet(int id, int i) {
         case H_DD_FPS: g.s.fps = kFps[i]; break; case H_DD_QUAL: g.s.quality = kQual[i]; break;
         case H_DD_ENC: g.s.encoder = kEnc[i]; break; case H_DD_GPU: g.s.gpuIndex = i - 1; break;
         case H_DD_RES: g.s.scale = kRes[i]; break; case H_DD_CONT: g.s.container = kCont[i]; break;
+        case H_DD_SYS: g.s.systemAudio = i == 1; break;
+        case H_DD_MIC: g.s.micEnabled = i > 0; g.s.micDevice = i >= 2 ? U(g.mics[i - 2].id) : std::string(); break;
     }
     save();
 }
 bool ddLocked(int id) { return g.rec.running() && id != H_NONE; }  // settings lock while a session is live
 
 // ---------- keyboard focus (Tab / Shift+Tab, arrows, Enter/Space) ----------
-const int kFocusOrder[] = {H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT, H_PATH, H_BROWSE, H_HK0, H_HK1, H_PAUSE, H_RECORD};
+const int kFocusOrder[] = {H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT, H_DD_SYS, H_DD_MIC, H_PATH, H_BROWSE, H_HK0, H_HK1, H_HK2, H_MIC, H_PAUSE, H_RECORD};
 int g_focus = H_NONE;
 int g_dropKb = -1;      // keyboard-highlighted item in the open dropdown  // keyboard focus; shown as a brighter border once Tab is used
 bool kbFocused(int id) { return g_focus == id; }
@@ -509,8 +532,20 @@ void paintTitle(HDC dc, const Layout& L) {
     fill(dc, L.title, C_BG);
     DrawIconEx(dc, S(12), S(12), g.icoSmall, S(16), S(16), 0, nullptr, DI_NORMAL);
     text(dc, L"Cast Recorder", RECT{S(36), 0, L.title.right - S(100), L.title.bottom}, g.fTitle, C_TEXT);
-    RECT rmin{L.title.right - S(92), 0, L.title.right - S(46), S(TB_H)}, rclose{L.title.right - S(46), 0, L.title.right, S(TB_H)};
+    RECT rmin{L.title.right - S(138), 0, L.title.right - S(92), S(TB_H)}, rmax{L.title.right - S(92), 0, L.title.right - S(46), S(TB_H)},
+         rclose{L.title.right - S(46), 0, L.title.right, S(TB_H)};
     if (g.hover == H_MIN) fill(dc, rmin, C_TB_HOVER);
+    if (g.hover == H_MAX) fill(dc, rmax, C_TB_HOVER);
+    {
+        int ax = (rmax.left + rmax.right) / 2, ay = (rmax.top + rmax.bottom) / 2, k2 = S(5);
+        bool zoomed = g.hwnd && IsZoomed(g.hwnd);
+        if (zoomed) {
+            ring(dc, RECT{ax - k2 + S(2), ay - k2 - S(1), ax + k2 + S(2), ay + k2 - S(1)}, C_TEXT2, 1, 1);
+            fill(dc, RECT{ax - k2, ay - k2 + S(1), ax + k2, ay + k2 + S(1)}, g.hover == H_MAX ? C_TB_HOVER : C_BG);
+        }
+        ring(dc, RECT{ax - k2, ay - k2 + (zoomed ? S(1) : 0), ax + k2, ay + k2 + (zoomed ? S(1) : 0)}, C_TEXT, 1, 1);
+        addRegion(rmax, H_MAX);
+    }
     if (g.hover == H_CLOSE) fill(dc, rclose, C_CLOSE_H);
     int mx = (rmin.left + rmin.right) / 2, my = (rmin.top + rmin.bottom) / 2;
     line(dc, mx - S(5), my, mx + S(5), my, C_TEXT, 1);
@@ -581,10 +616,10 @@ void paintPreview(HDC dc, const Layout& L) {
 void paintPanel(HDC dc, const Layout& L) {
     round(dc, L.panel, C_SURFACE, C_BORDER_S, 8);
     const int x = L.panel.left + S(16), right = L.panel.right - S(16);
-    const int labelW = S(88), ctrlX = x + labelW, rowH = S(32);
+    const int labelW = S(96), ctrlX = x + labelW, rowH = S(32);
     int avail = L.panel.bottom - L.panel.top - S(32);
-    // 7 control rows + 2 section headers; compress the row gap on short windows
-    int gapY = (avail - 7 * rowH - 2 * S(18)) / 8;
+    // 9 control rows; compress the row gap on short windows
+    int gapY = (avail - 9 * rowH) / 9;
     if (gapY > S(12)) gapY = S(12);
     if (gapY < S(4)) gapY = S(4);
     int y = L.panel.top + S(16);
@@ -594,14 +629,15 @@ void paintPanel(HDC dc, const Layout& L) {
         dropdown(dc, RECT{ctrlX, y, right, y + rowH}, id);
         y += rowH + gapY;
     };
-    section(L"CAPTURE");
+    (void)section;
     row(L"FPS", H_DD_FPS);
     row(L"Quality", H_DD_QUAL);
     row(L"Encoder", H_DD_ENC);
     row(L"GPU", H_DD_GPU);
-    section(L"OUTPUT");
     row(L"Resolution", H_DD_RES);
     row(L"Container", H_DD_CONT);
+    row(L"System audio", H_DD_SYS);
+    row(L"Microphone", H_DD_MIC);
     // Save folder: full-width path field (folder glyph + path) + Browse; the label column would clip it at 96 DPI.
     RECT br{right - S(80), y, right, y + rowH};
     RECT pf{x, y, br.left - S(8), y + rowH};
@@ -621,27 +657,28 @@ void paintPanel(HDC dc, const Layout& L) {
 
 void paintHotkeys(HDC dc, const Layout& L) {
     round(dc, L.hk, C_SURFACE, C_BORDER_S, 8);
-    const wchar_t* labels[2] = {L"Start / Stop", L"Pause"};
-    const Hotkey* hks[2] = {&g.s.toggleRecord, &g.s.pauseToggle};
-    int colW = (L.hk.right - L.hk.left - S(32) - S(24)) / 2;
-    for (int i = 0; i < 2; ++i) {
-        int cx = L.hk.left + S(16) + i * (colW + S(24));
-        int midY = (L.hk.top + L.hk.bottom) / 2;
-        text(dc, labels[i], RECT{cx, L.hk.top + S(12), cx + colW, L.hk.top + S(28)}, g.fLabel, C_TEXT2);
-        RECT f{cx, midY - S(4), cx + S(160), midY + S(26)};
-        if (f.right > cx + colW) f.right = cx + colW;
+    const wchar_t* labels[3] = {L"Start / Stop", L"Pause", L"Mic mute"};
+    const Hotkey* hks[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
+    const int inner = L.hk.right - L.hk.left - S(32), colGap = S(16);
+    int colW = (inner - 2 * colGap) / 3;
+    int y0 = L.hk.top + S(8), y1 = L.hk.bottom - S(8);
+    for (int i = 0; i < 3; ++i) {
+        int cx = L.hk.left + S(16) + i * (colW + colGap);
+        int lw = textW(dc, labels[i], g.fLabel) + S(10);
+        text(dc, labels[i], RECT{cx, y0, cx + lw, y1}, g.fLabel, C_TEXT2);
+        RECT f{cx + lw, y0, cx + colW, y1};
         bool lockedHk = g.rec.running();
         bool focus = g.capturing == i, hv = g.hover == H_HK0 + i && !lockedHk;
-        round(dc, f, focus ? C_INPUT_H : C_INPUT, focus ? C_ACCENT : (kbFocused(H_HK0 + i) ? C_BORDER_STRONG : hv ? C_BORDER_STRONG : C_BORDER), 6);
+        COLORREF bc = focus ? C_ACCENT : g.hkMsgColor[i] == C_ERR ? C_ERR : g.hkMsgColor[i] == C_WARN ? C_WARN
+                    : (kbFocused(H_HK0 + i) || hv) ? C_BORDER_STRONG : C_BORDER;
+        round(dc, f, focus ? C_INPUT_H : C_INPUT, bc, 6);
         std::wstring t; COLORREF tc = C_TEXT;
         if (focus) { t = g.liveMods ? modsText(g.liveMods) + L"\u2026" : L"Press a key\u2026"; tc = g.liveMods ? C_TEXT : C_MUTED; }
-        else if (hks[i]->empty()) { t = L"Click to set"; tc = C_MUTED; }
+        else if (hks[i]->empty()) { t = L"Not set"; tc = C_MUTED; }
         else t = W(format(*hks[i]));
         if (lockedHk && !focus) tc = C_DISABLED;
         text(dc, t, f, g.fMono, tc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         addRegion(f, H_HK0 + i);
-        std::wstring m = focus ? L"Esc cancels \u00b7 Backspace clears" : g.hkMsg[i];
-        text(dc, m, RECT{f.right + S(10), f.top, cx + colW, f.bottom}, g.fSmall, focus ? C_MUTED : g.hkMsgColor[i], DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 }
 
@@ -662,8 +699,25 @@ void paintBar(HDC dc, const Layout& L) {
         text(dc, tm, RECT{x, y0, x + S(100), y1}, g.fTimer, C_TEXT);
     } else {
         std::wstring s = finishing ? L"Finishing file\u2026" : (g.status.empty() ? L"Ready" : g.status);
-        text(dc, s, RECT{x, y0, L.pause.left - S(12), y1}, g.fLabel, finishing ? C_TEXT2 : g.statusColor,
+        text(dc, s, RECT{x, y0, L.record.left - S(64), y1}, g.fLabel, finishing ? C_TEXT2 : g.statusColor,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    // Mic mute toggle (always visible): red with a slash when muted, dim when the mic is off.
+    {
+        RECT m{L.pause.left - S(12) - S(40), L.record.top, L.pause.left - S(12), L.record.bottom};
+        if (!active) { m.right = L.record.left - S(12); m.left = m.right - S(40); }
+        bool hvm = g.hover == H_MIC, muted = g.micMuted, on = g.s.micEnabled;
+        round(dc, m, muted ? hex(0x3A1418) : hvm ? C_INPUT_H : C_ELEV, muted ? C_ACCENT : kbFocused(H_MIC) ? C_BORDER_STRONG : C_BORDER, 10);
+        COLORREF ic = !on ? C_DISABLED : muted ? C_ACCENT_B : C_TEXT;
+        int cx = (m.left + m.right) / 2, cy = (m.top + m.bottom) / 2;
+        round(dc, RECT{cx - S(4), cy - S(10), cx + S(4), cy + S(3)}, ic, ic, 8);
+        line(dc, cx - S(7), cy - S(1), cx - S(7), cy + S(1), ic, S(2));
+        line(dc, cx + S(7), cy - S(1), cx + S(7), cy + S(1), ic, S(2));
+        line(dc, cx - S(7), cy + S(1), cx, cy + S(7), ic, S(2));
+        line(dc, cx + S(7), cy + S(1), cx, cy + S(7), ic, S(2));
+        line(dc, cx, cy + S(7), cx, cy + S(10), ic, S(2));
+        if (muted || !on) line(dc, cx - S(9), cy - S(10), cx + S(9), cy + S(10), muted ? C_ACCENT_B : C_DISABLED, S(2));
+        addRegion(m, H_MIC);
     }
     // Pause / Resume (only while a session is active)
     if (active) {
@@ -759,7 +813,7 @@ UINT currentMods() {
 
 bool hotkeyKey(UINT vk, bool down) {
     if (g.capturing < 0) return false;
-    Hotkey* dst = g.capturing == 0 ? &g.s.toggleRecord : &g.s.pauseToggle;
+    Hotkey* dst = g.capturing == 0 ? &g.s.toggleRecord : g.capturing == 1 ? &g.s.pauseToggle : &g.s.micMute;
     UINT mods = currentMods();
     if (isModifierKey(vk)) { g.liveMods = mods; InvalidateRect(g.hwnd, nullptr, FALSE); return true; }
     if (!down && vk != VK_SNAPSHOT) return true;
@@ -767,14 +821,16 @@ bool hotkeyKey(UINT vk, bool down) {
     if (mods == 0 && (vk == VK_BACK || vk == VK_DELETE)) { *dst = Hotkey{}; save(); endCapture(); return true; }
     Hotkey hk{mods, vk};
     int idx = g.capturing;
-    if (keyName(vk).empty()) { g.hkMsg[idx] = L"Key not supported"; g.hkMsgColor[idx] = C_ERR; return true; }
+    if (keyName(vk).empty()) { setStatus(L"Key not supported", C_ERR); return true; }
     Issue is = validate(hk);
-    const Hotkey& other = idx == 0 ? g.s.pauseToggle : g.s.toggleRecord;
-    if (is.severity == Severity::Error || hk == other) {
+    const Hotkey* all[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
+    const wchar_t* names[3] = {L"Start / Stop", L"Pause", L"Mic mute"};
+    int clash = -1;
+    for (int k = 0; k < 3; ++k) if (k != idx && hk == *all[k]) clash = k;
+    if (is.severity == Severity::Error || clash >= 0) {
         g.capturing = -1; g.liveMods = 0;
         registerAll();
-        g.hkMsg[idx] = W(format(hk)) + (hk == other ? std::wstring(idx == 0 ? L" is used by Pause" : L" is used by Start / Stop") : L": " + W(is.message));
-        g.hkMsgColor[idx] = C_ERR;
+        setStatus(W(format(hk)) + (clash >= 0 ? std::wstring(L" is used by ") + names[clash] : L": " + W(is.message)), C_ERR);
         InvalidateRect(g.hwnd, nullptr, FALSE);
         return true;
     }
@@ -787,7 +843,7 @@ bool hotkeyKey(UINT vk, bool down) {
 }
 
 void click(int id) {
-    if (id != H_HK0 && id != H_HK1 && g.capturing >= 0) endCapture();
+    if (id != H_HK0 && id != H_HK1 && id != H_HK2 && g.capturing >= 0) endCapture();
     if (g.openDrop != H_NONE) {
         int dd = g.openDrop;
         g.openDrop = H_NONE;
@@ -797,13 +853,15 @@ void click(int id) {
         if (id >= H_ITEM0 || id == dd) return;  // item picked, padding, or toggled closed
     }
     if (id == H_MIN) ShowWindow(g.hwnd, SW_MINIMIZE);
-    else if (id == H_CLOSE) ShowWindow(g.hwnd, SW_HIDE);  // keeps running in the tray
+    else if (id == H_CLOSE) forceQuit();  // exits; a live recording is stopped and saved first
+    else if (id == H_MAX) ShowWindow(g.hwnd, IsZoomed(g.hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+    else if (id == H_MIC) toggleMic();
     else if (id == H_RECORD) toggleRecording();
     else if (id == H_PAUSE) togglePause();
-    else if (id >= H_DD_FPS && id <= H_DD_CONT) {
+    else if (id >= H_DD_FPS && id <= H_DD_MIC) {
         if (ddLocked(id)) setStatus(L"Stop recording to change settings", C_TEXT2);
-        else { if (id == H_DD_GPU) enumGpus(); g.openDrop = id; }
-    } else if (id == H_HK0 || id == H_HK1) {
+        else { if (id == H_DD_GPU) enumGpus(); if (id == H_DD_MIC) g.mics = listMicrophones(); g.openDrop = id; }
+    } else if (id == H_HK0 || id == H_HK1 || id == H_HK2) {
         if (g.rec.running()) { setStatus(L"Stop recording to change hotkeys", C_TEXT2); InvalidateRect(g.hwnd, nullptr, FALSE); return; }
         g.capturing = id - H_HK0;
         g.liveMods = 0;
@@ -853,6 +911,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g.taskbarCreated && g.taskbarCreated) { trayUpdate(NIM_ADD); return 0; }
     switch (msg) {
     case WM_NCCALCSIZE:
+        if (wp && IsZoomed(h)) {  // maximized borderless: keep the client inside the monitor work area
+            auto* p = (NCCALCSIZE_PARAMS*)lp;
+            int fx = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+            int fy = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+            p->rgrc[0].left += fx; p->rgrc[0].right -= fx; p->rgrc[0].top += fy; p->rgrc[0].bottom -= fy;
+            return 0;
+        }
         if (wp) return 0;  // whole window is client area (borderless)
         break;
     case WM_NCHITTEST: {
@@ -860,7 +925,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ScreenToClient(h, &p);
         RECT rc; GetClientRect(h, &rc);
         if (p.x >= rc.right - S(16) && p.y >= rc.bottom - S(16)) return HTBOTTOMRIGHT;  // invisible resize grip
-        if (p.y < S(TB_H) && hitTest(p) == H_NONE) return HTCAPTION;
+        if (p.y < S(TB_H) && hitTest(p) == H_NONE) return HTCAPTION;  // double-click maximizes
         return HTCLIENT;
     }
     case WM_GETMINMAXINFO: {
@@ -946,7 +1011,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == VK_TAB) { moveFocus(shift ? -1 : 1); InvalidateRect(h, nullptr, FALSE); return 0; }
-            if (g_focus >= H_DD_FPS && g_focus <= H_DD_CONT && (wp == VK_UP || wp == VK_DOWN) && !ddLocked(g_focus)) {
+            if (g_focus >= H_DD_FPS && g_focus <= H_DD_MIC && (wp == VK_UP || wp == VK_DOWN) && !ddLocked(g_focus)) {
                 int n = ddCount(g_focus), i = ddSel(g_focus) + (wp == VK_DOWN ? 1 : -1);
                 if (i >= 0 && i < n) ddSet(g_focus, i);
                 InvalidateRect(h, nullptr, FALSE);
@@ -954,7 +1019,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if ((wp == VK_LEFT || wp == VK_RIGHT) && g_focus != H_NONE) { moveFocus(wp == VK_RIGHT ? 1 : -1); InvalidateRect(h, nullptr, FALSE); return 0; }
             if ((wp == VK_RETURN || wp == VK_SPACE) && g_focus != H_NONE) {
-                if (g_focus >= H_DD_FPS && g_focus <= H_DD_CONT) g_dropKb = ddSel(g_focus);
+                if (g_focus >= H_DD_FPS && g_focus <= H_DD_MIC) g_dropKb = ddSel(g_focus);
                 click(g_focus);
                 return 0;
             }
@@ -974,6 +1039,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_HOTKEY:
         if (wp == HK_TOGGLE) toggleRecording();
+        else if (wp == HK_MIC) toggleMic();
         else if (wp == HK_PAUSE) togglePause();
         else if (wp == HK_FOLDER) openFolder();
         return 0;
@@ -1029,7 +1095,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         showWindow();
         return 0;
     case WM_CLOSE:
-        ShowWindow(h, SW_HIDE);
+        if (!g.quitting) forceQuit();
         return 0;
     case WM_DESTROY:
         g.gprev.stop();
@@ -1060,8 +1126,8 @@ int renderUi(const std::wstring& path, const std::wstring& state, int dpi) {
     g.hwnd = nullptr;
     g.status = state == L"recording" ? L"Recording…" : state == L"paused" ? L"Paused" : L"Ready";
     g.statusColor = state == L"recording" ? C_ACCENT_B : state == L"paused" ? C_WARN : C_TEXT2;
-    g.hkMsg[0] = L"Works in games"; g.hkMsgColor[0] = C_OK;
-    g.hkMsg[1] = L"Works in games"; g.hkMsgColor[1] = C_OK;
+    for (int i = 0; i < 3; ++i) g.hkMsgColor[i] = C_OK;
+    g.s.micEnabled = true;
     paint(mem, rc);
     GdiFlush();
     // write BMP
@@ -1122,6 +1188,10 @@ int runCli(int argc, wchar_t** argv) {
         "  --out FILE           output file (its folder is created if needed)\n"
         "  --log FILE           also write the result summary to FILE\n"
         "  --allow-synthetic    use a test pattern if screen capture is unavailable (CI)\n"
+        "  --pattern            record the static test pattern instead of the screen (CI quality/fps)\n"
+        "  --render-pattern FILE.bmp  write the test pattern reference image\n"
+        "  --system-audio / --mic     record system audio / the default microphone\n"
+        "  --test-tone          add a synthetic 440 Hz audio source (CI)\n"
         "  --pause-at S / --resume-at S  pause and resume at S seconds into the recording\n"
         "  --render-ui FILE.bmp  paint the settings window to a BMP (docs/CI)\n"
         "  --ui-state idle|dropdown\n"
@@ -1137,6 +1207,8 @@ int runCli(int argc, wchar_t** argv) {
     loadFile(U(settingsPath()), s);
     o.fps = s.fps; o.quality = s.quality; o.encoder = s.encoder; o.container = s.container; o.captureCursor = s.captureCursor;
     o.scale = s.scale; o.gpuIndex = s.gpuIndex; o.bitrateCap = s.bitrateCap;
+    o.systemAudio = false;  // CLI: audio only when asked for
+    std::wstring patternPath;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--help" || a == L"-h" || a == L"/?") { emit(usage, stdout); return 0; }
@@ -1147,10 +1219,14 @@ int runCli(int argc, wchar_t** argv) {
         };
         std::string v;
         if (a == L"--allow-synthetic") { o.allowSynthetic = true; continue; }
+        if (a == L"--pattern") { o.forcePattern = true; continue; }
+        if (a == L"--system-audio") { o.systemAudio = true; continue; }
+        if (a == L"--mic") { o.mic = true; continue; }
+        if (a == L"--test-tone") { o.testTone = true; continue; }
         if (a == L"--minimized") continue;
         if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality"
             && a != L"--out" && a != L"--log" && a != L"--scale" && a != L"--gpu" && a != L"--bitrate-cap"
-            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi")
+            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern")
             return bad("unknown option " + U(a));
         if (!value(v)) return bad(U(a) + " needs a value");
         if (a == L"--record") {
@@ -1187,6 +1263,9 @@ int runCli(int argc, wchar_t** argv) {
             char* end = nullptr; double d = strtod(v.c_str(), &end);
             if (v.empty() || !end || *end || !(d >= 0) || d > 86400) return bad(U(a) + " must be seconds 0..86400");
             (a == L"--pause-at" ? pauseAt : resumeAt) = d;
+        } else if (a == L"--render-pattern") {
+            if (v.empty()) return bad("--render-pattern needs a .bmp path");
+            patternPath = W(v);
         } else if (a == L"--render-ui") {
             if (v.empty()) return bad("--render-ui needs a .bmp path");
             renderPath = W(v);
@@ -1201,6 +1280,18 @@ int runCli(int argc, wchar_t** argv) {
             if (v.empty()) return bad("--out needs a file name");
             o.outputPath = W(v);
         }
+    }
+    if (!patternPath.empty()) {
+        const unsigned pw = 1280, ph = 720;
+        std::vector<uint32_t> px; testPattern(px, pw, ph);
+        BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
+        ih.biSize = sizeof ih; ih.biWidth = pw; ih.biHeight = -(LONG)ph; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;
+        fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih; fh.bfSize = fh.bfOffBits + pw * ph * 4;
+        FILE* f = _wfopen(patternPath.c_str(), L"wb");
+        bool ok = f && fwrite(&fh, sizeof fh, 1, f) == 1 && fwrite(&ih, sizeof ih, 1, f) == 1 && fwrite(px.data(), 4, px.size(), f) == px.size();
+        if (f) fclose(f);
+        emit(ok ? "ok=1 render-pattern\n" : "ok=0 render-pattern\n", stdout);
+        return ok ? 0 : 1;
     }
     if (!renderPath.empty()) {
         g.inst = GetModuleHandleW(nullptr);
@@ -1268,8 +1359,8 @@ int runCli(int argc, wchar_t** argv) {
     }
     char summary[4096];
     snprintf(summary, sizeof summary,
-             "ok=%d frames=%llu duplicated=%llu late=%llu dropped=%llu abandoned=%d\ncapture=%s\nencoder=%s\npath=%s\nfile=%s\nmessage=%s\n",
-             res.ok ? 1 : 0, res.frames, res.duplicated, res.late, res.dropped, res.abandoned ? 1 : 0,
+             "ok=%d frames=%llu duplicated=%llu late=%llu dropped=%llu abandoned=%d\ncapture_fps=%.1f encode_fps=%.1f audio=%d\ncapture=%s\nencoder=%s\npath=%s\nfile=%s\nmessage=%s\n",
+             res.ok ? 1 : 0, res.frames, res.duplicated, res.late, res.dropped, res.abandoned ? 1 : 0, res.captureFps, res.encodeFps, res.hasAudio ? 1 : 0,
              U(res.captureUsed).c_str(), U(res.encoderUsed).c_str(), U(res.pathLog).c_str(),
              U(res.file).c_str(), U(res.message).c_str());
     emit(std::string(summary) + extra + "encoder_log:\n" + U(res.encoderLog), stdout);
@@ -1339,15 +1430,14 @@ if (wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i
     DwmExtendFrameIntoClientArea(g.hwnd, &m);  // keeps the DWM drop shadow on a borderless window
 
     g.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    trayUpdate(NIM_ADD);
     registerAll();
     if (g.s.hotkeysMigrated) {  // one-time notice; saving writes v2 so it won't show again
         g.s.hotkeysMigrated = false;
         save();
         setStatus(L"Hotkeys changed to Ctrl+Shift+F9 / Ctrl+Shift+F10 (Alt+F9/F10 clash with NVIDIA). You can change them below.", C_WARN);
     }
-    g.status = L"Settings save automatically \u00b7 closing keeps Cast Recorder in the tray";
-    if (!minimized && !g.s.startMinimized) ShowWindow(g.hwnd, SW_SHOW);
+    g.status = L"Ready";
+    ShowWindow(g.hwnd, (minimized || g.s.startMinimized) ? SW_SHOWMINNOACTIVE : SW_SHOW);
     g.gprev.start(g.hwnd, previewRectNow(), g.s.captureCursor);
     if (!IsWindowVisible(g.hwnd)) g.gprev.setVisible(false);
 

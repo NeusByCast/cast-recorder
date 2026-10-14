@@ -146,7 +146,7 @@ void GpuPreview::run(bool cursor) {
             if (!any || (!got && !resized)) continue;
             // pacing: 60 fps idle, 30 fps while recording (never competes with the encoder)
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            LONGLONG minTicks = freq.QuadPart / (rec ? 30 : 60);
+            LONGLONG minTicks = freq.QuadPart / (rec ? 20 : 60);
             if (last.QuadPart && now.QuadPart - last.QuadPart < minTicks && !resized) {
                 DWORD ms = (DWORD)((minTicks - (now.QuadPart - last.QuadPart)) * 1000 / freq.QuadPart);
                 if (ms) Sleep(ms);

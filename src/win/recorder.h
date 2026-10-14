@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstdint>
 #include "../core/settings.h"
 #include "../core/fsm.h"
 #include "../core/handoff.h"
@@ -21,6 +22,11 @@ struct RecordOptions {
     std::wstring outputPath;
     bool captureCursor = true;
     bool allowSynthetic = false;
+    bool forcePattern = false;       // CI: static test pattern instead of the screen (quality / fps checks)
+    bool systemAudio = true;         // WASAPI loopback of the default output device
+    bool mic = false;
+    std::wstring micId;              // empty = default microphone
+    bool testTone = false;           // CI: synthetic 440 Hz audio source
     HWND notify = nullptr;           // WM_APP_RECORDER_DONE when the recording thread exits
     DWORD finalizeTimeoutMs = 8000;  // hard cap on Finalize (and separately on remux)
 };
@@ -38,6 +44,8 @@ struct RecordResult {
     std::vector<std::wstring> encoderFallbacks;  // hardware encoders that failed the probe / setup
     bool encoderStalled = false;
     std::wstring pathLog;            // adapter / encoder / zero-copy / drops for diagnostics
+    bool hasAudio = false;
+    double captureFps = 0, encodeFps = 0, convertMsAvg = 0, encodeMsAvg = 0;
     unsigned long long frames = 0, duplicated = 0, late = 0, dropped = 0, pauses = 0, convertFailures = 0;
 };
 
@@ -65,6 +73,8 @@ public:
     bool isActive() const { return fsm_.isRecording() || fsm_.isPaused(); }
     RecState state() const { return fsm_.get(); }
     bool started() const { return started_; }
+    void setMicMuted(bool m) { micMuted_ = m; }
+    bool micMuted() const { return micMuted_.load(); }
     bool mfAbandoned() const { return abandon_.poisoned.load(); }
     double elapsedSeconds() const;
     const RecordResult& result() const { return result_; }
@@ -77,7 +87,7 @@ private:
     RecFsm fsm_;
     FinishClaim claim_;
     AbandonLatch& abandon_;        // process-wide: MF is per-process, so one poisoned session poisons all
-    std::atomic<bool> stop_{false}, started_{false};
+    std::atomic<bool> stop_{false}, started_{false}, micMuted_{false};
     std::atomic<int> workers_{0};  // live run() count (incl. detached)
     std::atomic<long long> startQpc_{0};
     std::atomic<long long> pausedQpc_{0};    // QPC when the current pause began (0 = not paused)
@@ -89,6 +99,8 @@ private:
 };
 
 std::wstring describeHardwareEncoders();
+// Static CI test pattern (also written by --render-pattern as the PSNR/SSIM reference).
+void testPattern(std::vector<uint32_t>& px, unsigned w, unsigned h);
 std::wstring findFfmpeg();
 // Test hook: delay before IMFSinkWriter::Finalize (simulates a stuck Finalize). 0 = off.
 void setTestHangFinalizeMs(DWORD ms);

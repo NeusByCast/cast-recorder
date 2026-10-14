@@ -20,11 +20,15 @@ struct WgcCapture::Impl {
     wgc::GraphicsCaptureSession session{nullptr};
     winrt::com_ptr<ID3D11Device> dev;
     UINT w = 0, h = 0;
+    HANDLE arrived = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset; set from FrameArrived
+    winrt::event_token token{};
+    ~Impl() { if (arrived) CloseHandle(arrived); }
 };
 
 WgcCapture::WgcCapture() : p_(std::make_unique<Impl>()) {}
 WgcCapture::~WgcCapture() {
     try {
+        if (p_->pool && p_->token.value) p_->pool.FrameArrived(p_->token);
         if (p_->session) p_->session.Close();
         if (p_->pool) p_->pool.Close();
     } catch (...) {}
@@ -47,7 +51,10 @@ bool WgcCapture::start(ID3D11Device* dev, HMONITOR mon, bool cursor, std::wstrin
         auto d3d = insp.as<wdx::Direct3D11::IDirect3DDevice>();
         auto size = p_->item.Size();
         p_->w = (UINT)size.Width; p_->h = (UINT)size.Height;
-        p_->pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(d3d, wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        p_->pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(d3d, wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 3, size);
+        // Never block in the handler: just signal the recording thread (no 1 ms polling / 15.6 ms Sleep rounding).
+        HANDLE ev = p_->arrived;
+        p_->token = p_->pool.FrameArrived([ev](auto&&, auto&&) { SetEvent(ev); });
         p_->session = p_->pool.CreateCaptureSession(p_->item);
         p_->session.IsCursorCaptureEnabled(cursor);
         if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsBorderRequired")) {
@@ -71,8 +78,9 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
         wgc::Direct3D11CaptureFrame frame{nullptr}, f{nullptr};
         for (;;) {
             while ((f = p_->pool.TryGetNextFrame())) { if (frame) frame.Close(); frame = f; }  // keep newest
-            if (frame || GetTickCount() - start >= timeoutMs) break;
-            Sleep(1);
+            DWORD el = GetTickCount() - start;
+            if (frame || el >= timeoutMs) break;
+            WaitForSingleObject(p_->arrived, timeoutMs - el);
         }
         if (!frame) return true;
         auto cs = frame.ContentSize();

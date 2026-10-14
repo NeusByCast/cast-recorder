@@ -9,6 +9,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <codecapi.h>
 
 namespace cr {
 
@@ -50,6 +51,8 @@ private:
     bool configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log);
     HRESULT processOutput(const OutputFn& out);
     HRESULT deliver(IMFSample* s, const OutputFn& out);
+    std::vector<Microsoft::WRL::ComPtr<IMFSample>> queue_;  // waiting for METransformNeedInput (max 4)
+    HRESULT submitQueued();
     bool sync_ = false;
     bool gotKey_ = false;
     std::vector<BYTE> seqHeader_;
