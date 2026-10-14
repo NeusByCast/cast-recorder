@@ -27,6 +27,7 @@ if(WIN32)
     target_compile_options(cr_core PRIVATE /utf-8)
     target_compile_options(cr_tests PRIVATE /utf-8)
     target_link_libraries(CastRecorder PRIVATE windowsapp)
+    target_link_options(CastRecorder PRIVATE /MANIFEST:NO)  # res/app.manifest is embedded via app.rc
     # Static CRT: no VC++ redistributable needed on the target PC.
     set_property(TARGET CastRecorder cr_core cr_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   else()
