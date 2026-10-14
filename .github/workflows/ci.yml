@@ -92,11 +92,15 @@ jobs:
           if (${{ matrix.fps }} -eq 30) {
             $hangOut = "$PWD\rec\hang.mp4"
             $hangLog = "$PWD\rec\hang.txt"
-            $pH = Start-Process $exe.FullName -ArgumentList "--record 1 --fps 30 --encoder software --allow-synthetic --test-hang-finalize 8000 --out `"$hangOut`" --log `"$hangLog`"" -Wait -PassThru
+            $pH = Start-Process $exe.FullName -ArgumentList "--record 3 --fps 30 --encoder software --allow-synthetic --test-hang-finalize 8000 --out `"$hangOut`" --log `"$hangLog`"" -Wait -PassThru
             if (Test-Path $hangLog) { Get-Content $hangLog } else { throw "hang log missing" }
             if (-not (Select-String -Path $hangLog -Pattern 'abandoned=1' -Quiet)) { throw "expected abandoned=1 on hang-finalize" }
-            if (Test-Path $hangOut) { throw "incomplete hang.mp4 should have been deleted" }
+            # v1.0: recordings are fragmented MP4 -> a stuck Finalize must KEEP what was written, and it must play.
+            if (-not (Test-Path $hangOut) -or (Get-Item $hangOut).Length -eq 0) { throw "hang.mp4 was deleted after a stuck Finalize (must be kept)" }
             if (Test-Path "$hangOut.part.mp4") { throw "leftover hang.part.mp4" }
+            $hf = [int](ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 $hangOut)
+            "hang.mp4 kept: $((Get-Item $hangOut).Length) bytes, $hf decodable frames"
+            if ($hf -lt 30) { throw "kept hang.mp4 has only $hf decodable frames" }
             if (-not (Select-String -Path $hangLog -Pattern '^state=idle' -Quiet)) { throw "UI/recorder did not return to Idle" }
             if (-not (Select-String -Path $hangLog -Pattern '^second_start=refused' -Quiet)) { throw "second start after abandon should be refused" }
             $pR = Start-Process $exe.FullName -ArgumentList "--render-ui `"$PWD\rec\ui-idle.bmp`" --ui-state idle --log `"$PWD\rec\ui.txt`"" -Wait -PassThru
@@ -164,6 +168,11 @@ jobs:
             if ([math]::Abs($vd - $ad) -gt 0.1) { throw "$c audio/video durations differ: $vd vs $ad" }
             if ([math]::Abs($as) -gt 0.05) { throw "$c audio starts at $as s (expected 0)" }
             if (-not (Select-String -Path $log -Pattern 'SetInputType\(NV12\): 0x00000000 ok' -Quiet)) { throw "software encoder did not go through the pass-through MFT writer" }
+            if (-not (Select-String -Path $log -Pattern 'fragmented=1' -Quiet)) { throw "$c was not recorded as fragmented MP4 (crash-safe)" }
+            if ($c -ne 'mp4' -and -not (Select-String -Path $log -Pattern 'post: converted' -Quiet)) { throw "$c: no stream copy from the recorded MP4" }
+            if ($c -eq 'mp4') { $atoms = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($out)); if ($atoms.IndexOf('moof') -lt 0) { throw "smoke mp4 has no moof (not fragmented)" } }
+            $ach = [int](ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 $out)
+            if ($ach -ne 2) { throw "$c audio has $ach channels (stereo is the default)" }
           }
       - name: Quality (SSIM/PSNR vs reference) and achieved fps on the static test pattern
         shell: pwsh
@@ -227,7 +236,7 @@ jobs:
           $j | Format-List
           if ($j.fps -ne 30) { throw "fps not persisted" }
           if ($j.quality -ne 'ultra') { throw "quality not persisted" }
-          if ($j.container -ne 'mp4') { throw "container not persisted" }
+          if ($j.container -ne 'mkv') { throw "container not persisted" }
           if ($j.version -ne 3) { throw "settings version $($j.version) != 3" }
           if ($j.scale -ne '1440p') { throw "resolution not persisted: $($j.scale)" }
           if ($j.autoRemux -ne $false) { throw "autoRemux not persisted" }
@@ -252,7 +261,7 @@ jobs:
           if ($j.noiseGateDb -ne -50) { throw "noiseGateDb not persisted" }
           if ($j.monitoring -ne $true) { throw "monitoring not persisted" }
           if ($j.pushToTalk -ne $true) { throw "pushToTalk not persisted" }
-          if ($j.channels -ne 2) { throw "channels not persisted" }
+          if ($j.channels -ne 1) { throw "channels (mono, non-default) not persisted" }
           $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
           if (-not (Test-Path $applog)) { throw "CastRecorder.log missing" }
           Get-Content $applog | Select-Object -Last 40
@@ -383,7 +392,7 @@ jobs:
           $rs = [double](Select-String -Path "$v\rp.txt" -Pattern 'replay_seconds=([\d.]+)').Matches[0].Groups[1].Value
           $rd = Dur "$v\rp.mp4"
           "replay: reported=$rs s file=$rd s"
-          if ($rs -lt 4.0 -or $rs -gt 7.5) { throw "replay length $rs s not ~5 s (keyframe-aligned)" }
+          if ($rs -lt 4.4 -or $rs -gt 5.6) { throw "replay length $rs s not 5 +-0.5 s (nearest 1 s key frame)" }
           if ([math]::Abs($rd - $rs) -gt 0.35) { throw "replay file $rd s != reported $rs s" }
           Clean "$v\rp.mp4"
           if (-not ((ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$v\rp.mp4") -match 'aac')) { throw "replay has no audio" }
@@ -397,6 +406,69 @@ jobs:
           $rd = Dur "$v\ro-replay.mp4"; "replay-only file: $rd s"
           if ($rd -lt 3.0 -or $rd -gt 5.6) { throw "replay-only length $rd" }
           Clean "$v\ro-replay.mp4"
+          # --- replay RAM cap: 60 s asked, 2 MB allowed -> memory stays under the cap, replay gets shorter
+          $rc = Run "--record 8 --replay 60 --replay-max-mb 2 --save-replay-at 7.5 --encoder software --allow-synthetic --test-tone --out `"$v\cap-main.mp4`" --replay-out `"$v\cap.mp4`"" "$v\cap.txt"
+          $cl = (Select-String -Path "$v\cap.txt" -Pattern 'replay_ok=1 replay_seconds=([\d.]+) replay_buffered=[\d.]+ replay_ram=(\d+) replay_cap=(\d+) replay_capped=(\d)').Matches
+          if (-not $cl) { throw "capped replay failed" }
+          $g = $cl[0].Groups; "replay cap: seconds=$($g[1].Value) ram=$($g[2].Value) cap=$($g[3].Value) capped=$($g[4].Value)"
+          if ([long]$g[2].Value -gt [long]$g[3].Value) { throw "replay buffer exceeds its RAM cap" }
+          if ($g[4].Value -ne '1' -or [double]$g[1].Value -ge 7) { throw "RAM cap did not limit the replay" }
+          Clean "$v\cap.mp4"
+          # --- crash safety: kill the recorder mid-recording; the fragmented MP4 must still play
+          $kp = Start-Process $exe -ArgumentList "--record 12 --encoder software --allow-synthetic --test-tone --out `"$v\killed.mp4`" --log `"$v\killed.txt`"" -PassThru
+          Start-Sleep 6; Stop-Process -Id $kp.Id -Force; Start-Sleep 1
+          if (-not (Test-Path "$v\killed.mp4")) { throw "killed recording left no file" }
+          $kd = [int](ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$v\killed.mp4")
+          "killed after ~6 s: $((Get-Item "$v\killed.mp4").Length) bytes, $kd decodable frames"
+          if ($kd -lt 60) { throw "killed recording keeps only $kd frames (expected >= 2 s)" }
+          # --- post-processing outside the watchdog: GUI, MKV, conversion stalled 20 s (as for a ~5 GB file), then X.
+          # The MP4 must be saved and untouched; the stalled copy must not delete it.
+          $sp = "$env:RUNNER_TEMP\slowpost.json"; New-Item -ItemType Directory "$v\slow" -Force | Out-Null
+          @{version=3; fps=30; encoder="software"; outputDir="$v\slow"; systemAudio=$false; container="mkv"; autoRemux=$false} | ConvertTo-Json | Set-Content $sp
+          $t0 = Get-Date
+          $p = Start-Process $exe -ArgumentList "--selftest-record --settings-file `"$sp`" --test-slow-post 20000" -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "GUI exit hung behind a slow post-process" }
+          $el = ((Get-Date) - $t0).TotalSeconds; "GUI exited after $el s"
+          Get-ChildItem "$v\slow" | Format-Table Name, Length
+          $sm = Get-ChildItem "$v\slow" -Filter *.mp4 | Where-Object { $_.Name -notmatch '\.part\.' } | Select-Object -First 1
+          if (-not $sm) { throw "the saved recording was lost while its MKV conversion was stalled" }
+          Clean $sm.FullName
+          if ($el -gt 30) { throw "exit waited $el s for the background conversion" }
+          $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
+          if (-not (Select-String -Path $applog -Pattern 'still running - the saved file is kept' -Quiet)) { throw "no 'kept' log line for the stalled conversion" }
+          # same, without the stall: the MKV replaces the MP4
+          New-Item -ItemType Directory "$v\fast" -Force | Out-Null
+          @{version=3; fps=30; encoder="software"; outputDir="$v\fast"; systemAudio=$false; container="mkv"; autoRemux=$false} | ConvertTo-Json | Set-Content $sp
+          $p = Start-Process $exe -ArgumentList "--selftest-record --settings-file `"$sp`"" -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "GUI MKV run hung" }
+          Get-ChildItem "$v\fast" | Format-Table Name, Length
+          $mk = Get-ChildItem "$v\fast" -Filter *.mkv | Select-Object -First 1
+          if (-not $mk) { throw "GUI MKV recording: no .mkv after the background conversion" }
+          if ((ffprobe -v error -show_entries format=format_name -of csv=p=0 $mk.FullName) -notmatch 'matroska') { throw "not MKV" }
+          if (Get-ChildItem "$v\fast" -Filter *.mp4) { throw "the MP4 was not removed after a good MKV conversion" }
+          Clean $mk.FullName
+          # --- large file (~5 GB): remux MKV -> MP4 with the default engine (Media Foundation), no timeout, source kept
+          $big = "C:\castrec-big"; New-Item -ItemType Directory $big -Force | Out-Null
+          & ffmpeg -hide_banner -v error -f lavfi -i "testsrc2=size=1920x1080:rate=30,noise=alls=30:allf=t" -f lavfi -i "sine=f=440:r=48000" -t 10 -c:v libx264 -preset ultrafast -pix_fmt yuv420p -profile:v high -b:v 200M -maxrate 200M -bufsize 400M -g 30 -c:a aac -shortest -y "$big\seed.mkv"
+          $seed = (Get-Item "$big\seed.mkv").Length; $loops = [math]::Ceiling(5.0e9 / $seed) - 1
+          "seed $([math]::Round($seed/1MB)) MB, looping x$($loops + 1)"
+          & ffmpeg -hide_banner -v error -stream_loop $loops -i "$big\seed.mkv" -c copy -y "$big\big.mkv"
+          $bs = (Get-Item "$big\big.mkv").Length; "big.mkv: $([math]::Round($bs/1GB, 2)) GB"
+          if ($bs -lt 4.5e9) { throw "could not build the ~5 GB test file" }
+          Get-PSDrive C | Format-Table Name, Used, Free
+          Remove-Item "$big\seed.mkv"
+          $t0 = Get-Date
+          $rc = Run "--remux `"$big\big.mkv`" `"$big\big.mp4`"" "$v\bigremux.txt"
+          $el = ((Get-Date) - $t0).TotalSeconds
+          if ($rc -ne 0) { Get-Content "$v\bigremux.txt"; throw "5 GB remux failed" }
+          $ms = (Get-Item "$big\big.mp4").Length
+          "5 GB remux (MF): $([math]::Round($el)) s, mp4 $([math]::Round($ms/1GB, 2)) GB"
+          if (-not (Test-Path "$big\big.mkv")) { throw "the source MKV was deleted" }
+          $d1 = Dur "$big\big.mkv"; $d2 = Dur "$big\big.mp4"; "durations mkv=$d1 mp4=$d2"
+          if ([math]::Abs($d1 - $d2) -gt 0.5) { throw "5 GB remux duration differs" }
+          & ffmpeg -hide_banner -v error -sseof -3 -i "$big\big.mp4" -f null - 2>&1 | Tee-Object -Variable te
+          if ($te) { throw "tail of the 5 GB MP4 does not decode" }
+          Remove-Item $big -Recurse -Force
           # --- remux MKV -> MP4 without re-encoding, both engines
           $rc = Run "--record 3 --container mkv --encoder software --allow-synthetic --test-tone --out `"$v\rm.mkv`"" "$v\rm.txt"
           if ((ffprobe -v error -show_entries format=format_name -of csv=p=0 "$v\rm.mkv") -notmatch 'matroska') { throw "rm.mkv is not MKV" }
@@ -496,7 +568,7 @@ jobs:
           $j = Get-Content "$v\hk-settings.json" -Raw | ConvertFrom-Json
           if ($j.hotkeySaveReplay -ne 'Ctrl+Alt+F7' -or $j.hotkeyScreenshot -ne 'Ctrl+Alt+F6' -or $j.hotkeyToggleRecord -ne 'Ctrl+Alt+F9' -or $j.hotkeyPause -ne 'Ctrl+Alt+F10' -or $j.hotkeyMicMute -ne 'Ctrl+Alt+F11') { throw "hotkeys not persisted" }
           # --- UI v1.0 renders (2x, like the mockups)
-          foreach ($st in 'idle','recording','settings','recordings','replaytoast','savedtoast','source','micpop','ctxmenu') {
+          foreach ($st in 'idle','recording','settings','recordings','replaytoast','savedtoast','source','micpop','ctxmenu','replaycap') {
             Start-Process $exe -ArgumentList "--render-ui `"$v\ui-v1-$st.png`" --ui-state $st --dpi 192 --log `"$v\ui-$st.txt`"" -Wait
             if (-not (Test-Path "$v\ui-v1-$st.png")) { throw "ui-v1-$st.png missing" }
           }
