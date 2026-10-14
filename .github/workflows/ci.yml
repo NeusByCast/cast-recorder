@@ -421,6 +421,13 @@ jobs:
           $kd = [int](ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$v\killed.mp4")
           "killed after ~6 s: $((Get-Item "$v\killed.mp4").Length) bytes, $kd decodable frames"
           if ($kd -lt 60) { throw "killed recording keeps only $kd frames (expected >= 2 s)" }
+          # --- abort() publishes first and the worker loses the claim later: the loser must NOT delete the saved file
+          $lp = Start-Process $exe -ArgumentList "--record 3 --encoder software --allow-synthetic --test-tone --test-late-publish 3000 --out `"$v\late.mp4`" --log `"$v\late.txt`"" -Wait -PassThru
+          Get-Content "$v\late.txt" | Select-Object -First 14 | Out-Host
+          if (-not (Select-String -Path "$v\late.txt" -Pattern '^late_publish_lost=1' -Quiet)) { throw "worker did not lose the publish claim (test hook)" }
+          if (-not (Test-Path "$v\late.mp4") -or (Get-Item "$v\late.mp4").Length -eq 0) { throw "the losing save thread deleted late.mp4" }
+          $lf = [int](ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$v\late.mp4")
+          "late publish: file kept, $lf decodable frames"; if ($lf -lt 30) { throw "late.mp4 has only $lf frames" }
           # --- post-processing outside the watchdog: GUI, MKV, conversion stalled 20 s (as for a ~5 GB file), then X.
           # The MP4 must be saved and untouched; the stalled copy must not delete it.
           $sp = "$env:RUNNER_TEMP\slowpost.json"; New-Item -ItemType Directory "$v\slow" -Force | Out-Null
@@ -438,6 +445,8 @@ jobs:
           if (-not (Select-String -Path $applog -Pattern 'still running - the saved file is kept' -Quiet)) { throw "no 'kept' log line for the stalled conversion" }
           # same, without the stall: the MKV replaces the MP4
           New-Item -ItemType Directory "$v\fast" -Force | Out-Null
+          # leftovers of a killed remux / conversion: swept at startup
+          Set-Content "$v\fast\stale.part.mp4" "x"; Set-Content "$v\fast\stale.part.mkv" "x"
           @{version=3; fps=30; encoder="software"; outputDir="$v\fast"; systemAudio=$false; container="mkv"; autoRemux=$false} | ConvertTo-Json | Set-Content $sp
           $p = Start-Process $exe -ArgumentList "--selftest-record --settings-file `"$sp`"" -PassThru
           if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "GUI MKV run hung" }
@@ -445,7 +454,9 @@ jobs:
           $mk = Get-ChildItem "$v\fast" -Filter *.mkv | Select-Object -First 1
           if (-not $mk) { throw "GUI MKV recording: no .mkv after the background conversion" }
           if ((ffprobe -v error -show_entries format=format_name -of csv=p=0 $mk.FullName) -notmatch 'matroska') { throw "not MKV" }
-          if (Get-ChildItem "$v\fast" -Filter *.mp4) { throw "the MP4 was not removed after a good MKV conversion" }
+          if (Get-ChildItem "$v\fast" -Filter *.mp4) { throw "the MP4 was not removed after a good MKV conversion (or a stale .part.mp4 was not swept)" }
+          if (Test-Path "$v\fast\stale.part.mkv") { throw "stale .part.mkv not swept at startup" }
+          if (-not (Select-String -Path $applog -Pattern 'startup: removed 2 leftover .part file' -Quiet)) { throw "no startup sweep log line" }
           Clean $mk.FullName
           # --- large file (~5 GB): remux MKV -> MP4 with the default engine (Media Foundation), no timeout, source kept
           $big = "C:\castrec-big"; New-Item -ItemType Directory $big -Force | Out-Null
@@ -458,7 +469,13 @@ jobs:
           Get-PSDrive C | Format-Table Name, Used, Free
           Remove-Item "$big\seed.mkv"
           $t0 = Get-Date
-          $rc = Run "--remux `"$big\big.mkv`" `"$big\big.mp4`"" "$v\bigremux.txt"
+          # atomic: while the copy runs only big.part.mp4 exists; big.mp4 appears complete, by rename
+          $bp = Start-Process $exe -ArgumentList "--remux `"$big\big.mkv`" `"$big\big.mp4`" --log `"$v\bigremux.txt`"" -PassThru
+          $sawPart = $false
+          while (-not $bp.HasExited) { if (Test-Path "$big\big.part.mp4") { $sawPart = $true; if (Test-Path "$big\big.mp4") { throw "big.mp4 exists while the remux is still writing" } }; Start-Sleep -Milliseconds 500 }
+          $bp.WaitForExit(); $rc = $bp.ExitCode
+          if (-not $sawPart) { throw "remux did not write to big.part.mp4" }
+          if (Test-Path "$big\big.part.mp4") { throw "leftover big.part.mp4 after the remux" }
           $el = ((Get-Date) - $t0).TotalSeconds
           if ($rc -ne 0) { Get-Content "$v\bigremux.txt"; throw "5 GB remux failed" }
           $ms = (Get-Item "$big\big.mp4").Length
@@ -469,6 +486,11 @@ jobs:
           & ffmpeg -hide_banner -v error -sseof -3 -i "$big\big.mp4" -f null - 2>&1 | Tee-Object -Variable te
           if ($te) { throw "tail of the 5 GB MP4 does not decode" }
           Remove-Item $big -Recurse -Force
+          # --- a failing remux leaves neither the output nor a .part
+          [System.IO.File]::WriteAllBytes("$v\bad.mkv", [byte[]](1..4096 | ForEach-Object { $_ % 251 }))
+          $rc = Run "--remux `"$v\bad.mkv`" `"$v\bad.mp4`"" "$v\badremux.txt"
+          if ($rc -eq 0) { throw "remux of garbage succeeded?" }
+          if ((Test-Path "$v\bad.mp4") -or (Test-Path "$v\bad.part.mp4")) { throw "failed remux left bad.mp4 / bad.part.mp4" }
           # --- remux MKV -> MP4 without re-encoding, both engines
           $rc = Run "--record 3 --container mkv --encoder software --allow-synthetic --test-tone --out `"$v\rm.mkv`"" "$v\rm.txt"
           if ((ffprobe -v error -show_entries format=format_name -of csv=p=0 "$v\rm.mkv") -notmatch 'matroska') { throw "rm.mkv is not MKV" }
