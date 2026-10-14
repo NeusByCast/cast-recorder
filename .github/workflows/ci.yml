@@ -169,7 +169,7 @@ jobs:
             if ([math]::Abs($as) -gt 0.05) { throw "$c audio starts at $as s (expected 0)" }
             if (-not (Select-String -Path $log -Pattern 'SetInputType\(NV12\): 0x00000000 ok' -Quiet)) { throw "software encoder did not go through the pass-through MFT writer" }
             if (-not (Select-String -Path $log -Pattern 'fragmented=1' -Quiet)) { throw "$c was not recorded as fragmented MP4 (crash-safe)" }
-            if ($c -ne 'mp4' -and -not (Select-String -Path $log -Pattern 'post: converted' -Quiet)) { throw "$c: no stream copy from the recorded MP4" }
+            if ($c -ne 'mp4' -and -not (Select-String -Path $log -Pattern 'post: converted' -Quiet)) { throw "${c}: no stream copy from the recorded MP4" }
             if ($c -eq 'mp4') { $atoms = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($out)); if ($atoms.IndexOf('moof') -lt 0) { throw "smoke mp4 has no moof (not fragmented)" } }
             $ach = [int](ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 $out)
             if ($ach -ne 2) { throw "$c audio has $ach channels (stereo is the default)" }
