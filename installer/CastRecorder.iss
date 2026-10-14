@@ -1,4 +1,4 @@
-; Inno Setup 6 script. Build: iscc /DAppVersion=1.0.1 /DBinDir=..\build\Release installer\CastRecorder.iss
+; Inno Setup 6. CI passes /DAppVersion from src/win/version.h; the fallback below must match it.
 #ifndef AppVersion
   #define AppVersion "1.0.1"
 #endif

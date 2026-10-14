@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
-project(CastRecorder VERSION 1.0.1 LANGUAGES CXX)
+# The app version comes only from src/win/version.h.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/win/version.h" _cr_ver_h)
+foreach(_p MAJOR MINOR PATCH)
+  string(REGEX MATCH "CR_VERSION_${_p}[ \t]+([0-9]+)" _m "${_cr_ver_h}")
+  set(CR_VERSION_${_p} ${CMAKE_MATCH_1})
+endforeach()
+project(CastRecorder VERSION ${CR_VERSION_MAJOR}.${CR_VERSION_MINOR}.${CR_VERSION_PATCH} LANGUAGES CXX)
 if(WIN32)
   enable_language(RC)
 endif()
