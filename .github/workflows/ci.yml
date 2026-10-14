@@ -127,7 +127,7 @@ jobs:
             $out = "$PWD\rec\smoke-${{ matrix.fps }}.$c"
             $log = "$PWD\rec\smoke-${{ matrix.fps }}-$c.txt"
             # The runner has a desktop session but no GPU; --allow-synthetic falls back to a test pattern only if screen capture is unavailable.
-            $p = Start-Process $exe.FullName -ArgumentList "--record 4 --fps ${{ matrix.fps }} --encoder software --quality medium --container $c --allow-synthetic --out `"$out`" --log `"$log`"" -Wait -PassThru
+            $p = Start-Process $exe.FullName -ArgumentList "--record 4 --fps ${{ matrix.fps }} --encoder software --quality medium --container $c --allow-synthetic --test-tone --out `"$out`" --log `"$log`"" -Wait -PassThru
             if (Test-Path $log) { Get-Content $log } else { throw "log missing for $c" }
             if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { throw "recorder failed for $c (log)" }
             if (-not (Test-Path $out)) { throw "$out was not created" }
@@ -151,8 +151,48 @@ jobs:
             "decoded frames=$nf"
             if ($nf -lt (${{ matrix.fps }} * 3)) { throw "$c decoded only $nf frames" }
             if (-not (Select-String -Path $log -Pattern 'encoder=Software' -Quiet)) { throw "unexpected encoder" }
+            # Audio: AAC track present, decodes, and is in sync with video (stream durations within 100 ms).
+            $acodec = ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of default=nw=1 $out
+            $acodec
+            if (-not ($acodec -match 'codec_name=aac')) { throw "$c has no AAC audio track" }
+            $adec = & ffmpeg -hide_banner -v error -xerror -i $out -map 0:a:0 -f null - 2>&1
+            if ($LASTEXITCODE -ne 0 -or $adec) { $adec; throw "$c audio does not decode cleanly" }
+            $vd = [double](& ffmpeg -hide_banner -i $out -map 0:v:0 -f null - 2>&1 | Select-String 'time=(\d+):(\d+):([\d.]+)' | Select-Object -Last 1 | ForEach-Object { $g = $_.Matches[0].Groups; [double]$g[1].Value*3600 + [double]$g[2].Value*60 + [double]$g[3].Value })
+            $ad = [double](& ffmpeg -hide_banner -i $out -map 0:a:0 -f null - 2>&1 | Select-String 'time=(\d+):(\d+):([\d.]+)' | Select-Object -Last 1 | ForEach-Object { $g = $_.Matches[0].Groups; [double]$g[1].Value*3600 + [double]$g[2].Value*60 + [double]$g[3].Value })
+            $as = [double](ffprobe -v error -select_streams a:0 -show_entries packet=pts_time -of csv=p=0 -read_intervals "%+#1" $out | Select-Object -First 1)
+            "a/v: video=$vd s audio=$ad s audio_start=$as s"
+            if ([math]::Abs($vd - $ad) -gt 0.1) { throw "$c audio/video durations differ: $vd vs $ad" }
+            if ([math]::Abs($as) -gt 0.05) { throw "$c audio starts at $as s (expected 0)" }
             if (-not (Select-String -Path $log -Pattern 'SetInputType\(NV12\): 0x00000000 ok' -Quiet)) { throw "software encoder did not go through the pass-through MFT writer" }
           }
+      - name: Quality (SSIM/PSNR vs reference) and achieved fps on the static test pattern
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory rec -Force | Out-Null
+          $ref = "$PWD\rec\pattern.bmp"
+          Start-Process $exe -ArgumentList "--render-pattern `"$ref`"" -Wait
+          if (-not (Test-Path $ref)) { throw "reference pattern missing" }
+          $fps = ${{ matrix.fps }}
+          $out = "$PWD\rec\quality-$fps.mp4"; $log = "$PWD\rec\quality-$fps.txt"
+          Start-Process $exe -ArgumentList "--record 5 --fps $fps --encoder software --quality high --pattern --test-tone --out `"$out`" --log `"$log`"" -Wait
+          Get-Content $log | Select-Object -First 6
+          if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { throw "pattern recording failed" }
+          $m = (Select-String -Path $log -Pattern 'capture_fps=([\d.]+) encode_fps=([\d.]+)').Matches[0].Groups
+          $cf = [double]$m[1].Value; $ef = [double]$m[2].Value
+          $nf = [int](ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 $out)
+          "fps: target=$fps capture=$cf encode=$ef decoded_frames=$nf (expected ~$($fps*5))"
+          if ($ef -lt $fps * 0.95) { throw "achieved encode fps $ef < 95% of $fps" }
+          if ($nf -lt $fps * 5 * 0.95) { throw "only $nf frames for 5 s at $fps" }
+          # Compare in RGB with the correct BT.709 limited-range matrix (what the encoder signals).
+          $filt = "[0:v]scale=in_color_matrix=bt709:in_range=tv:flags=bicubic,format=gbrp[a];[1:v]format=gbrp[b];[a][b]"
+          $ss = & ffmpeg -hide_banner -i $out -loop 1 -i $ref -lavfi ($filt + "ssim") -shortest -f null - 2>&1 | Select-String 'All:([\d.]+)' | Select-Object -Last 1
+          $ps = & ffmpeg -hide_banner -i $out -loop 1 -i $ref -lavfi ($filt + "psnr") -shortest -f null - 2>&1 | Select-String 'average:([\d.inf]+)' | Select-Object -Last 1
+          $ssim = [double]$ss.Matches[0].Groups[1].Value
+          $psnrS = $ps.Matches[0].Groups[1].Value; $psnr = if ($psnrS -eq 'inf') { 99 } else { [double]$psnrS }
+          "quality: SSIM=$ssim PSNR=$psnr dB"
+          if ($ssim -lt 0.95) { throw "SSIM $ssim < 0.95 (warping / artifacts / starved bitrate)" }
+          if ($psnr -lt 30) { throw "PSNR $psnr dB < 30" }
       - name: ffmpeg hijack probe (a fake ffmpeg.exe in the working folder must not run)
         if: matrix.fps == 30
         shell: pwsh
