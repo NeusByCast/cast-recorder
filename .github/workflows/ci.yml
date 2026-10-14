@@ -113,11 +113,12 @@ jobs:
             $expect = 6.0 - [double]$pm[1].Value / 1000.0
             $dur = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $pOut)
             "pause: paused_ms=$($pm[1].Value) expected=$expect duration=$dur"
-            if ([math]::Abs($dur - $expect) -gt 0.35) { throw "duration $dur != recorded minus paused ($expect)" }
+            if ([math]::Abs($dur - $expect) -gt 0.1) { throw "duration $dur != recorded minus paused ($expect)" }
             $pts = ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 $pOut | ForEach-Object { [double]$_ } | Sort-Object
             $maxGap = 0.0
             for ($i = 1; $i -lt $pts.Count; $i++) { $gap = $pts[$i] - $pts[$i-1]; if ($gap -gt $maxGap) { $maxGap = $gap } }
             "pause: packets=$($pts.Count) max_pts_gap=$maxGap"
+            if ([math]::Abs($pts.Count - 120) -gt 2) { throw "frame count $($pts.Count) != 120 +-2" }
             if ($maxGap -gt (1.5 / 30)) { throw "PTS gap $maxGap s: timestamps not continuous across pause" }
             $late = (Select-String -Path $pLog -Pattern 'late=(\d+)').Matches[0].Groups[1].Value
             if ([int]$late -gt 3) { throw "pause was counted as $late late frames" }
