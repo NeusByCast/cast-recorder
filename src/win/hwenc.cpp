@@ -234,7 +234,7 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
         setCodec(codec.Get(), kCODECAPI_AVEncCommonQualityVsSpeed, VT_UI4, high ? 100 : 60, L"CODECAPI QualityVsSpeed", log);
         setCodec(codec.Get(), kCODECAPI_AVLowLatencyMode, VT_BOOL, 0, L"CODECAPI LowLatencyMode=off", log);
         setCodec(codec.Get(), kCODECAPI_AVEncMPVDefaultBPictureCount, VT_UI4, 0, L"CODECAPI BPictureCount=0", log);
-        setCodec(codec.Get(), kCODECAPI_AVEncMPVGOPSize, VT_UI4, (ULONG)fps * 2, L"CODECAPI GOPSize", log);
+        setCodec(codec.Get(), kCODECAPI_AVEncMPVGOPSize, VT_UI4, (ULONG)fps, L"CODECAPI GOPSize=1s", log);
     } else log += L"ICodecAPI not available\n";
 
     // Output type FIRST (required by AMF/NVENC/QSV encoders), then input.

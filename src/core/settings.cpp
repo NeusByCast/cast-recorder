@@ -39,6 +39,23 @@ bool validAccent(const std::string& a) {
     for (const char* k : {"red", "orange", "green", "blue", "purple", "pink"}) if (a == k) return true;
     return false;
 }
+// CON, PRN, AUX, NUL, COM1-9, LPT1-9 (also with an extension) can't be file names on Windows.
+bool isReservedName(const std::string& name) {
+    std::string b = name.substr(0, name.find('.'));
+    while (!b.empty() && b.back() == ' ') b.pop_back();
+    for (auto& ch : b) ch = (char)std::toupper((unsigned char)ch);
+    if (b == "CON" || b == "PRN" || b == "AUX" || b == "NUL") return true;
+    return b.size() == 4 && (b.compare(0, 3, "COM") == 0 || b.compare(0, 3, "LPT") == 0) && b[3] >= '1' && b[3] <= '9';
+}
+// Strict integer parse: optional surrounding spaces, digits only, in [lo, hi].
+bool parseIntStrict(const std::string& t, int lo, int hi, int& out) {
+    size_t a = t.find_first_not_of(' '), b = t.find_last_not_of(' ');
+    if (a == std::string::npos) return false;
+    long long v = 0;
+    for (size_t i = a; i <= b; ++i) { if (t[i] < '0' || t[i] > '9') return false; v = v * 10 + (t[i] - '0'); if (v > hi) return false; }
+    if (v < lo) return false;
+    out = (int)v; return true;
+}
 std::string fileNameFor(const std::string& pattern, int y, int mo, int d, int h, int mi, int se, const std::string& source, int counter) {
     char date[32], tim[32];
     std::snprintf(date, sizeof date, "%04d-%02d-%02d", y, mo, d);
@@ -46,11 +63,14 @@ std::string fileNameFor(const std::string& pattern, int y, int mo, int d, int h,
     std::string src;
     for (unsigned char c : source) {  // keep it a valid, short file-name part
         if (c < 0x20 || std::strchr("<>:\"/\\|?*", (int)c)) continue;
+        if (c == '.' && !src.empty() && src.back() == '.') continue;  // no ".." (path-like names)
+        if (c == '.' && src.empty()) continue;
         src += (char)c;
         if (src.size() >= 40) break;
     }
     while (!src.empty() && (src.back() == ' ' || src.back() == '.')) src.pop_back();
     if (src.empty()) src = "Screen";
+    if (isReservedName(src)) src = "_" + src;
     if (pattern == "date_time") return std::string(date) + "_" + tim;
     if (pattern == "source_date_time") return src + "_" + date + "_" + tim;
     if (pattern == "cast_counter") { char b[32]; std::snprintf(b, sizeof b, "cast_%03d", counter < 1 ? 1 : counter); return b; }
@@ -356,13 +376,13 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     num("micVolume", 0, 200, s.micVolume);
     num("noiseGateDb", -80, 0, s.noiseGateDb);
     num("channels", 1, 2, s.channels);
-    if (str("hotkeyPushToTalk", v) && parse(v, hk)) s.pttKey = hk;
+    if (str("hotkeyPushToTalk", v) && parse(v, hk) && validate(hk).severity != Severity::Error) s.pttKey = hk;
     if (str("scale", v)) fromString(v, s.scale);
     // v1.1
     if (str("codec", v)) fromString(v, s.codec);
     boo("autoRemux", s.autoRemux);
     boo("replayEnabled", s.replayEnabled);
-    num("replaySeconds", 5, 900, s.replaySeconds);
+    num("replaySeconds", 5, 900, s.replaySeconds);  // 601..900 only via the 10/15 min presets
     auto hkOpt = [&](const char* k, Hotkey& dst) {
         if (!str(k, v)) return;
         if (v.empty()) dst = Hotkey{};
@@ -373,6 +393,13 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     for (Hotkey* x : {&s.saveReplay, &s.screenshot})  // never two actions on one combo
         if (!x->empty() && (*x == s.toggleRecord || *x == s.pauseToggle || *x == s.micMute || *x == s.openFolder)) *x = Hotkey{};
     if (!s.screenshot.empty() && s.screenshot == s.saveReplay) s.screenshot = Hotkey{};
+    // Push-to-talk can't share a combo with an action: fall back to the default, or clear it if that clashes too.
+    auto pttClash = [&](const Hotkey& k) {
+        for (const Hotkey* x : {&s.toggleRecord, &s.pauseToggle, &s.micMute, &s.openFolder, &s.saveReplay, &s.screenshot})
+            if (!x->empty() && *x == k) return true;
+        return false;
+    };
+    if (!s.pttKey.empty() && pttClash(s.pttKey)) s.pttKey = pttClash(Settings{}.pttKey) ? Hotkey{} : Settings{}.pttKey;
     if (str("screenshotFormat", v) && (v == "png" || v == "jpg")) s.screenshotFormat = v;
     boo("separateTracks", s.separateTracks);
     if (str("theme", v) && (v == "auto" || v == "dark" || v == "light")) s.theme = v;

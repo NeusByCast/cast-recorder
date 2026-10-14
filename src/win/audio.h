@@ -26,6 +26,11 @@ struct AudioFx {
     std::atomic<bool> micMuted{false}, systemMuted{false};
     std::atomic<bool> monitoring{false};     // play the processed mic on the default output
     std::atomic<float> levelMic{0}, levelSys{0};  // peak (linear) since the UI last read it
+    // Our own UI sounds (replay saved, screenshot, start/stop): microphone packets captured in [from, to] (QPC,
+    // 100 ns) are silenced so the speakers -> mic path can't put them in the file. System audio needs it only
+    // when process-loopback exclusion isn't available (old Windows, or an explicitly chosen output device).
+    std::atomic<long long> ownSoundFrom{0}, ownSoundTo{0};
+    void markOwnSound(long long from100, long long to100) { ownSoundTo.store(0); ownSoundFrom.store(from100); ownSoundTo.store(to100); }
     static float take(std::atomic<float>& a) { return a.exchange(0.f); }
 };
 AudioFx& audioFx();

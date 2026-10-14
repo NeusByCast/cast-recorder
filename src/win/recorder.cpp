@@ -365,6 +365,21 @@ struct Writer {
     DWORD stream = 0;
     bool gpu = false;
     std::wstring label;
+    // Recordings: fragmented MP4 (moof/mdat every ~1 s). A crash, kill or stuck Finalize still leaves a playable
+    // file with everything up to the last fragment; nothing has to be copied or remuxed after Stop.
+    bool fragmented = false;
+    bool fragmentedOk = false;  // the fMP4 sink was accepted (else plain MP4)
+    const GUID& container() const { return fragmented ? MFTranscodeContainerType_FMPEG4 : MFTranscodeContainerType_MPEG4; }
+    HRESULT createSink(const std::wstring& path, IMFAttributes* a) {
+        HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, a, &sw);
+        if (FAILED(hr) && fragmented) {  // very old MF without the fMP4 sink: plain MP4
+            a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+            fragmented = false;
+            hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, a, &sw);
+        }
+        fragmentedOk = SUCCEEDED(hr) && fragmented;
+        return hr;
+    }
 
     // nv12In=true: samples are DXGI NV12 surfaces (zero-copy HW path). Otherwise RGB32 (CPU or MF color convert).
     bool open(const std::wstring& path, ID3D11Device* dev, UINT w, UINT h, const RecordOptions& o, bool hardware, bool nv12In, std::wstring& err) {
@@ -373,7 +388,7 @@ struct Writer {
         a->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, hardware ? TRUE : FALSE);
         a->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
         a->SetUINT32(MF_LOW_LATENCY, TRUE);
-        a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+        a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, container());
         gpu = hardware;
         if (hardware) {
             UINT token = 0;
@@ -382,7 +397,7 @@ struct Writer {
             if (FAILED(hr)) { err = hrMsg(L"MFCreateDXGIDeviceManager", hr); return false; }
             a->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, mgr.Get());
         }
-        HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, a.Get(), &sw);
+        HRESULT hr = createSink(path, a.Get());
         if (FAILED(hr)) { err = hrMsg(L"MFCreateSinkWriterFromURL", hr); return false; }
 
         unsigned br = bitrateFor(o.quality, (int)w, (int)h, o.fps, o.bitrateCap);
@@ -487,9 +502,9 @@ struct Writer {
         MFCreateAttributes(&a, 3);
         a->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, FALSE);
         a->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-        a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+        a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, container());
         gpu = true;
-        HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, a.Get(), &sw);
+        HRESULT hr = createSink(path, a.Get());
         if (FAILED(hr)) { err = hrMsg(L"MFCreateSinkWriterFromURL(passthrough)", hr); return false; }
         hr = sw->AddStream(encOut, &stream);
         if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(stream, encOut, nullptr);
@@ -533,6 +548,12 @@ DWORD finalizeBudgetMs(DWORD finalizeTimeoutMs) { return (finalizeTimeoutMs ? fi
 }  // namespace
 
 void setTestHangFinalizeMs(DWORD ms) { g_testHangFinalizeMs = ms; }
+std::atomic<DWORD> g_testSlowPostMs{0};
+void setTestSlowPostMs(DWORD ms) { g_testSlowPostMs = ms; }
+static unsigned long long fileSizeOf(const std::wstring& p) {
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    return GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
+}
 int abandonedFinalizeLive() { return g_abandonLive.load(); }
 
 std::wstring findFfmpeg() {
@@ -601,6 +622,17 @@ Recorder::~Recorder() {
     if (doneEvent_) CloseHandle(doneEvent_);
 }
 
+// x.mkv -> x.mp4 (or "x (2).mp4" if that is taken); x.mp4 -> x.mp4
+static std::wstring recordingMp4Path(const std::wstring& out) {
+    size_t slash = out.find_last_of(L"\\/"), dot = out.find_last_of(L'.');
+    std::wstring ext = dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash) ? L"" : out.substr(dot);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    if (ext == L".mp4") return out;
+    std::wstring base = ext.empty() ? out : out.substr(0, dot), p = base + L".mp4";
+    for (int k = 2; GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES && k < 1000; ++k) p = base + L" (" + std::to_wstring(k) + L").mp4";
+    return p;
+}
+
 bool Recorder::start(const RecordOptions& o) {
     // After an abandoned Finalize/Close, Media Foundation is poisoned for this process.
     if (!abandon_.canStart()) return false;
@@ -618,7 +650,8 @@ bool Recorder::start(const RecordOptions& o) {
     started_ = false;
     sessionGen_ = claim_.arm();
     sessionOut_ = opt_.outputPath;
-    sessionTmp_ = opt_.bufferOnly ? std::wstring() : opt_.container == Container::MP4 ? opt_.outputPath : opt_.outputPath + L".part.mp4";
+    // Every recording is written once, straight to its final .mp4 (fragmented). MKV is a stream copy made afterwards.
+    sessionTmp_ = opt_.bufferOnly ? std::wstring() : recordingMp4Path(opt_.outputPath);
     { std::lock_guard<std::mutex> g(fileM_); curFile_ = sessionTmp_; }
     if (doneEvent_) ResetEvent(doneEvent_);
     th_ = std::thread([this] { run(); });
@@ -645,15 +678,15 @@ void Recorder::abort() {
         // Prefer leak over UAF: poison MF so we never MFShutdown while Finalize may still run.
         abandon_.abandon();
     }
-    // Only the first of {abort, worker} publishes; the winner here also deletes half-written files.
-    const std::wstring tmpP = sessionTmp_, outP = sessionOut_;
+    // Only the first of {abort, worker} publishes. Files are never deleted here: recordings are fragmented MP4, so
+    // whatever reached the disk is playable (only an empty file is removed).
+    const std::wstring tmpP = sessionTmp_;
     claim_.claim(sessionGen_, [&] {
-        if (!tmpP.empty()) DeleteFileW(tmpP.c_str());
-        if (!outP.empty() && outP != tmpP) DeleteFileW(outP.c_str());
         RecordResult pub;
+        if (!tmpP.empty()) { if (fileSizeOf(tmpP) > 0) pub.file = tmpP; else DeleteFileW(tmpP.c_str()); }
         pub.timedOut = true;
         pub.abandoned = abandon_.poisoned.load();
-        pub.message = L"Recording cancelled";
+        pub.message = pub.file.empty() ? L"Recording cancelled" : L"Recording stopped before it finished saving - kept what was written";
         result_ = std::move(pub);
         fsm_.toIdle();
         started_ = true;
@@ -872,6 +905,7 @@ void Recorder::run() {
         if (FAILED(dev->CreateTexture2D(&td, nullptr, &latest))) { r.message = L"CreateTexture2D failed"; return; }
         // ---- audio (system loopback + mic), mixed on the video media clock ----
         Writer wr;
+        wr.fragmented = !opt_.warmupOnly && !opt_.bufferOnly;
         wr.tracks = opt_.separateTracks ? 3 : 1;
         struct AChunk { long long t; std::vector<short> pcm[3]; };
         std::deque<AChunk> audioPending;  // until the lazy writer opens
@@ -924,7 +958,7 @@ void Recorder::run() {
         // Encoded-sample sink for the hardware path: the MP4 writer is opened on the first output so it gets the
         // encoder's final output type (sequence header).
         HRESULT muxHr = S_OK;
-        auto resetWriter = [&] { bool wa = wr.wantAudio; int tr = wr.tracks; UINT32 ch = wr.achannels; wr = Writer{}; wr.wantAudio = wa; wr.tracks = tr; wr.achannels = ch; };
+        auto resetWriter = [&] { bool wa = wr.wantAudio, fr = wr.fragmented; int tr = wr.tracks; UINT32 ch = wr.achannels; wr = Writer{}; wr.wantAudio = wa; wr.tracks = tr; wr.achannels = ch; wr.fragmented = fr; };
         auto muxOut = [&](IMFSample* es) -> HRESULT {
             if (replay) {
                 if (!ringAttached) { ComPtr<IMFMediaType> ot = hw->muxType(); replay->attach(ot.Get(), opt_.fps, (int)wr.achannels, wr.tracks, wr.wantAudio); ringAttached = true; }
@@ -1086,7 +1120,7 @@ void Recorder::run() {
                 if (GetTempPathW(MAX_PATH, tp) && GetTempFileNameW(tp, L"crw", 0, tf)) {
                     std::wstring warm = std::wstring(tf) + L".mp4";
                     {
-                        Writer pw; pw.wantAudio = wr.wantAudio; pw.tracks = wr.tracks; pw.achannels = wr.achannels; std::wstring e3;
+                        Writer pw; pw.wantAudio = wr.wantAudio; pw.tracks = wr.tracks; pw.achannels = wr.achannels; pw.fragmented = true; std::wstring e3;
                         ComPtr<IMFMediaType> vt = hw->muxType();
                         pw.openPassthrough(warm, vt.Get(), e3);
                         pw.sw.Reset();
@@ -1383,6 +1417,8 @@ void Recorder::run() {
         }
         // ---- Finalize: budget = finalizeTimeoutMs/2 (default 4 s); remux gets the other half ----
         HRESULT fh = E_FAIL;
+        const bool fragOk = wr.fragmentedOk;
+        r.fragmented = fragOk;
         if (r.frames && wr.sw) {
             auto st = std::make_shared<FinState>();
             ComPtr<IMFSinkWriter> swRef = wr.sw;     // by value: helper holds its own refs
@@ -1397,7 +1433,7 @@ void Recorder::run() {
                     // Main abandoned us: do not Release the writer (prefer leak over UAF / MF re-entry).
                     swRef.Detach();
                     mgrRef.Detach();
-                    for (int i = 0; i < 40 && !DeleteFileW(tmpCopy.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND; ++i) Sleep(50);
+                    (void)tmpCopy;  // the file is kept: fragmented MP4 is playable up to its last fragment
                     g_abandonLive.fetch_sub(1);
                 }
             });
@@ -1415,8 +1451,8 @@ void Recorder::run() {
                 abandonedMf = true;
                 r.timedOut = true;
                 r.abandoned = true;
-                r.message = L"Finalize timed out - file discarded";
-                DeleteFileW(tmp.c_str());  // best effort now; helper retries after Finalize returns
+                if (fragOk && fileSizeOf(tmp) > 0) { r.file = tmp; r.message = L"Finalize timed out - kept the file (the last second may be missing)"; }
+                else { r.message = L"Finalize timed out - nothing was written"; DeleteFileW(tmp.c_str()); }
             } else {
                 g_abandonLive.fetch_sub(1);
                 fin.join();
@@ -1431,54 +1467,22 @@ void Recorder::run() {
         if (!r.timedOut) {
             if (FAILED(fh) && r.frames) {
                 if (r.message.empty()) r.message = hrMsg(L"Finalize", fh);
-                DeleteFileW(tmp.c_str());
+                if (fragOk && fileSizeOf(tmp) > 0) { r.file = tmp; r.message += L" - kept the file"; }  // still playable
+                else DeleteFileW(tmp.c_str());
             } else if (SUCCEEDED(fh) && r.frames) {
+                // Saved. Anything else (MKV, track names) is a separate stream copy the caller runs afterwards, so a
+                // long recording can never be lost to a timeout here.
                 r.file = tmp;
-                std::vector<std::wstring> names;
-                if (wr.tracks == 3 && r.hasAudio) names = {L"Mix", L"System audio", L"Microphone"};
-                // remux budget: the configured half plus 1 s per 200 MB (stream copy is disk-bound)
-                WIN32_FILE_ATTRIBUTE_DATA fa{};
-                unsigned long long sz = GetFileAttributesExW(tmp.c_str(), GetFileExInfoStandard, &fa) ? ((unsigned long long)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) : 0;
-                const DWORD remuxBudget = finalizeBudgetMs(opt_.finalizeTimeoutMs) + (DWORD)(sz / (200ull << 20)) * 1000;
-                if (opt_.container != Container::MP4) {
-                    std::wstring ff = findFfmpeg();
-                    std::wstring rerr;
-                    if (!ff.empty() && remuxFile(tmp, opt_.outputPath, rerr, L"ffmpeg", remuxBudget, names)) {
-                        DeleteFileW(tmp.c_str());
-                        r.file = opt_.outputPath;
-                    } else {
-                        DeleteFileW(opt_.outputPath.c_str());
-                        std::wstring mp4 = opt_.outputPath;
-                        size_t slash = mp4.find_last_of(L"\\/"), dot = mp4.find_last_of(L'.');
-                        if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash)) mp4.resize(dot);
-                        mp4 += L".mp4";
-                        if (MoveFileExW(tmp.c_str(), mp4.c_str(), MOVEFILE_REPLACE_EXISTING)) r.file = mp4;
-                        else r.file = tmp;
-                        if (ff.empty()) r.message = L"ffmpeg.exe not found, saved as MP4";
-                        else { r.message = L"ffmpeg remux failed, saved as MP4"; DeleteFileW(tmp.c_str()); }
-                    }
-                    // Auto-remux: MKV -> MP4 by stream copy, keep only the MP4.
-                    if (opt_.autoRemux && r.file == opt_.outputPath) {
-                        std::wstring mp4 = opt_.outputPath;
-                        size_t dot = mp4.find_last_of(L'.');
-                        mp4 = mp4.substr(0, dot) + L".mp4";
-                        std::wstring rerr2;
-                        if (remuxFile(r.file, mp4, rerr2, L"", remuxBudget, names)) {
-                            DeleteFileW(r.file.c_str());
-                            r.file = mp4;
-                            r.encoderLog += L"auto-remux: MKV -> MP4 ok\n";
-                        } else r.encoderLog += L"auto-remux failed (" + rerr2 + L"): kept the MKV\n";
-                    }
-                } else if (!names.empty() && !findFfmpeg().empty()) {
-                    // MP4 with separate tracks: name the tracks (stream copy into a temp, then replace)
-                    std::wstring named = tmp + L".named.mp4", rerr;
-                    if (remuxFile(tmp, named, rerr, L"ffmpeg", remuxBudget, names) && MoveFileExW(named.c_str(), tmp.c_str(), MOVEFILE_REPLACE_EXISTING))
-                        r.encoderLog += L"audio tracks named (mix / system / mic)\n";
-                    else { DeleteFileW(named.c_str()); r.encoderLog += L"track naming failed: " + rerr + L"\n"; }
+                r.post.file = tmp;
+                if (wr.tracks == 3 && r.hasAudio) r.post.trackNames = {L"Mix", L"System audio", L"Microphone"};
+                if (opt_.container != Container::MP4 && !opt_.autoRemux) {  // MKV / MOV: stream copy afterwards
+                    size_t dot = opt_.outputPath.find_last_of(L'.');
+                    r.post.mkvPath = (dot == std::wstring::npos ? opt_.outputPath : opt_.outputPath.substr(0, dot)) + (opt_.container == Container::MOV ? L".mov" : L".mkv");
                 }
+                if (opt_.container != Container::MP4 && opt_.autoRemux) r.encoderLog += L"auto-remux on: recorded straight to MP4 (no remux needed)\n";
             }
         }
-        r.ok = r.frames > 0 && !r.timedOut && (r.message.empty() || r.message.find(L"saved as MP4") != std::wstring::npos);
+        r.ok = r.frames > 0 && !r.timedOut && r.message.empty();
     }();
 
     // Skip MF/COM teardown if anything was abandoned (a detached Finalize/Close may still be inside MF).
@@ -1520,7 +1524,18 @@ bool ffmpegCopy(const std::wstring& ffmpeg, const std::wstring& in, const std::w
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
     buf.push_back(0);
-    if (!CreateProcessW(ffmpeg.c_str(), buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) { err = L"ffmpeg did not start"; return false; }
+    if (!CreateProcessW(ffmpeg.c_str(), buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) { err = L"ffmpeg did not start"; return false; }
+    {   // ffmpeg dies with us (no orphan finishing a copy nobody will rename)
+        static HANDLE job = [] {
+            HANDLE j = CreateJobObjectW(nullptr, nullptr);
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (j) SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li);
+            return j;
+        }();
+        if (job) AssignProcessToJobObject(job, pi.hProcess);
+        ResumeThread(pi.hThread);
+    }
     DWORD wait = timeoutMs ? timeoutMs : 8000;
     bool timedOut = false;
     if (WaitForSingleObject(pi.hProcess, wait) == WAIT_TIMEOUT) {
@@ -1607,6 +1622,19 @@ bool mfCopy(const std::wstring& in, const std::wstring& out, std::wstring& err) 
 bool remuxFile(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
                const std::vector<std::wstring>& trackNames) {
     if (GetFileAttributesW(in.c_str()) == INVALID_FILE_ATTRIBUTES) { err = L"source file missing"; return false; }
+    size_t odot = out.find_last_of(L'.');
+    std::wstring oext = odot == std::wstring::npos ? L"" : out.substr(odot);
+    for (auto& c : oext) c = (wchar_t)towlower(c);
+    // Default: Media Foundation (built into Windows, no ffmpeg needed) for MP4 output; ffmpeg is the fallback.
+    if (engine.empty() && oext == L".mp4" && trackNames.empty()) {
+        std::wstring e1;
+        if (mfCopy(in, out, e1)) { err.clear(); return true; }
+        std::wstring ff0 = findFfmpeg();
+        if (ff0.empty()) { err = e1; return false; }
+        if (ffmpegCopy(ff0, in, out, timeoutMs, trackNames, err)) return true;
+        err = L"MF: " + e1 + L"; " + err;
+        return false;
+    }
     std::wstring ff = engine == L"mf" ? std::wstring() : findFfmpeg();
     if (!ff.empty()) {
         if (ffmpegCopy(ff, in, out, timeoutMs, trackNames, err)) return true;
@@ -1622,6 +1650,38 @@ bool remuxFile(const std::wstring& in, const std::wstring& out, std::wstring& er
     return false;
 }
 
+bool postProcessRecording(const PostJob& j, std::wstring& finalFile, std::wstring& log) {
+    finalFile = j.file;
+    if (!j.needed()) return true;
+    if (DWORD slow = g_testSlowPostMs.load()) { log += L"post: test delay " + std::to_wstring(slow) + L" ms\n"; Sleep(slow); }
+    const unsigned long long sz = fileSizeOf(j.file);
+    if (!sz) { log += L"post: source missing\n"; return false; }
+    std::wstring ff = findFfmpeg();
+    if (ff.empty()) {
+        if (!j.mkvPath.empty()) log += L"post: MKV needs ffmpeg.exe - kept the MP4\n";
+        if (!j.trackNames.empty()) log += L"post: track names need ffmpeg.exe - tracks are unnamed (order: mix, system, mic)\n";
+        return false;
+    }
+    // Disk-bound stream copy: 60 s + 1 s per 20 MB. On timeout only the partial copy is removed.
+    const DWORD budget = (DWORD)std::min<unsigned long long>(60000ull + sz / (20ull << 20) * 1000ull, 3600000ull);
+    const bool mkv = !j.mkvPath.empty();
+    size_t dot = mkv ? j.mkvPath.find_last_of(L'.') : j.file.find_last_of(L'.');
+    const std::wstring& dstp = mkv ? j.mkvPath : j.file;
+    std::wstring part = dstp.substr(0, dot) + L".part" + dstp.substr(dot);
+    std::wstring err;
+    bool ok = ffmpegCopy(ff, j.file, part, budget, j.trackNames, err) && fileSizeOf(part) > 0;
+    if (ok) {
+        const std::wstring& dst = mkv ? j.mkvPath : j.file;
+        ok = MoveFileExW(part.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+        if (ok && mkv) DeleteFileW(j.file.c_str());
+        if (ok) finalFile = dst;
+        else err = L"rename failed (" + std::to_wstring(GetLastError()) + L")";
+    }
+    if (!ok) { DeleteFileW(part.c_str()); log += L"post: " + std::wstring(mkv ? L"MKV conversion" : L"track naming") + L" failed (" + err + L") - kept " + j.file + L"\n"; }
+    else log += std::wstring(L"post: ") + (mkv ? L"converted to MKV" : L"audio tracks named (mix / system / mic)") + L"\n";
+    return ok;
+}
+
 // ======================= instant replay ring =======================
 struct ReplayRing::Impl {
     mutable std::mutex m;
@@ -1631,38 +1691,72 @@ struct ReplayRing::Impl {
     int fps = 30, channels = 1, tracks = 1; bool audio = false;
     struct V { ComPtr<IMFSample> s; LONGLONG t = 0, d = 0; bool key = false; size_t bytes = 0; };
     std::deque<V> v;
-    struct A { LONGLONG t = 0; std::vector<short> pcm[3]; };
+    // PCM chunks are immutable once queued: save() takes refs under the lock and copies nothing there.
+    struct A { LONGLONG t = 0; std::shared_ptr<const std::vector<short>> pcm[3]; size_t bytes = 0; };
     std::deque<A> a;
     LONGLONG offset = 0, lastEnd = 0;
     bool attached = false;
     size_t bytes = 0;
-    LONGLONG startFor(int secs) const {  // newest key frame at or before (end - secs)
+    size_t maxBytes = (size_t)2 << 30;  // hard RAM cap (UI sets min(25 % of RAM, 2 GB)); oldest GOPs go first
+    bool capped = false;                 // the cap (not the length) is what trimmed the ring
+    // Key frame closest to (end - secs): with 1 s GOPs the saved length is within +-0.5 s of what was asked.
+    LONGLONG startFor(int secs) const {
         LONGLONG want = lastEnd - (LONGLONG)secs * 10000000LL;
-        LONGLONG best = -1;
-        for (auto& x : v) { if (!x.key) continue; if (best < 0 || x.t <= want) best = x.t; if (x.t > want) break; }
+        LONGLONG best = -1, bestD = 0;
+        for (auto& x : v) {
+            if (!x.key) continue;
+            LONGLONG d = x.t > want ? x.t - want : want - x.t;
+            if (best < 0 || d < bestD) { best = x.t; bestD = d; }
+            if (x.t > want) break;
+        }
         return best;
     }
+    void dropFirstGop() {
+        size_t k = 1;
+        while (k < v.size() && !v[k].key) ++k;
+        for (size_t i = 0; i < k && !v.empty(); ++i) { bytes -= v.front().bytes; v.pop_front(); }
+    }
     void trim() {
+        // keep one GOP more than asked so the nearest key frame can be the one before (end - seconds)
         const LONGLONG keep = (LONGLONG)seconds * 10000000LL;
         for (;;) {
             size_t k = 1;
             while (k < v.size() && !v[k].key) ++k;
             if (k >= v.size() || v[k].t > lastEnd - keep) break;
-            for (size_t i = 0; i < k; ++i) { bytes -= v.front().bytes; v.pop_front(); }
+            dropFirstGop();
+        }
+        capped = false;
+        while (bytes > maxBytes && v.size() > 1) {
+            size_t k = 1;
+            while (k < v.size() && !v[k].key) ++k;
+            if (k >= v.size()) break;  // never drop the only GOP
+            dropFirstGop();
+            capped = true;
         }
         LONGLONG first = v.empty() ? lastEnd : v.front().t;
-        while (!a.empty() && a.front().t + 2000000 < first) {
-            for (auto& p : a.front().pcm) bytes -= p.size() * sizeof(short);
-            a.pop_front();
-        }
+        while (!a.empty() && a.front().t + 2000000 < first) { bytes -= a.front().bytes; a.pop_front(); }
     }
 };
 
 ReplayRing::ReplayRing(int seconds) : p_(new Impl) { p_->seconds = seconds < 5 ? 5 : seconds > 900 ? 900 : seconds; }
+// Bytes a replay of `seconds` needs at this bitrate: video + PCM (48 kHz s16 x channels x tracks) + 10 % headroom.
+unsigned long long ReplayRing::estimateBytes(int seconds, unsigned videoBitrate, int channels, int tracks, bool audio) {
+    double perSec = videoBitrate / 8.0 + (audio ? 48000.0 * 2 * channels * tracks : 0.0);
+    return (unsigned long long)(perSec * seconds * 1.1);
+}
+size_t ReplayRing::defaultMaxBytes() {
+    MEMORYSTATUSEX ms{sizeof ms};
+    unsigned long long quarter = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys / 4 : (1ull << 30);
+    unsigned long long cap = std::min<unsigned long long>(quarter, 2ull << 30);
+    return (size_t)std::min<unsigned long long>(cap, (unsigned long long)SIZE_MAX / 2);
+}
 ReplayRing::~ReplayRing() = default;
 void ReplayRing::setSeconds(int s) { std::lock_guard<std::mutex> g(p_->m); p_->seconds = s < 5 ? 5 : s > 900 ? 900 : s; p_->trim(); }
 int ReplayRing::seconds() const { std::lock_guard<std::mutex> g(p_->m); return p_->seconds; }
 size_t ReplayRing::bytes() const { std::lock_guard<std::mutex> g(p_->m); return p_->bytes; }
+void ReplayRing::setMaxBytes(size_t b) { std::lock_guard<std::mutex> g(p_->m); p_->maxBytes = b < ((size_t)1 << 20) ? ((size_t)1 << 20) : b; p_->trim(); }
+size_t ReplayRing::maxBytes() const { std::lock_guard<std::mutex> g(p_->m); return p_->maxBytes; }
+bool ReplayRing::cappedByMemory() const { std::lock_guard<std::mutex> g(p_->m); return p_->capped; }
 double ReplayRing::bufferedSeconds() const {
     std::lock_guard<std::mutex> g(p_->m);
     LONGLONG st = p_->startFor(p_->seconds);
@@ -1720,10 +1814,13 @@ void ReplayRing::addVideo(IMFSample* s) {
 }
 
 void ReplayRing::addAudio(long long t, const std::vector<short>* const pcm[3]) {
+    Impl::A c;  // copy the PCM before taking the lock
+    for (int k = 0; k < 3; ++k) if (pcm[k] && !pcm[k]->empty()) { c.pcm[k] = std::make_shared<const std::vector<short>>(*pcm[k]); c.bytes += pcm[k]->size() * sizeof(short); }
     std::lock_guard<std::mutex> g(p_->m);
     if (!p_->attached || !p_->audio || p_->v.empty()) return;
-    Impl::A c; c.t = t + p_->offset;
-    for (int k = 0; k < 3; ++k) if (pcm[k] && k < p_->tracks) { c.pcm[k] = *pcm[k]; p_->bytes += pcm[k]->size() * sizeof(short); }
+    c.t = t + p_->offset;
+    for (int k = p_->tracks; k < 3; ++k) { if (c.pcm[k]) c.bytes -= c.pcm[k]->size() * sizeof(short); c.pcm[k].reset(); }
+    p_->bytes += c.bytes;
     p_->a.push_back(std::move(c));
 }
 
@@ -1737,6 +1834,11 @@ bool ReplayRing::save(const std::wstring& path, double& savedSeconds, std::wstri
         start = p_->startFor(p_->seconds);
         if (start < 0 || !p_->vtype) { err = L"Replay buffer is empty"; return false; }
         end = p_->lastEnd;
+        // refs only (ComPtr / shared_ptr): the copy of the media itself happens in the writer, outside the lock
+        size_t nv = 0, na = 0;
+        for (auto& x : p_->v) if (x.t >= start) ++nv;
+        for (auto& x : p_->a) if (x.t + 2000000 >= start) ++na;
+        vs.reserve(nv); as.reserve(na);
         for (auto& x : p_->v) if (x.t >= start) vs.push_back(x);
         for (auto& x : p_->a) if (x.t + 2000000 >= start) as.push_back(x);
         vt = p_->vtype; fps = p_->fps; channels = p_->channels; tracks = p_->tracks; audio = p_->audio;
@@ -1755,7 +1857,8 @@ bool ReplayRing::save(const std::wstring& path, double& savedSeconds, std::wstri
             for (; ai < as.size() && as[ai].t <= until; ++ai) {
                 const Impl::A& c = as[ai];
                 for (int k = 0; k < tracks; ++k) {
-                    const std::vector<short>& pc = c.pcm[k];
+                    if (!c.pcm[k]) continue;
+                    const std::vector<short>& pc = *c.pcm[k];
                     if (pc.empty()) continue;
                     LONGLONG t = c.t - start;
                     size_t skip = 0;

@@ -15,7 +15,7 @@ struct Settings {
     int fps = 30;                       // 15, 30 or 60
     Quality quality = Quality::High;
     Encoder encoder = Encoder::Auto;
-    Container container = Container::MKV;  // v1.1 default: MKV, auto-remuxed to MP4
+    Container container = Container::MP4;  // v1.0: fragmented MP4 (crash-safe, written once, no remux)
     Codec codec = Codec::Auto;
     bool autoRemux = true;
     std::string outputDir;              // UTF-8; empty = default (Videos\Cast Recorder)
@@ -43,7 +43,7 @@ struct Settings {
     bool monitoring = false;           // hear the processed mic on the default output
     bool pushToTalk = false;
     Hotkey pttKey{MOD_CTRL_, 0x20};    // Ctrl+Space (held)
-    int channels = 1;                  // 1 mono, 2 stereo
+    int channels = 2;                  // 1 mono, 2 stereo (default)
     OutputScale scale = OutputScale::Native;
     int gpuIndex = -1;                 // -1 Auto; else adapter ordinal
     unsigned bitrateCap = 0;           // 0 = uncapped beyond quality
@@ -52,7 +52,7 @@ struct Settings {
     bool hotkeysMigrated = false;
     // v1.1
     bool replayEnabled = false;
-    int replaySeconds = 30;            // 5..900
+    int replaySeconds = 30;            // 5..600 typed; 10/15 min presets only when memory allows (<= 900)
     Hotkey saveReplay{MOD_CTRL_ | MOD_SHIFT_, 0x77};  // Ctrl+Shift+F8
     Hotkey screenshot{MOD_CTRL_ | MOD_SHIFT_, 0x7B};  // Ctrl+Shift+F12
     std::string screenshotFormat = "png";  // png | jpg
@@ -71,6 +71,8 @@ bool fromString(const std::string& s, Codec& c);
 // File name (no extension) for a recording started at the given local time. source: short label, counter: 1-based.
 std::string fileNameFor(const std::string& pattern, int y, int mo, int d, int h, int mi, int se, const std::string& source, int counter);
 bool validAccent(const std::string& a);
+bool isReservedName(const std::string& name);   // CON, NUL, COM1, ... (case-insensitive, extension ignored)
+bool parseIntStrict(const std::string& t, int lo, int hi, int& out);
 const char* extension(Container c);  // ".mp4"
 bool fromString(const std::string& s, Encoder& e);
 bool fromString(const std::string& s, Container& c);

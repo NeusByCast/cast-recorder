@@ -4,6 +4,7 @@
 #include <string>
 #include "../src/core/hotkey.h"
 #include "../src/core/settings.h"
+#include "../src/core/fsm.h"
 
 using namespace cr;
 static int g_fail = 0, g_pass = 0;
@@ -175,12 +176,12 @@ static void testSettingsV2() {
     CHECK(b.systemDevice == a.systemDevice && b.systemMuted && b.micMuted && b.micVolume == 150 && b.noiseSuppression);
     CHECK(b.noiseGateDb == -50 && b.monitoring && b.pushToTalk && b.pttKey == a.pttKey && b.channels == 2);
     cr::Settings c; CHECK(cr::fromJson("{\"micVolume\": 900, \"channels\": 7, \"sourceKind\": \"bogus\", \"noiseGateDb\": 5}", c));
-    CHECK(c.micVolume == 100 && c.channels == 1 && c.sourceKind == "all" && c.noiseGateDb == -42);
+    CHECK(c.micVolume == 100 && c.channels == 2 && c.sourceKind == "all" && c.noiseGateDb == -42);
 }
 
 static void testSettingsV11() {
     cr::Settings d;
-    CHECK(d.container == cr::Container::MKV && d.autoRemux && !d.replayEnabled && d.replaySeconds == 30 && !d.separateTracks);
+    CHECK(d.container == cr::Container::MP4 && d.autoRemux && !d.replayEnabled && d.replaySeconds == 30 && !d.separateTracks);
     CHECK(cr::format(d.saveReplay) == "Ctrl+Shift+F8" && cr::format(d.screenshot) == "Ctrl+Shift+F12");
     CHECK(d.codec == cr::Codec::Auto && d.theme == "auto" && d.accent == "red" && d.screenshotFormat == "png");
     cr::Settings a; a.codec = cr::Codec::HEVC; a.autoRemux = false; a.replayEnabled = true; a.replaySeconds = 600;
@@ -200,6 +201,23 @@ static void testSettingsV11() {
     CHECK_EQ(cr::fileNameFor("date_time", 2026, 10, 14, 9, 5, 7, "", 1), std::string("2026-10-14_09-05-07"));
     CHECK_EQ(cr::fileNameFor("source_date_time", 2026, 1, 2, 3, 4, 5, "Note:pad?.", 1), std::string("Notepad_2026-01-02_03-04-05"));
     CHECK_EQ(cr::fileNameFor("cast_counter", 2026, 1, 2, 3, 4, 5, "", 12), std::string("cast_012"));
+    // v1.0 QA: path-like / reserved source names, PTT dedupe, strict numbers, stop retry, vendor conflicts
+    for (const char* ev : {"..\\..\\Windows\\x", "a/b:c*?\"<>|", "CON", "  ..  ", "nul.txt", "COM3"}) {
+        std::string n = cr::fileNameFor("source_date_time", 2026, 10, 14, 23, 1, 2, ev, 1);
+        CHECK(n.find_first_of("\\/:*?\"<>|") == std::string::npos && n.find("..") == std::string::npos);
+        CHECK(!cr::isReservedName(n.substr(0, n.find('_', 1))));
+    }
+    CHECK(cr::isReservedName("con") && cr::isReservedName("LPT1.mp4") && cr::isReservedName("Aux ") && !cr::isReservedName("console") && !cr::isReservedName("COM0"));
+    cr::Settings w;
+    CHECK(cr::fromJson("{\"version\":2,\"hotkeyPushToTalk\":\"Ctrl+Shift+F9\"}", w));
+    CHECK(!(w.pttKey == w.toggleRecord) && w.pttKey == cr::Settings{}.pttKey);
+    int iv = 0;
+    CHECK(cr::parseIntStrict("45", 5, 600, iv) && iv == 45 && cr::parseIntStrict(" 600 ", 5, 600, iv) && iv == 600);
+    CHECK(!cr::parseIntStrict("45s", 5, 600, iv) && !cr::parseIntStrict("4", 5, 600, iv) && !cr::parseIntStrict("601", 5, 600, iv));
+    CHECK(!cr::parseIntStrict("-5", 5, 600, iv) && !cr::parseIntStrict("", 5, 600, iv) && !cr::parseIntStrict("99999999999999", 5, 600, iv) && !cr::parseIntStrict("1e2", 5, 600, iv));
+    cr::RecFsm f; CHECK(f.tryStart() && f.pause() && f.requestStop() && f.get() == cr::RecState::Stopping);
+    CHECK(cr::validate(cr::Hotkey{cr::MOD_ALT_ | cr::MOD_SHIFT_, 0x79}).severity != cr::Severity::Ok);
+    CHECK(cr::validate(cr::Hotkey{cr::MOD_CTRL_ | cr::MOD_SHIFT_, 'G'}).severity != cr::Severity::Ok);
 }
 
 int main() {

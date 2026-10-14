@@ -41,9 +41,10 @@ struct RecFsm {
     }
     // Request stop from Recording or Paused (or ignore if already stopping/finishing/idle).
     bool requestStop() {
+        // Retry: a concurrent pause/resume (Recording <-> Paused) must not swallow the stop.
         auto cur = state.load();
-        if (cur == RecState::Recording || cur == RecState::Paused)
-            return state.compare_exchange_strong(cur, RecState::Stopping);
+        while (cur == RecState::Recording || cur == RecState::Paused)
+            if (state.compare_exchange_weak(cur, RecState::Stopping)) return true;
         return cur == RecState::Stopping || cur == RecState::Finishing;
     }
     bool beginFinish() {

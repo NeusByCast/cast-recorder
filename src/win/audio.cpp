@@ -172,6 +172,7 @@ std::vector<AudioDevice> listOutputDevices() { return listEndpoints(eRender); }
 // One capture stream (48 kHz stereo float via the engine's converter) placed on the media timeline by QPC.
 struct AudioSource {
     bool isMic = false, loopback = false, procLoopback = false, pcm16 = false, allowMonitor = false;
+    unsigned long long ownSoundMuted = 0;  // packets silenced around our own UI sounds
     MicChain chain;
     MonitorOut mon;
     std::wstring id, name, devName;
@@ -333,6 +334,17 @@ struct AudioSource {
                 else if (pcm16) { const short* s16 = (const short*)data; for (size_t i = 0; i < conv.size(); ++i) conv[i] = s16[i] / 32768.f; }
                 else memcpy(conv.data(), data, conv.size() * sizeof(float));
                 cap->ReleaseBuffer(frames);
+                if (isMic || (loopback && !procLoopback)) {  // silence our own UI sounds (see AudioFx::markOwnSound)
+                    const long long f0 = audioFx().ownSoundFrom.load(), f1 = audioFx().ownSoundTo.load();
+                    const long long p0 = (long long)qpc, p1 = p0 + (long long)frames * 10000000LL / AudioMixer::kRate;
+                    if (f1 > 0 && p1 > f0 && p0 < f1) {
+                        for (UINT32 i = 0; i < frames; ++i) {
+                            long long t = p0 + (long long)i * 10000000LL / AudioMixer::kRate;
+                            if (t >= f0 && t < f1) conv[i * 2] = conv[i * 2 + 1] = 0.f;
+                        }
+                        ++ownSoundMuted;
+                    }
+                }
                 if (isMic) {
                     peakTo(audioFx().levelMic, chain.run(conv.data(), frames));
                     // the noise suppressor delays its output: those samples were captured that much earlier

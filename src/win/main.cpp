@@ -118,12 +118,14 @@ const wchar_t* kFnameL[] = {L"cast_date_time", L"date_time", L"source_date_time"
 enum { TK_REPLAY, TK_STARTED, TK_STOPPED, TK_SHOT, TK_SAVED, TK_ERROR, TK_TEST };  // toast kinds
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3, HK_MIC = 4, HK_REPLAY = 5, HK_SHOT = 6;
-constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2, TIMER_SELFTEST = 3, TIMER_FRAME = 6, TIMER_TOAST = 7, TIMER_RESCAN = 8, TIMER_HKTEST = 9;
+constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2, TIMER_SELFTEST = 3, TIMER_FRAME = 6, TIMER_TOAST = 7, TIMER_RESCAN = 8, TIMER_HKTEST = 9, TIMER_REPLAYRESTART = 10;
 constexpr UINT WM_APP_REPLAY_DONE = WM_APP + 45, WM_APP_REPLAY_SAVED = WM_APP + 46, WM_APP_SHOT_SAVED = WM_APP + 47, WM_APP_REMUX_DONE = WM_APP + 48,
                WM_APP_META = WM_APP + 50, WM_APP_DIRCHANGE = WM_APP + 51;
 constexpr int BASE_W = 1100, BASE_H = 700, MIN_W = 960, MIN_H = 620;  // v2 SPEC: Window
-// UI watchdog > worst-case teardown: capture Close 2 s + Finalize (8000/2) + remux (8000/2) + 3 s margin.
-constexpr ULONGLONG kWatchdogMs = 2000 + 8000 / 2 + 8000 / 2 + 3000;
+// UI watchdog > worst-case teardown: capture Close 2 s + Finalize (8000/2) + 3 s margin. It only covers a stuck
+// Finalize: MKV conversion / remux run later in the background file queue, never under this watchdog, and the
+// recording (fragmented MP4) is never deleted by it.
+constexpr ULONGLONG kWatchdogMs = 2000 + 8000 / 2 + 3000;
 
 struct App {
     HINSTANCE inst{};
@@ -321,8 +323,23 @@ std::wstring outputDir() { return g.s.outputDir.empty() ? defaultOutputDir() : W
 void setStatus(const std::wstring& s, COLORREF c) { g.status = s; g.statusColor = c; if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE); }
 
 // Our own tones (res/sounds, scripts/make-sounds.py): soft filtered-noise glides at -34 dBFS (tick -38, shutter -36).
+// Length of a WAVE resource in ms (PCM header), 600 if unknown.
+static double toneMs(int id) {
+    HRSRC r = FindResourceW(g.inst, MAKEINTRESOURCEW(id), L"WAVE");
+    if (!r) return 600;
+    DWORD sz = SizeofResource(g.inst, r);
+    const BYTE* p = (const BYTE*)LockResource(LoadResource(g.inst, r));
+    if (!p || sz < 44) return 600;
+    DWORD byteRate = *(const DWORD*)(p + 28);
+    return byteRate ? (sz - 44) * 1000.0 / byteRate : 600;
+}
 void playTone(int id) {
     LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
+    {   // keep it out of the mic (and of system audio without process-loopback exclusion): output latency + tail
+        LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+        long long now100 = (long long)(a.QuadPart / qf.QuadPart * 10000000LL + a.QuadPart % qf.QuadPart * 10000000LL / qf.QuadPart);
+        audioFx().markOwnSound(now100 - 200000LL, now100 + (long long)((toneMs(id) + 350.0) * 10000.0));
+    }
     if (!PlaySoundW(MAKEINTRESOURCEW(id), g.inst, SND_RESOURCE | SND_ASYNC | SND_NODEFAULT))
         PlaySoundW(reinterpret_cast<LPCWSTR>(kClickWav), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
     QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
@@ -395,6 +412,17 @@ RecordOptions optionsFromSettings() {
 }
 // Background warm-up (startup and when encoder-relevant settings change): same device/capture/encoder
 // selection as a real recording, but exits before the loop. Probe results are cached process-wide.
+// What the replay buffer session depends on: a change to anything else (theme, hotkeys, file names, screenshot
+// format, output folder, ...) must not throw the buffered seconds away.
+std::wstring replaySig() {
+    RecordOptions o = optionsFromSettings();
+    wchar_t b[256];
+    swprintf(b, 256, L"%d|%d|%d|%d|%d|%d|%u|%d|%d|%d|%d|%d|%p|%p|%d|%d", o.fps, (int)o.quality, (int)o.encoder, (int)o.codec, o.gpuIndex, (int)o.scale,
+             o.bitrateCap, o.systemAudio ? 1 : 0, o.mic ? 1 : 0, o.channels, o.separateTracks ? 1 : 0, o.allDisplays ? 1 : 0, (void*)o.monitor, (void*)o.window,
+             o.captureCursor ? 1 : 0, o.codec == Codec::Auto ? (int)o.container * 2 + (o.autoRemux ? 1 : 0) : -1);
+    return std::wstring(b) + L"|" + o.micId + L"|" + o.systemId;
+}
+std::wstring g_replaySig;  // signature the running buffer session was started with
 void startWarmup() {
     if (g.warm.running() || g.rec.running()) return;
     g.warmLogged = false;
@@ -409,6 +437,7 @@ void startWarmup() {
 
 void stopReplayBuffer();
 extern std::atomic<int> g_shotsBusy;
+void queuePost(const cr::PostJob& pj); bool remuxBusy();
 void forceQuit() {
     g.quitting = true;
     stopReplayBuffer();
@@ -426,7 +455,12 @@ void forceQuit() {
     }
     if (g.rec.running()) g.rec.abort();
     g.rec.waitUntilIdle(500);
-    if (g.recPending) { g.recPending = false; writeSessionLog(g.rec.result(), L"recording (saved on exit)"); }
+    if (g.recPending) {
+        g.recPending = false;
+        const RecordResult& r = g.rec.result();
+        writeSessionLog(r, L"recording (saved on exit)");
+        if (r.ok && r.post.needed()) queuePost(r.post);
+    }
     DestroyWindow(g.hwnd);
 }
 
@@ -830,6 +864,14 @@ const DisplayInfo* displayFor(HMONITOR m) {
     return g_displays.empty() ? nullptr : &g_displays[0];
 }
 std::wstring g_srcTitle;  // window title for the field
+// Window titles can hold private text (document names, chats, URLs): the log gets a stable hash instead, the
+// settings file keeps the real title so the window can still be found again.
+std::wstring redactTitle(const std::wstring& t) {
+    uint32_t hsh = 2166136261u;
+    for (wchar_t c : t) { hsh ^= (uint32_t)c; hsh *= 16777619u; }
+    wchar_t b[48]; swprintf(b, 48, L"title#%08x (%u chars)", hsh, (unsigned)t.size());
+    return b;
+}
 HICON g_srcIcon = nullptr;
 std::wstring sourceText() {
     if (g.target.kind == CaptureTarget::Window) return g_srcTitle.empty() ? L"Window" : g_srcTitle;
@@ -864,7 +906,7 @@ void resolveSource() {
             g.target.kind = CaptureTarget::Window; g.target.hwnd = h;
             for (auto& w : listCaptureWindows()) if (w.hwnd == h) { g_srcTitle = w.title; g_srcIcon = w.icon; }
         } else {
-            cr::appLog(L"source: saved window " + W(g.s.sourceExe) + L" \"" + W(g.s.sourceTitle) + L"\" not found, using Full screen");
+            cr::appLog(L"source: saved window " + W(g.s.sourceExe) + L" " + redactTitle(W(g.s.sourceTitle)) + L" not found, using Full screen");
             setStatus(L"Saved window isn't open \u2013 using Full screen", toRef(T_TEXT2));
         }
     }
@@ -936,15 +978,39 @@ std::wstring encoderText() {
 }
 std::wstring g_ctxPath;  // recording the context menu acts on
 const wchar_t* kCtxL[] = {L"Open", L"Show in folder", L"Remux to MP4", L"Rename", L"Delete"};
+std::vector<int> replayPresets();
 int ddCount(int id) {
     switch (id) {
         case H_DD_FPS: return 3; case H_DD_QUAL: return 4; case H_DD_ENC: return (int)g_encChoices.size();
         case H_DD_GPU: return 1 + (int)g.gpus.size(); case H_DD_RES: return 4; case H_DD_CONT: return 2;
         case H_DD_SYSDEV: return 1 + (int)g.outs.size(); case H_DD_MICDEV: return 1 + (int)g.mics.size();
-        case H_DD_REPLAYLEN: return 8; case H_DD_FNAME: return 4; case H_DD_SHOTFMT: return 2; case H_CTXMENU: return 5;
+        case H_DD_REPLAYLEN: return (int)replayPresets().size() + 1; case H_DD_FNAME: return 4; case H_DD_SHOTFMT: return 2; case H_CTXMENU: return 5;
     }
     return 0;
 }
+// ---- instant replay memory budget ----
+void sourceSize(int& w, int& h);
+struct ReplayBudget { unsigned long long perSec = 0; size_t cap = 0; int effSecs = 0; };
+ReplayBudget replayBudget(int secs) {
+    int w = 0, h = 0; sourceSize(w, h);
+    if (w <= 0 || h <= 0) { w = 1920; h = 1080; }
+    int maxH = g.s.scale == OutputScale::P1440 ? 1440 : g.s.scale == OutputScale::P1080 ? 1080 : g.s.scale == OutputScale::P720 ? 720 : 0;
+    if (maxH && h > maxH) { w = (int)((long long)w * maxH / h) & ~1; h = maxH; }
+    unsigned br = bitrateFor(g.s.quality, w, h, g.s.fps, g.s.bitrateCap);
+    ReplayBudget b;
+    b.perSec = ReplayRing::estimateBytes(1, br, g.s.channels, g.s.separateTracks ? 3 : 1, g.s.systemAudio || g.s.micEnabled);
+    b.cap = ReplayRing::defaultMaxBytes();
+    unsigned long long fit = b.perSec ? b.cap / b.perSec : (unsigned long long)secs;
+    b.effSecs = (int)std::min<unsigned long long>((unsigned long long)secs, fit);
+    return b;
+}
+// 15 s .. 5 min always; 10 / 15 min only when they fit in the RAM cap at the current quality
+std::vector<int> replayPresets() {
+    std::vector<int> v = {15, 30, 60, 120, 300};
+    for (int s : {600, 900}) if (replayBudget(s).effSecs >= s) v.push_back(s);
+    return v;
+}
+std::wstring presetLabel(int s) { for (int i = 0; i < 7; ++i) if (kReplayLen[i] == s) return kReplayLenL[i]; return std::to_wstring(s) + L" s"; }
 std::wstring ddItem(int id, int i) {
     switch (id) {
         case H_DD_FPS: return kFpsL[i]; case H_DD_QUAL: return kQualL[i];
@@ -954,7 +1020,7 @@ std::wstring ddItem(int id, int i) {
         case H_DD_CONT: return kContL[i];
         case H_DD_SYSDEV: return i == 0 ? std::wstring(L"Default output") : g.outs[i - 1].name;
         case H_DD_MICDEV: return i == 0 ? std::wstring(L"Default microphone") : g.mics[i - 1].name;
-        case H_DD_REPLAYLEN: return i < 7 ? std::wstring(kReplayLenL[i]) : std::wstring(L"Custom\u2026");
+        case H_DD_REPLAYLEN: { auto ps = replayPresets(); return i < (int)ps.size() ? presetLabel(ps[i]) : std::wstring(L"Custom (5\u2013600 s)\u2026"); }
         case H_DD_FNAME: return kFnameL[i];
         case H_DD_SHOTFMT: return i ? L"JPG" : L"PNG";
         case H_CTXMENU: return kCtxL[i];
@@ -970,7 +1036,7 @@ int ddSel(int id) {
         case H_DD_CONT: return g.s.container == Container::MKV ? 0 : 1;
         case H_DD_SYSDEV: for (size_t k = 0; k < g.outs.size(); ++k) if (U(g.outs[k].id) == g.s.systemDevice) return (int)k + 1; return 0;
         case H_DD_MICDEV: for (size_t k = 0; k < g.mics.size(); ++k) if (U(g.mics[k].id) == g.s.micDevice) return (int)k + 1; return 0;
-        case H_DD_REPLAYLEN: for (int k = 0; k < 7; ++k) if (kReplayLen[k] == g.s.replaySeconds) return k; return 7;
+        case H_DD_REPLAYLEN: { auto ps = replayPresets(); for (size_t k = 0; k < ps.size(); ++k) if (ps[k] == g.s.replaySeconds) return (int)k; return (int)ps.size(); }
         case H_DD_FNAME: for (int k = 0; k < 4; ++k) if (g.s.fileNamePattern == kFname[k]) return k; return 0;
         case H_DD_SHOTFMT: return g.s.screenshotFormat == "jpg" ? 1 : 0;
         case H_CTXMENU: return -1;
@@ -991,10 +1057,13 @@ void ctxAction(int item, int action);
 void applyReplaySeconds(int v) {
     g.s.replaySeconds = v; save();
     if (g.ring) g.ring->setSeconds(v);
+    ReplayBudget b = replayBudget(v);
+    if (b.effSecs < v) cr::appLog(L"replay: " + std::to_wstring(v) + L" s needs ~" + std::to_wstring(b.perSec * (unsigned long long)v >> 20) + L" MB, capped at " + std::to_wstring(b.cap >> 20) + L" MB -> about " + std::to_wstring(b.effSecs) + L" s");
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 // Encoder-relevant change: the replay buffer (when on) restarts on the new config, otherwise the warm-up re-probes.
-void encoderSettingsChanged() { if (g.s.replayEnabled && !g.rec.running()) restartReplayBuffer(); else startWarmup(); }
+void scheduleReplayRestart();
+void encoderSettingsChanged() { if (g.s.replayEnabled && !g.rec.running()) scheduleReplayRestart(); else startWarmup(); }
 void ddSet(int id, int i) {
     if (id == H_CTXMENU) { ctxAction(0, i); return; }
     switch (id) {
@@ -1004,14 +1073,16 @@ void ddSet(int id, int i) {
         case H_DD_RES: g.s.scale = kRes[i]; break; case H_DD_CONT: g.s.container = kCont[i]; break;
         case H_DD_SYSDEV: g.s.systemDevice = i > 0 ? U(g.outs[i - 1].id) : std::string(); break;
         case H_DD_MICDEV: g.s.micDevice = i > 0 ? U(g.mics[i - 1].id) : std::string(); break;
-        case H_DD_REPLAYLEN:
-            if (i < 7) { applyReplaySeconds(kReplayLen[i]); return; }
-            beginEdit(2, RF(150, 427, 120, 18), std::to_wstring(g.s.replaySeconds), L""); return;
+        case H_DD_REPLAYLEN: {
+            auto ps = replayPresets();
+            if (i < (int)ps.size()) { applyReplaySeconds(ps[i]); return; }
+            }
+            beginEdit(2, RF(150, 417, 120, 18), std::to_wstring(g.s.replaySeconds), L""); return;
         case H_DD_FNAME: g.s.fileNamePattern = kFname[i]; break;
         case H_DD_SHOTFMT: g.s.screenshotFormat = i ? "jpg" : "png"; break;
     }
     save();
-    if (id == H_DD_SYSDEV || id == H_DD_MICDEV) { restartMeter(); if (g.replay.running()) restartReplayBuffer(); }
+    if (id == H_DD_SYSDEV || id == H_DD_MICDEV) { restartMeter(); if (g.replay.running()) scheduleReplayRestart(); }
     if (id == H_DD_FPS || id == H_DD_QUAL || id == H_DD_ENC || id == H_DD_GPU || id == H_DD_RES || id == H_DD_CONT) encoderSettingsChanged();
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
@@ -1327,6 +1398,11 @@ std::wstring replayLenText() {
     for (int i = 0; i < 7; ++i) if (kReplayLen[i] == g.s.replaySeconds) return kReplayLenL[i];
     return std::to_wstring(g.s.replaySeconds) + L" s (custom)";
 }
+std::wstring durText(int s) {
+    if (s < 60) return std::to_wstring(s) + L" s";
+    if (s % 60 == 0) return std::to_wstring(s / 60) + L" min";
+    return std::to_wstring(s / 60) + L" min " + std::to_wstring(s % 60) + L" s";
+}
 std::wstring lastSavedText(double secs) {
     int s = (int)std::lround(secs);
     if (s < 60) return L"Last " + std::to_wstring(s) + (s == 1 ? L" second saved" : L" seconds saved");
@@ -1336,6 +1412,7 @@ std::wstring lastSavedText(double secs) {
 void ensureRing() {
     if (!g.ring) g.ring = std::make_shared<ReplayRing>(g.s.replaySeconds);
     else g.ring->setSeconds(g.s.replaySeconds);
+    g.ring->setMaxBytes(ReplayRing::defaultMaxBytes());
 }
 void startReplayBuffer() {
     if (g_renderOnly || !g.hwnd || !g.s.replayEnabled || g.rec.running() || g.replay.running() || g.quitting || g.rec.mfAbandoned()) return;
@@ -1346,7 +1423,7 @@ void startReplayBuffer() {
     wchar_t tp[MAX_PATH]; GetTempPathW(MAX_PATH, tp);
     o.outputPath = std::wstring(tp) + L"castrec-replay" + std::to_wstring(GetCurrentProcessId()) + L".mp4";
     LARGE_INTEGER q; QueryPerformanceCounter(&q); o.pressQpc = q.QuadPart;
-    if (g.replay.start(o)) cr::appLog(L"replay buffer: started (" + std::to_wstring(g.s.replaySeconds) + L" s)");
+    if (g.replay.start(o)) { g_replaySig = replaySig(); cr::appLog(L"replay buffer: started (" + std::to_wstring(g.s.replaySeconds) + L" s, cap " + std::to_wstring(g.ring->maxBytes() >> 20) + L" MB)"); }
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 void stopReplayBuffer() {
@@ -1355,6 +1432,16 @@ void stopReplayBuffer() {
     if (!g.replay.waitUntilIdle(4000)) { g.replay.abort(); g.replay.waitUntilIdle(1000); }
 }
 void restartReplayBuffer() { stopReplayBuffer(); startReplayBuffer(); }
+// Debounced (600 ms) and only if a setting the buffer depends on really changed.
+void scheduleReplayRestart() { if (g.hwnd && !g_renderOnly) SetTimer(g.hwnd, TIMER_REPLAYRESTART, 600, nullptr); }
+void replayRestartTimer() {
+    KillTimer(g.hwnd, TIMER_REPLAYRESTART);
+    if (!g.s.replayEnabled || g.rec.running()) return;
+    if (!g.replay.running()) { startReplayBuffer(); return; }
+    if (replaySig() == g_replaySig) { cr::appLog(L"replay buffer: settings change doesn't affect it, kept running"); return; }
+    cr::appLog(L"replay buffer: restarting for new settings");
+    restartReplayBuffer();
+}
 struct ReplaySaved { bool ok; std::wstring path, err; double secs; };
 void saveReplay() {
     if (!g.s.replayEnabled) { setStatus(L"Instant replay is off (turn it on in Settings)", toRef(T_TEXT2)); return; }
@@ -1413,7 +1500,7 @@ void beginEdit(int kind, RF r, const std::wstring& text, const std::wstring& pat
     if (!g_edit.hwnd) { g_edit.kind = 0; return; }
     SendMessageW(g_edit.hwnd, WM_SETFONT, (WPARAM)g.fBody, TRUE);
     SendMessageW(g_edit.hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(2, 2));
-    if (kind == 2) SendMessageW(g_edit.hwnd, EM_SETLIMITTEXT, 3, 0);
+    if (kind == 2) SendMessageW(g_edit.hwnd, EM_SETLIMITTEXT, 3, 0);  // digits only (ES_NUMBER); paste is re-checked strictly
     g_edit.orig = (WNDPROC)SetWindowLongPtrW(g_edit.hwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
     SetFocus(g_edit.hwnd);
     SendMessageW(g_edit.hwnd, EM_SETSEL, 0, -1);
@@ -1433,16 +1520,19 @@ void commitEdit(bool ok) {
     DestroyWindow(e);
     SetFocus(g.hwnd);
     if (ok && kind == 2 && !t.empty()) {
-        int v = _wtoi(t.c_str());
-        if (v < 5 || v > 900) setStatus(L"Replay length must be 5\u2013900 seconds", toRef(T_ERR));
+        int v = 0;
+        if (!parseIntStrict(U(t), 5, 600, v)) setStatus(L"Replay length must be a whole number of seconds, 5\u2013600", toRef(T_ERR));
         else applyReplaySeconds(v);
     }
     if (ok && kind == 1 && !t.empty()) {
         const std::wstring& old = g_edit.path;
         size_t sl = old.find_last_of(L'\\'), dot = old.find_last_of(L'.');
         bool badc = t.find_first_of(L"<>:\"/\\|?*") != std::wstring::npos || t.back() == L'.';
+        for (wchar_t c : t) if (c < 0x20) badc = true;
         std::wstring nu = old.substr(0, sl + 1) + t + old.substr(dot);
         if (badc) setStatus(L"A file name can't contain < > : \" / \\ | ? *", toRef(T_ERR));
+        else if (isReservedName(U(t))) setStatus(L"\u201c" + t + L"\u201d is reserved by Windows (CON, PRN, AUX, NUL, COM1\u20139, LPT1\u20139)", toRef(T_ERR));
+        else if (old.size() - sl - 1 > 0 && nu.size() >= MAX_PATH) setStatus(L"That name is too long", toRef(T_ERR));
         else if (nu != old && !MoveFileW(old.c_str(), nu.c_str()))
             setStatus(GetLastError() == ERROR_ALREADY_EXISTS ? L"A file with that name already exists" : L"Couldn't rename (the file may be open)", toRef(T_ERR));
         else { cr::appLog(L"recordings: renamed " + old + L" -> " + nu); scanRecordings(); }
@@ -1472,6 +1562,7 @@ void metaWorker();
 void scanRecordings() {
     std::wstring dir = outputDir();
     std::vector<RecItem> found;
+    const std::wstring live = g.rec.isActive() ? lowerW(g.rec.currentFile()) : std::wstring();  // the file being recorded
     for (const wchar_t* pat : {L"\\*.mp4", L"\\*.mkv"}) {
         WIN32_FIND_DATAW fd{};
         HANDLE f = FindFirstFileW((dir + pat).c_str(), &fd);
@@ -1480,6 +1571,7 @@ void scanRecordings() {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             std::wstring n = fd.cFileName, ln = lowerW(n);
             if (ln.find(L".part.") != std::wstring::npos || ln.find(L"castrec-") == 0 || ln.find(L".tmp.") != std::wstring::npos) continue;
+            if (!live.empty() && lowerW(dir + L"\\" + n) == live) continue;
             RecItem it;
             it.path = dir + L"\\" + n; it.ext = lowerExt(n);
             it.name = n.substr(0, n.size() - it.ext.size() - 1);
@@ -1579,51 +1671,85 @@ void startWatcher() {
         FindCloseChangeNotification(ch);
     });
 }
-// Remux jobs (stream copy, recorder.cpp remuxFile): one at a time, in order.
+// Background file jobs, one at a time, in order: manual / auto remux MKV -> MP4 (Media Foundation by default) and
+// post-processing of a just-saved recording (MKV conversion, track names). None of these can delete a saved file:
+// the source is only removed after the new file is complete.
+struct FileJob { std::wstring in; bool post = false; cr::PostJob pj; };
 std::mutex g_remuxM;
-std::vector<std::wstring> g_remuxQueue;
-std::wstring g_remuxCur, g_remuxOut; unsigned long long g_remuxInSize = 0;
-std::atomic<bool> g_remuxRun{false};
-struct RemuxDone { bool ok; std::wstring in, out, err; };
+std::vector<FileJob> g_remuxQueue;               // guarded by g_remuxM
+std::wstring g_remuxCur, g_remuxOut;             // guarded by g_remuxM
+unsigned long long g_remuxInSize = 0;            // guarded by g_remuxM
+bool g_remuxRun = false;                         // guarded by g_remuxM: a worker thread owns the queue
+struct RemuxDone { bool ok; std::wstring in, out, err; bool post = false; };
 std::wstring remuxTarget(const std::wstring& in) {
     std::wstring base = in.substr(0, in.size() - 4), out = base + L".mp4";
     for (int k = 2; GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES && k < 100; ++k) out = base + L" (" + std::to_wstring(k) + L").mp4";
     return out;
 }
-void remuxPump() {
-    if (g_remuxRun.exchange(true)) return;
+void remuxPumpLocked() {  // call with g_remuxM held
+    if (g_remuxRun || g_remuxQueue.empty()) return;
+    g_remuxRun = true;
     HWND h = g.hwnd;
     std::thread([h] {
         HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         for (;;) {
-            std::wstring in;
-            { std::lock_guard<std::mutex> l(g_remuxM); if (g_remuxQueue.empty()) { g_remuxCur.clear(); break; } in = g_remuxQueue.front(); g_remuxQueue.erase(g_remuxQueue.begin()); g_remuxCur = in; }
-            WIN32_FILE_ATTRIBUTE_DATA fa{};
-            g_remuxInSize = GetFileAttributesExW(in.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
-            auto* r = new RemuxDone{false, in, remuxTarget(in), L""};
-            { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = r->out; }
-            r->ok = remuxFile(in, r->out, r->err, L"", (DWORD)(30000 + g_remuxInSize / (50ull << 20) * 1000));
+            FileJob job;
+            {
+                std::lock_guard<std::mutex> l(g_remuxM);
+                // empty check and "no worker" flag flip under one lock: a job queued now can't be stranded
+                if (g_remuxQueue.empty()) { g_remuxCur.clear(); g_remuxOut.clear(); g_remuxRun = false; break; }
+                job = g_remuxQueue.front(); g_remuxQueue.erase(g_remuxQueue.begin());
+                g_remuxCur = job.in;
+                WIN32_FILE_ATTRIBUTE_DATA fa{};
+                g_remuxInSize = GetFileAttributesExW(job.in.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
+            }
+            auto* r = new RemuxDone{false, job.in, L"", L"", job.post};
+            if (job.post) {
+                const std::wstring& dst = job.pj.mkvPath.empty() ? job.pj.file : job.pj.mkvPath;
+                size_t dot = dst.find_last_of(L'.');
+                { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = dst.substr(0, dot) + L".part" + dst.substr(dot); }
+                std::wstring fin, plog;
+                r->ok = postProcessRecording(job.pj, fin, plog);
+                r->out = fin; r->err = plog;
+                cr::appLog(L"post-process " + job.pj.file + L": " + plog);
+            } else {
+                r->out = remuxTarget(job.in);
+                { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = r->out; }
+                r->ok = remuxFile(job.in, r->out, r->err, L"", 0);
+            }
             if (!PostMessageW(h, WM_APP_REMUX_DONE, 0, (LPARAM)r)) delete r;
         }
-        g_remuxRun = false;
         if (SUCCEEDED(co)) CoUninitialize();
     }).detach();
 }
+bool remuxBusy() { std::lock_guard<std::mutex> l(g_remuxM); return g_remuxRun; }
 void queueRemux(const std::vector<std::wstring>& files) {
-    { std::lock_guard<std::mutex> l(g_remuxM);
-      for (auto& f : files) if (f != g_remuxCur && std::find(g_remuxQueue.begin(), g_remuxQueue.end(), f) == g_remuxQueue.end()) g_remuxQueue.push_back(f); }
-    remuxPump();
+    {
+        std::lock_guard<std::mutex> l(g_remuxM);
+        for (auto& f : files) {
+            bool dup = f == g_remuxCur;
+            for (auto& q : g_remuxQueue) if (q.in == f) dup = true;
+            if (!dup) { FileJob j; j.in = f; g_remuxQueue.push_back(j); }
+        }
+        remuxPumpLocked();
+    }
     if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);
 }
+void queuePost(const cr::PostJob& pj) {
+    { std::lock_guard<std::mutex> l(g_remuxM); FileJob j; j.in = pj.file; j.post = true; j.pj = pj; g_remuxQueue.push_back(j); remuxPumpLocked(); }
+    if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+std::wstring g_fakeRemuxPath;  // --render-ui: this row shows "Remuxing 42%"
 // 0..1 progress for a file being remuxed (output size vs input size), -1 if queued, -2 if not involved
 float remuxProgress(const std::wstring& path) {
+    if (!g_fakeRemuxPath.empty()) return path == g_fakeRemuxPath ? 0.42f : -2;
     std::lock_guard<std::mutex> l(g_remuxM);
     if (path == g_remuxCur) {
         WIN32_FILE_ATTRIBUTE_DATA fa{};
         unsigned long long o = GetFileAttributesExW(g_remuxOut.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
-        return g_remuxInSize ? std::min(0.98f, (float)o / (float)g_remuxInSize) : 0.f;
+        return g_remuxInSize ? std::min(0.99f, (float)o / (float)g_remuxInSize) : 0.f;
     }
-    for (auto& q : g_remuxQueue) if (q == path) return -1;
+    for (auto& q : g_remuxQueue) if (q.in == path) return -1;
     return -2;
 }
 bool hasMp4Sibling(const std::wstring& mkv) { return GetFileAttributesW((mkv.substr(0, mkv.size() - 4) + L".mp4").c_str()) != INVALID_FILE_ATTRIBUTES; }
@@ -1922,13 +2048,23 @@ void paintSettingsView(gp::Graphics& gr, float W, float H) {
     toggleW(gr, 306, 299, H_TG_REMUX, g.s.autoRemux);
     // Instant replay
     cardTitle(gr, replay, L"INSTANT REPLAY");
-    label(gr, L"Replay buffer", 38, 397, locked(H_TG_REPLAY));
-    toggleW(gr, 306, 397, H_TG_REPLAY, g.s.replayEnabled);
-    label(gr, L"Length", 38, 436);
-    RF lf(138, 420, 204, 32);
+    label(gr, L"Replay buffer", 38, 390, locked(H_TG_REPLAY));
+    toggleW(gr, 306, 390, H_TG_REPLAY, g.s.replayEnabled);
+    label(gr, L"Length", 38, 426);
+    RF lf(138, 410, 204, 32);
     if (g_edit.kind == 2) { g_edit.rect = lf; fillRR(gr, lf, 8, C(T_INPUT)); strokeRR(gr, lf, 8, C(T_ACC), 1.5f);
                             txt(gr, L"seconds", RF(lf.X + 12, lf.Y, lf.Width - 24, lf.Height), F.label, C(T_MUTED), AL_R, false); }
     else { ddField(gr, lf, H_DD_REPLAYLEN, replayLenText()); focusRing(gr, lf, 8, H_DD_REPLAYLEN); }
+    if (g.s.replayEnabled) {
+        ReplayBudget b = replayBudget(g.s.replaySeconds);
+        wchar_t cap[32]; swprintf(cap, 32, L"%.1f GB", b.cap / 1073741824.0);
+        if (b.effSecs < g.s.replaySeconds)
+            txt(gr, L"RAM cap " + std::wstring(cap) + L": keeps " + durText(b.effSecs), RF(138, 443, 204, 16), F.caption, C(T_WARN), AL_L, false);
+        else {
+            wchar_t mb[48]; swprintf(mb, 48, L"Uses about %.0f MB of RAM", (double)(b.perSec * (unsigned long long)g.s.replaySeconds) / 1048576.0);
+            txt(gr, mb, RF(138, 443, 204, 16), F.caption, C(T_MUTED), AL_L, false);
+        }
+    }
     // Appearance
     cardTitle(gr, look, L"APPEARANCE");
     label(gr, L"Theme", 38, 530);
@@ -2145,15 +2281,17 @@ void paintRecordingsView(gp::Graphics& gr, float W, float H) {
         fillRR(gr, bd, 11, C(bc, 0x29));
         txt(gr, mkv ? L"MKV" : L"MP4", bd, F.tiny, C(bc), AL_C, false);
         float R = lc.X + lc.Width;
-        float pr = mkv ? remuxProgress(it.path) : -2;
-        if (mkv && !hasMp4Sibling(it.path)) {
-            RF rb(R - 126, top + 12, 84, 32);
+        float pr = remuxProgress(it.path);
+        if ((mkv && !hasMp4Sibling(it.path)) || pr > -2) {
+            RF rb(pr >= 0 ? R - 146 : R - 126, top + 12, pr >= 0 ? 104.f : 84.f, 32);
             pressScope ps(gr, rb, base + 3);
             buttonBg(gr, rb, 8, base + 3, T_ELEV, WA(A_DEFAULT));
-            if (pr >= 0) {
-                fillRR(gr, RF(rb.X + 10, rb.Y + 22, (rb.Width - 20), 3), 1.5f, C(T_TRACK));
-                fillRR(gr, RF(rb.X + 10, rb.Y + 22, (rb.Width - 20) * pr, 3), 1.5f, C(T_ACC));
-                txt(gr, L"Remuxing", RF(rb.X, rb.Y - 3, rb.Width, rb.Height - 6), F.caption, C(T_TEXT2), AL_C, false);
+            if (pr >= 0) {  // progress bar: output bytes / input bytes (stream copy)
+                RF bar(rb.X + 10, rb.Y + 21, rb.Width - 20, 4);
+                fillRR(gr, bar, 2, C(T_TRACK));
+                if (pr > 0.005f) fillRR(gr, RF(bar.X, bar.Y, std::max(4.f, bar.Width * pr), bar.Height), 2, C(T_ACC));
+                std::wstring pt = L"Remuxing " + std::to_wstring((int)std::lround(pr * 100)) + L"%";
+                txt(gr, pt, RF(rb.X, rb.Y - 4, rb.Width, rb.Height - 6), F.caption, C(T_TEXT2), AL_C, false);
             } else if (pr == -1) txt(gr, L"Queued", rb, F.label, C(T_MUTED), AL_C, false);
             else {
                 float tw = txtW(gr, L"Remux", F.body), x0 = rb.X + (rb.Width - 22 - tw) / 2;
@@ -2846,7 +2984,7 @@ void click(int id) {
         if (p.empty()) return;
         if (part == 1) openPath(p);
         else if (part == 2) showInFolder(p);
-        else if (part == 3) queueRemux({p});
+        else if (part == 3 && lowerExt(p) == L"mkv" && remuxProgress(p) == -2) queueRemux({p});
         InvalidateRect(g.hwnd, nullptr, FALSE);
         return;
     }
@@ -2886,8 +3024,8 @@ void click(int id) {
             break;
         case H_FOLDERICON: openFolder(); break;
         case H_PATH: case H_BROWSE: if (!locked(H_BROWSE)) { pickFolder(); startWatcher(); } break;
-        case H_TG_SYS: if (!locked(id)) { g.s.systemAudio = !g.s.systemAudio; save(); restartMeter(); if (g.replay.running()) restartReplayBuffer(); } break;
-        case H_TG_MIC: if (!locked(id)) { g.s.micEnabled = !g.s.micEnabled; save(); restartMeter(); if (g.replay.running()) restartReplayBuffer(); } break;
+        case H_TG_SYS: if (!locked(id)) { g.s.systemAudio = !g.s.systemAudio; save(); restartMeter(); if (g.replay.running()) scheduleReplayRestart(); } break;
+        case H_TG_MIC: if (!locked(id)) { g.s.micEnabled = !g.s.micEnabled; save(); restartMeter(); if (g.replay.running()) scheduleReplayRestart(); } break;
         case H_TG_NS: g.s.noiseSuppression = !g.s.noiseSuppression; applyAudioFx(); save(); break;
         case H_TG_MON: g.s.monitoring = !g.s.monitoring; applyAudioFx(); save(); break;
         case H_TG_PTT: g.s.pushToTalk = !g.s.pushToTalk; syncPtt(); save(); break;
@@ -2909,7 +3047,7 @@ void click(int id) {
             break;
         }
         case H_CH_MONO: case H_CH_STEREO:
-            if (!locked(id)) { int c = id == H_CH_MONO ? 1 : 2; if (g.s.channels != c) { g.s.channels = c; save(); if (g.replay.running()) restartReplayBuffer(); } } break;
+            if (!locked(id)) { int c = id == H_CH_MONO ? 1 : 2; if (g.s.channels != c) { g.s.channels = c; save(); if (g.replay.running()) scheduleReplayRestart(); } } break;
         case H_RSEARCH: g_rsearchFocus = true; SetFocus(g.hwnd); kickAnim(); break;
         case H_REMUXALL: remuxAll(); break;
         default:
@@ -2985,7 +3123,7 @@ void frameTick() {
         if (uiActive()) { invalidateLogical(g_recordRect); invalidateLogical(g_statusRect); }
         if (g_viewIdx == 0 && g_pillRect.Width > 0) invalidateLogical(g_pillRect);  // replay dot pulse / save spinner
         static double lastSlow = 0;
-        if (g_viewIdx == 1 && (g_rsearchFocus || g_remuxRun) && t - lastSlow > 100) { lastSlow = t; InvalidateRect(g.hwnd, nullptr, FALSE); }
+        if (g_viewIdx == 1 && (g_rsearchFocus || remuxBusy()) && t - lastSlow > 100) { lastSlow = t; InvalidateRect(g.hwnd, nullptr, FALSE); }
     }
     if (g.replaySaving && t - g.replaySaveT > 300 && g_pillRect.Width > 0) invalidateLogical(g_pillRect);
 }
@@ -3252,6 +3390,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_TOAST) { toastTick(); return 0; }
         if (wp == TIMER_RESCAN) { KillTimer(h, wp); scanRecordings(); return 0; }
         if (wp == TIMER_HKTEST) { selftestHotkeysStep(); return 0; }
+        if (wp == TIMER_REPLAYRESTART) { replayRestartTimer(); return 0; }
         if (wp == TIMER_SELFTEST + 1) { KillTimer(h, wp); click(H_CLOSE); return 0; }  // stop + save + exit
         if (wp == TIMER_SELFTEST) { KillTimer(h, TIMER_SELFTEST); selftestSettings(); return 0; }
         if (wp == TIMER_PREVIEW) {
@@ -3341,9 +3480,16 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_APP_REMUX_DONE: {
         std::unique_ptr<RemuxDone> r((RemuxDone*)lp);
-        cr::appLog(L"remux " + std::wstring(r->ok ? L"ok: " : L"FAILED: ") + r->in + L" -> " + r->out + (r->ok ? L"" : L" (" + r->err + L")"));
-        if (r->ok) setStatus(L"Remuxed to " + fileNameOf(r->out), toRef(T_OK));
-        else setStatus(L"Remux failed: " + r->err, toRef(T_ERR));
+        if (r->post) {
+            for (auto& t : g_toasts) if (t->path == r->in && r->out != r->in) { t->path = r->out; t->sub = fileNameOf(r->out) + t->sub.substr(std::min(t->sub.size(), fileNameOf(r->in).size())); InvalidateRect(t->hwnd, nullptr, FALSE); }
+            if (r->ok) setStatus(L"Saved " + fileNameOf(r->out), toRef(T_OK));
+            else setStatus(L"Kept " + fileNameOf(r->out) + L"  \u00b7  " + r->err, toRef(T_WARN));
+            if (g_hkTestHook) g_hkTestHook(r->ok ? 107 : 207);
+        } else {
+            cr::appLog(L"remux " + std::wstring(r->ok ? L"ok: " : L"FAILED: ") + r->in + L" -> " + r->out + (r->ok ? L"" : L" (" + r->err + L")"));
+            if (r->ok) setStatus(L"Remuxed to " + fileNameOf(r->out), toRef(T_OK));
+            else setStatus(L"Remux failed: " + r->err, toRef(T_ERR));
+        }
         scanRecordings();
         return 0;
     }
@@ -3370,6 +3516,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (r.dropped) msg2 += L"  \u00b7  " + std::to_wstring(r.dropped) + L" dropped";
             if (!r.encoderFallbacks.empty()) msg2 += L"  \u00b7  " + r.encoderFallbacks.front() + L" failed its test encode, fell back";
             setStatus(msg2, toRef(T_OK));
+            if (r.post.needed()) queuePost(r.post);  // MKV / track names: background stream copy, the MP4 is already safe
             WIN32_FILE_ATTRIBUTE_DATA fa{};
             unsigned long long sz = GetFileAttributesExW(r.file.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
             std::wstring sub = fname + L" \u00b7 " + sizeText(sz);
@@ -3377,7 +3524,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (appOnScreen()) showToast(TK_SAVED, L"Recording saved", sub, r.file, true);
                 if (!appOnScreen() || GetForegroundWindow() != h) showToast(TK_SAVED, L"Recording saved", sub, r.file, false);
             }
-        } else if (r.abandoned) setStatus(L"Encoder got stuck, file discarded. Restart Cast Recorder to record again.", toRef(T_WARN));
+        } else if (r.abandoned) setStatus(r.file.empty() ? L"Encoder got stuck. Restart Cast Recorder to record again." : L"Encoder got stuck - kept " + fname + L". Restart Cast Recorder to record again.", toRef(T_WARN));
+        else if (!r.file.empty()) setStatus(L"Saved " + fname + L" (" + r.message + L")", toRef(T_WARN));
         else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, toRef(T_WARN));
         else {
             setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), toRef(T_ERR));
@@ -3398,6 +3546,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g.quitting) forceQuit();
         return 0;
     case WM_DESTROY:
+        // Give a running MKV conversion / remux up to 5 s (no message pumping here). If it is still running, the
+        // saved source stays as it is; ffmpeg is in a kill-on-close job, so only its partial copy is left behind.
+        for (int i = 0; i < 500 && remuxBusy(); ++i) Sleep(10);
+        if (remuxBusy()) cr::appLog(L"exit: a remux / MKV conversion was still running - the saved file is kept as it is");
         save();
         closePopup(false);
         for (auto& t : g_toasts) DestroyWindow(t->hwnd);
@@ -3428,7 +3580,7 @@ void selftestSettings() {
     cr::appLog(L"selftest: source " + sourceText());
     click(H_TAB_SET);
     paintToNull();
-    pick(H_DD_CONT, 1);  // MP4
+    pick(H_DD_CONT, 0);  // MKV (non-default since v1.0)
     pick(H_DD_RES, 1);   // 1440p
     if (g_encChoices.size() > 1) pick(H_DD_ENC, (int)g_encChoices.size() - 1);
     cr::appLog(L"selftest: encoder " + encoderText());
@@ -3436,7 +3588,7 @@ void selftestSettings() {
     if (!g.s.replayEnabled) click(H_TG_REPLAY);  // on
     pick(H_DD_REPLAYLEN, 2);                     // 1 min
     paintToNull();
-    pick(H_DD_REPLAYLEN, 7);                     // Custom... -> seconds field
+    pick(H_DD_REPLAYLEN, (int)replayPresets().size());  // Custom... -> seconds field
     if (g_edit.hwnd) { SetWindowTextW(g_edit.hwnd, L"45"); commitEdit(true); }
     click(H_THEME_LIGHT);
     paintToNull();
@@ -3449,7 +3601,7 @@ void selftestSettings() {
     if (!g.s.noiseSuppression) click(H_TG_NS);
     if (!g.s.pushToTalk) click(H_TG_PTT);
     if (!g.s.monitoring) click(H_TG_MON);
-    click(H_CH_STEREO);
+    click(H_CH_MONO);  // non-default since v1.0 (stereo)
     setSlider(H_SL_VOL, 530 + 123 * 0.75f);    // 150 %
     setSlider(H_SL_GATE, 530 + 123 * 0.375f);  // -50 dB
     save();
@@ -3580,6 +3732,7 @@ int renderUi(const std::wstring& path, const std::wstring& state, int dpi, const
     g.s.replayEnabled = true;
     if (state == L"recording") { g_fakeRec = true; }
     if (state == L"settings") { g_viewIdx = 2; g.capturing = 4; }  // Save replay field shows "Press a key..."
+    if (state == L"replaycap") { g_viewIdx = 2; g.s.replayEnabled = true; g.s.replaySeconds = 900; g.s.quality = Quality::Ultra; g.s.fps = 60; g.s.scale = OutputScale::Native; }  // memory-cap warning
     if (state == L"recordings" || state == L"ctxmenu") { g_viewIdx = 1; fakeRecordings(); }
     updatePreview();
     const float s = scale(), W = 1100, H = 700;
@@ -3588,7 +3741,7 @@ int renderUi(const std::wstring& path, const std::wstring& state, int dpi, const
         gp::Graphics gr(&bmp);
         setupGraphics(gr, false);
         gr.ScaleTransform(s, s);
-        if (state == L"recordings") { std::lock_guard<std::mutex> l(g_itemsM); g_remuxCur = g_items[4].path; g_remuxInSize = 0; }
+        if (state == L"recordings") { std::lock_guard<std::mutex> l(g_itemsM); g_fakeRemuxPath = g_items[4].path; }
         paintAll(gr, W, H);
         RecLayout L = recLayout(W, H);
         if (state == L"source" || state == L"dropdown" || state == L"micpop" || state == L"ctxmenu") {
@@ -3690,7 +3843,7 @@ int runCli(int argc, wchar_t** argv) {
     double secs = -1;
     std::wstring renderPath, uiState = L"idle", uiTheme; int renderDpi = 96;
     bool containerGiven = false, replayOnly = false, testToast = false, toastVisible = false;
-    int replaySecs = 0; double saveReplayAt = -1;
+    int replaySecs = 0, replayMaxMb = 0; double saveReplayAt = -1;
     std::wstring replayOut, remuxIn, remuxOut, remuxEngine, shotPath, toastShot;
     double pauseAt = -1, resumeAt = -1;
     RecordOptions o;
@@ -3755,7 +3908,7 @@ int runCli(int argc, wchar_t** argv) {
         if (a == L"--minimized") continue;
         if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality"
             && a != L"--out" && a != L"--log" && a != L"--scale" && a != L"--gpu" && a != L"--bitrate-cap"
-            && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window"
+            && a != L"--test-hang-finalize" && a != L"--test-slow-post" && a != L"--replay-max-mb" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window"
             && a != L"--source" && a != L"--noise-suppression" && a != L"--noise-gate" && a != L"--mic-volume" && a != L"--channels"
             && a != L"--codec" && a != L"--auto-remux" && a != L"--replay" && a != L"--save-replay-at" && a != L"--replay-out" && a != L"--remux"
             && a != L"--remux-engine" && a != L"--screenshot" && a != L"--test-toast" && a != L"--test-toast-visible" && a != L"--ui-theme")
@@ -3766,6 +3919,10 @@ int runCli(int argc, wchar_t** argv) {
         } else if (a == L"--auto-remux") {
             if (v != "on" && v != "off") return bad("--auto-remux must be on or off");
             o.autoRemux = v == "on";
+        } else if (a == L"--replay-max-mb") {
+            int mb = 0;
+            if (!parseIntStrict(v, 1, 65536, mb)) return bad("--replay-max-mb must be 1..65536");
+            replayMaxMb = mb;
         } else if (a == L"--replay") {
             char* end = nullptr; long d = strtol(v.c_str(), &end, 10);
             if (v.empty() || !end || *end || d < 5 || d > 900) return bad("--replay must be 5..900 seconds");
@@ -3839,6 +3996,8 @@ int runCli(int argc, wchar_t** argv) {
             char* end = nullptr; unsigned long b = strtoul(v.c_str(), &end, 10);
             if (v.empty() || !end || *end || b > 500000000ul) return bad("--bitrate-cap must be 0..500000000");
             o.bitrateCap = (unsigned)b;
+        } else if (a == L"--test-slow-post") {
+            // handled in wWinMain (UI and CLI)
         } else if (a == L"--test-hang-finalize") {
             char* end = nullptr; unsigned long ms = strtoul(v.c_str(), &end, 10);
             if (v.empty() || !end || *end || ms > 60000) return bad("--test-hang-finalize must be 0..60000 ms");
@@ -3857,8 +4016,8 @@ int runCli(int argc, wchar_t** argv) {
             renderPath = W(v);
         } else if (a == L"--ui-state") {
             if (v != "idle" && v != "dropdown" && v != "source" && v != "settings" && v != "recording" && v != "micpop" && v != "recordings" &&
-                v != "replaytoast" && v != "savedtoast" && v != "ctxmenu")
-                return bad("--ui-state must be idle, source, settings, recording, recordings, replaytoast, savedtoast, micpop or ctxmenu");
+                v != "replaytoast" && v != "savedtoast" && v != "ctxmenu" && v != "replaycap")
+                return bad("--ui-state must be idle, source, settings, recording, recordings, replaytoast, savedtoast, micpop, ctxmenu or replaycap");
             uiState = W(v);
         } else if (a == L"--dpi") {
             char* end = nullptr; long d = strtol(v.c_str(), &end, 10);
@@ -4005,7 +4164,10 @@ int runCli(int argc, wchar_t** argv) {
     Recorder r;
     { LARGE_INTEGER q; QueryPerformanceCounter(&q); o.pressQpc = q.QuadPart; }
     std::shared_ptr<ReplayRing> ring;
-    if (replaySecs > 0 || replayOnly || saveReplayAt > 0) { ring = std::make_shared<ReplayRing>(replaySecs > 0 ? replaySecs : 30); o.ring = ring; o.bufferOnly = replayOnly; }
+    if (replaySecs > 0 || replayOnly || saveReplayAt > 0) {
+        ring = std::make_shared<ReplayRing>(replaySecs > 0 ? replaySecs : 30); o.ring = ring; o.bufferOnly = replayOnly;
+        ring->setMaxBytes(replayMaxMb > 0 ? (size_t)replayMaxMb << 20 : ReplayRing::defaultMaxBytes());
+    }
     if (replayOut.empty()) replayOut = o.outputPath.substr(0, o.outputPath.find_last_of(L'.')) + L"-replay.mp4";
     std::string replayInfo;
     r.start(o);
@@ -4023,7 +4185,7 @@ int runCli(int argc, wchar_t** argv) {
             double got = 0; std::wstring err;
             ULONGLONG ts = GetTickCount64();
             bool ok = ring->save(replayOut, got, err);
-            char b[256]; snprintf(b, sizeof b, "replay_ok=%d replay_seconds=%.2f replay_buffered=%.2f replay_ram=%zu replay_save_ms=%llu\n", ok ? 1 : 0, got, ring->bufferedSeconds(), ring->bytes(), GetTickCount64() - ts);
+            char b[256]; snprintf(b, sizeof b, "replay_ok=%d replay_seconds=%.2f replay_buffered=%.2f replay_ram=%zu replay_cap=%zu replay_capped=%d replay_save_ms=%llu\n", ok ? 1 : 0, got, ring->bufferedSeconds(), ring->bytes(), ring->maxBytes(), ring->cappedByMemory() ? 1 : 0, GetTickCount64() - ts);
             replayInfo = std::string(b) + "replay_file=" + U(replayOut) + "\nreplay_message=" + U(err) + "\n";
         }
         if (resumeAt >= 0 && pausedOnce && !resumedOnce && el >= (ULONGLONG)(resumeAt * 1000)) {
@@ -4039,9 +4201,19 @@ int runCli(int argc, wchar_t** argv) {
     if (!r.waitUntilIdle(waitMs)) r.abort();
     r.waitUntilIdle(2000);
     for (int i = 0; i < 100 && abandonedFinalizeLive() > 0; ++i) Sleep(50);
-    const RecordResult res = r.result();
+    RecordResult res = r.result();
+    if (res.ok && res.post.needed()) {  // MKV / track names: after the file is saved, outside the recorder
+        std::wstring fin, plog;
+        ULONGLONG t0 = GetTickCount64();
+        bool pok = postProcessRecording(res.post, fin, plog);
+        res.file = fin;
+        res.encoderLog += plog;
+        if (!pok && !res.post.mkvPath.empty()) res.message.clear();  // still saved (as MP4)
+        char b[96]; snprintf(b, sizeof b, "post_ok=%d post_ms=%llu\n", pok ? 1 : 0, GetTickCount64() - t0);
+        warmInfo += b;
+    }
     std::string extra = warmInfo + replayInfo + "state=" + std::string(toString(r.state())) + "\n";
-    extra += "codec=" + U(res.codec) + " audio_tracks=" + std::to_string(res.audioTracks) + "\n";
+    extra += "codec=" + U(res.codec) + " audio_tracks=" + std::to_string(res.audioTracks) + " fragmented=" + (res.fragmented ? "1" : "0") + "\n";
     if (pausedOnce) { char b[96]; snprintf(b, sizeof b, "paused_ms=%llu pauses=%llu\n", pausedWall, res.pauses); extra += b; }
     if (res.abandoned) {  // same process: MF is poisoned, a second session must be refused
         bool again = r.start(o);
@@ -4071,6 +4243,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     enableDpiAwareness();
     for (int i = 1; i + 1 < argc; ++i) if (wcscmp(argv[i], L"--settings-file") == 0) g_settingsOverride = argv[i + 1];
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-settings") == 0) g_selftest = true;
+    for (int i = 1; i + 1 < argc; ++i) if (wcscmp(argv[i], L"--test-slow-post") == 0) setTestSlowPostMs((DWORD)std::min(600000ul, wcstoul(argv[i + 1], nullptr, 10)));
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-record") == 0) g_selftest = g_selftestRecord = true;
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-hotkeys") == 0) g_selftest = g_selftestHotkeys = true;
     for (int i = 1; i < argc; ++i)

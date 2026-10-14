@@ -161,6 +161,8 @@ Issue validate(const Hotkey& hk) {
         {MOD_ALT_, 0x70, "Alt+F1 is NVIDIA's screenshot key"},
         {MOD_ALT_, 'R', "Alt+R toggles NVIDIA's performance overlay"},
         {MOD_ALT_ | MOD_SHIFT_, 0x7B, "Alt+Shift+F12 is NVIDIA's stats overlay"},
+        {MOD_ALT_ | MOD_SHIFT_, 0x79, "Alt+Shift+F10 is NVIDIA's instant replay toggle"},
+        {MOD_CTRL_ | MOD_SHIFT_, 'G', "Ctrl+Shift+G is AMD's Adrenalin overlay"},
         {MOD_CTRL_ | MOD_SHIFT_, 'E', "Ctrl+Shift+E starts AMD Adrenalin recording"},
         {MOD_CTRL_ | MOD_SHIFT_, 'R', "Ctrl+Shift+R is AMD's instant replay"},
         {MOD_CTRL_ | MOD_SHIFT_, 'S', "Ctrl+Shift+S saves an AMD instant replay"},
