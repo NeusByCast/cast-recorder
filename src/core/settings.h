@@ -8,29 +8,36 @@ namespace cr {
 enum class Encoder { Auto, NVENC, AMF, QSV, Software };
 enum class Container { MP4, MKV, MOV };
 enum class Quality { Low, Medium, High, Ultra };
+enum class OutputScale { Native, P1080, P720 };  // Native / 1080p / 720p
 
 struct Settings {
-    int fps = 60;                       // 15, 30 or 60
+    int fps = 30;                       // 15, 30 or 60
     Quality quality = Quality::High;
     Encoder encoder = Encoder::Auto;
     Container container = Container::MP4;
     std::string outputDir;              // UTF-8; empty = default (Videos\Cast Recorder)
     Hotkey toggleRecord{MOD_ALT_, 0x78};              // Alt+F9
-    Hotkey openFolder{MOD_ALT_ | MOD_SHIFT_, 0x78};   // Alt+Shift+F9
+    Hotkey openFolder{MOD_ALT_ | MOD_SHIFT_, 0x78};   // Alt+Shift+F9 (no UI field; still registered)
+    Hotkey pauseToggle{MOD_ALT_, 0x79};               // Alt+F10
     bool captureCursor = true;
     bool startMinimized = false;
+    OutputScale scale = OutputScale::Native;
+    int gpuIndex = -1;                 // -1 Auto; else adapter ordinal
+    unsigned bitrateCap = 0;           // 0 = uncapped beyond quality
 };
 
 const char* toString(Encoder e);
 const char* toString(Container c);
 const char* toString(Quality q);
+const char* toString(OutputScale s);
 const char* extension(Container c);  // ".mp4"
 bool fromString(const std::string& s, Encoder& e);
 bool fromString(const std::string& s, Container& c);
 bool fromString(const std::string& s, Quality& q);
+bool fromString(const std::string& s, OutputScale& o);
 
 // Target bitrate in bits/s for a resolution, fps and quality preset.
-unsigned bitrateFor(Quality q, int width, int height, int fps);
+unsigned bitrateFor(Quality q, int width, int height, int fps, unsigned cap = 0);
 // Clamps to 15/30/60 (nearest).
 int normalizeFps(int fps);
 

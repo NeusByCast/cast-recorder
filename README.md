@@ -2,11 +2,10 @@
 
 Lightweight Windows screen recorder: GPU capture, hardware encode, global hotkeys.
 
-- GPU capture (Windows Graphics Capture, DXGI fallback) and NVENC / AMF / QuickSync encode
-- 15 / 30 / 60 FPS, quality presets, MP4 (MKV/MOV with ffmpeg)
+- Live preview, Pause, NVENC / AMF / QuickSync / Software
+- 15 / 30 / 60 FPS, quality presets, native / 1080p / 720p, MP4 (MKV/MOV with ffmpeg)
 - Press-to-set global hotkeys that work while games have focus
-- Dark tray settings UI; saves to `Videos\Cast Recorder`
-- Start menu installer; single static exe, no Electron
+- Dark borderless settings UI; saves to `Videos\Cast Recorder`
 
 **Download:** [latest release](https://github.com/NeusByCast/cast-recorder/releases/latest)
 
@@ -18,4 +17,4 @@ ctest --test-dir build -C Release
 iscc /DAppVersion=<ver> /DBinDir=..\build\Release installer\CastRecorder.iss
 ```
 
-Version lives in `src/win/version.h` (1.0, 1.1, …). Unit tests also build on Linux. Known limits: primary monitor only, no audio, MKV/MOV need ffmpeg on PATH.
+Version lives in `src/win/version.h`. Known limits: primary monitor only, no audio.

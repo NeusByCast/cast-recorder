@@ -70,15 +70,19 @@ static void testValidateConflicts() {
 
 static void testSettings() {
     Settings d;
-    CHECK_EQ(d.fps, 60);
+    CHECK_EQ(d.fps, 30);
     CHECK(d.encoder == Encoder::Auto);
     Settings s;
     s.fps = 30; s.quality = Quality::Ultra; s.encoder = Encoder::NVENC; s.container = Container::MKV;
     s.outputDir = "C:\\Users\\Ünïcødé \"q\"\\Videos\\Cast Recorder";
     s.toggleRecord = P("Ctrl+Shift+F9"); s.openFolder = P("Alt+V"); s.captureCursor = false; s.startMinimized = true;
+    s.scale = OutputScale::P1080; s.gpuIndex = 1; s.bitrateCap = 12000000;
     Settings r;
     CHECK(fromJson(toJson(s), r));
-    CHECK_EQ(r.fps, 30); CHECK(r.quality == Quality::Ultra); CHECK(r.encoder == Encoder::NVENC);
+    CHECK_EQ(r.fps, 30);
+    CHECK(r.scale == OutputScale::P1080);
+    CHECK_EQ(r.gpuIndex, 1);
+    CHECK_EQ(r.bitrateCap, 12000000u); CHECK(r.quality == Quality::Ultra); CHECK(r.encoder == Encoder::NVENC);
     CHECK(r.container == Container::MKV); CHECK_EQ(r.outputDir, s.outputDir);
     CHECK(r.toggleRecord == s.toggleRecord); CHECK(r.openFolder == s.openFolder);
     CHECK(!r.captureCursor); CHECK(r.startMinimized);
@@ -98,12 +102,17 @@ static void testSettings() {
     CHECK(saveFile(path, s));
     Settings f; CHECK(loadFile(path, f)); CHECK_EQ(f.fps, 30); CHECK_EQ(f.outputDir, s.outputDir);
     std::remove(path);
-    CHECK(!loadFile("does/not/exist.json", f)); CHECK_EQ(f.fps, 60);
+    CHECK(!loadFile("does/not/exist.json", f)); CHECK_EQ(f.fps, 30);
     // Bitrates
     CHECK(bitrateFor(Quality::High, 1920, 1080, 60) > bitrateFor(Quality::Medium, 1920, 1080, 60));
     CHECK(bitrateFor(Quality::High, 1920, 1080, 60) > bitrateFor(Quality::High, 1920, 1080, 30));
     CHECK(bitrateFor(Quality::Ultra, 7680, 4320, 60) <= 150000000u);
     CHECK(bitrateFor(Quality::Low, 320, 240, 15) >= 1000000u);
+    CHECK(bitrateFor(Quality::Ultra, 1920, 1080, 60, 5000000u) == 5000000u);
+    CHECK(std::string(toString(OutputScale::Native)) == "native");
+    CHECK(std::string(toString(OutputScale::P1080)) == "1080p");
+    OutputScale sc = OutputScale::Native;
+    CHECK(fromString("720p", sc) && sc == OutputScale::P720);
     CHECK_EQ(std::string(extension(Container::MKV)), std::string(".mkv"));
 }
 

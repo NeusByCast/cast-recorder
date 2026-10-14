@@ -1,6 +1,5 @@
 ## 1.0
 
-- Stop hotkey and Stop button always end the recording; finalize/remux cannot hang the UI (hard timeout)
-- Exit from the tray always works, even while finishing a file
-- Soft click on start and stop
-- Reliable recording clock and duration; hardened ffmpeg lookup and CLI validation
+- Borderless 760×560 window with live preview, dropdowns (FPS / Quality / Encoder / GPU / Resolution / Container), and Pause
+- Stop and Exit never hang; a stuck Finalize is abandoned safely (prefer leak over UAF)
+- Soft start/stop click; zero-copy GPU path when available

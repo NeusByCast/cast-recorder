@@ -23,6 +23,9 @@ const char* toString(Quality q) {
     switch (q) { case Quality::Low: return "low"; case Quality::Medium: return "medium";
         case Quality::Ultra: return "ultra"; default: return "high"; }
 }
+const char* toString(OutputScale s) {
+    switch (s) { case OutputScale::P1080: return "1080p"; case OutputScale::P720: return "720p"; default: return "native"; }
+}
 const char* extension(Container c) {
     switch (c) { case Container::MKV: return ".mkv"; case Container::MOV: return ".mov"; default: return ".mp4"; }
 }
@@ -41,6 +44,11 @@ bool fromString(const std::string& s, Quality& q) {
         if (s == toString(v)) { q = v; return true; }
     return false;
 }
+bool fromString(const std::string& s, OutputScale& o) {
+    for (OutputScale v : {OutputScale::Native, OutputScale::P1080, OutputScale::P720})
+        if (s == toString(v)) { o = v; return true; }
+    return false;
+}
 
 int normalizeFps(int fps) {
     if (fps <= 22) return 15;
@@ -48,12 +56,13 @@ int normalizeFps(int fps) {
     return 60;
 }
 
-unsigned bitrateFor(Quality q, int w, int h, int fps) {
-    // Bits per pixel per frame tuned for H.264 screen/game content.
+unsigned bitrateFor(Quality q, int w, int h, int fps, unsigned cap) {
+    // Bits per pixel per frame tuned for H.264 screen/game content (CBR-ish target).
     double bpp = q == Quality::Low ? 0.04 : q == Quality::Medium ? 0.07 : q == Quality::High ? 0.11 : 0.17;
     double br = bpp * (double)w * (double)h * (double)fps;
     if (br < 1e6) br = 1e6;
     if (br > 150e6) br = 150e6;
+    if (cap && br > (double)cap) br = (double)cap;
     return (unsigned)br;
 }
 
@@ -222,8 +231,12 @@ std::string toJson(const Settings& s) {
       << "  \"outputDir\": \"" << esc(s.outputDir) << "\",\n"
       << "  \"hotkeyToggleRecord\": \"" << esc(format(s.toggleRecord)) << "\",\n"
       << "  \"hotkeyOpenFolder\": \"" << esc(format(s.openFolder)) << "\",\n"
+      << "  \"hotkeyPause\": \"" << esc(format(s.pauseToggle)) << "\",\n"
       << "  \"captureCursor\": " << (s.captureCursor ? "true" : "false") << ",\n"
-      << "  \"startMinimized\": " << (s.startMinimized ? "true" : "false") << "\n"
+      << "  \"startMinimized\": " << (s.startMinimized ? "true" : "false") << ",\n"
+      << "  \"scale\": \"" << toString(s.scale) << "\",\n"
+      << "  \"gpuIndex\": " << s.gpuIndex << ",\n"
+      << "  \"bitrateCap\": " << s.bitrateCap << "\n"
       << "}\n";
     return o.str();
 }
@@ -247,10 +260,19 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     Hotkey hk;
     if (str("hotkeyToggleRecord", v) && parse(v, hk) && validate(hk).severity != Severity::Error) s.toggleRecord = hk;
     if (str("hotkeyOpenFolder", v) && parse(v, hk) && validate(hk).severity != Severity::Error) s.openFolder = hk;
+    if (str("hotkeyPause", v)) { if (v.empty()) s.pauseToggle = Hotkey{}; else if (parse(v, hk) && validate(hk).severity != Severity::Error) s.pauseToggle = hk; }
+    if (!s.pauseToggle.empty() && (s.pauseToggle == s.toggleRecord || s.pauseToggle == s.openFolder)) s.pauseToggle = Hotkey{};
     // Two actions can't share one combo: keep Start/stop and clear the duplicate.
     if (!s.openFolder.empty() && s.openFolder == s.toggleRecord) s.openFolder = Hotkey{};
     boo("captureCursor", s.captureCursor);
     boo("startMinimized", s.startMinimized);
+    if (str("scale", v)) fromString(v, s.scale);
+    auto git = m.find("gpuIndex");
+    if (git != m.end() && git->second.t == Value::Num && std::isfinite(git->second.n) && git->second.n >= -1 && git->second.n <= 32)
+        s.gpuIndex = (int)git->second.n;
+    auto bit = m.find("bitrateCap");
+    if (bit != m.end() && bit->second.t == Value::Num && std::isfinite(bit->second.n) && bit->second.n >= 0 && bit->second.n <= 500e6)
+        s.bitrateCap = (unsigned)bit->second.n;
     out = s;
     return true;
 }

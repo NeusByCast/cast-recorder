@@ -8,6 +8,10 @@ int main() {
     T("idle", f.get()==RecState::Idle && !f.busy());
     T("start", f.tryStart() && f.isRecording());
     T("no double start", !f.tryStart());
+    T("pause", f.pause() && f.isPaused());
+    T("pause while paused fails", !f.pause());
+    T("resume", f.resume() && f.isRecording());
+    T("resume while recording fails", !f.resume());
     T("stop", f.requestStop() && f.get()==RecState::Stopping);
     T("stop idempotent", f.requestStop() && f.get()==RecState::Stopping);
     T("finish", f.beginFinish() && f.get()==RecState::Finishing);
@@ -18,7 +22,9 @@ int main() {
     T("stop while idle is false", !f.requestStop());
     RecFsm g;
     T("fresh start", g.tryStart());
-    g.requestStop(); g.beginFinish(); g.toIdle();
+    g.pause();
+    T("stop from paused", g.requestStop() && g.get()==RecState::Stopping);
+    g.beginFinish(); g.toIdle();
     T("restart after full cycle", g.tryStart() && g.isRecording());
     std::printf("%d passed, %d failed\n", P, F);
     return F ? 1 : 0;
