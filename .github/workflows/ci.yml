@@ -102,6 +102,26 @@ jobs:
             $pR = Start-Process $exe.FullName -ArgumentList "--render-ui `"$PWD\rec\ui-idle.bmp`" --ui-state idle --log `"$PWD\rec\ui.txt`"" -Wait -PassThru
             if (-not (Test-Path "$PWD\rec\ui-idle.bmp")) { throw "ui-idle.bmp missing" }
           }
+          # Pause/Resume: 6 s wall, paused 2..4 s. Duration must equal recorded minus paused time, PTS continuous.
+          if (${{ matrix.fps }} -eq 30) {
+            $pOut = "$PWD\rec\pause.mp4"; $pLog = "$PWD\rec\pause.txt"
+            $pp = Start-Process $exe.FullName -ArgumentList "--record 6 --fps 30 --encoder software --allow-synthetic --pause-at 2 --resume-at 4 --out `"$pOut`" --log `"$pLog`"" -Wait -PassThru
+            Get-Content $pLog
+            if (-not (Select-String -Path $pLog -Pattern '^ok=1' -Quiet)) { throw "pause recording failed" }
+            $pm = (Select-String -Path $pLog -Pattern 'paused_ms=(\d+) pauses=(\d+)').Matches[0].Groups
+            if ([int]$pm[2].Value -ne 1) { throw "worker saw $($pm[2].Value) pauses, expected 1" }
+            $expect = 6.0 - [double]$pm[1].Value / 1000.0
+            $dur = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $pOut)
+            "pause: paused_ms=$($pm[1].Value) expected=$expect duration=$dur"
+            if ([math]::Abs($dur - $expect) -gt 0.35) { throw "duration $dur != recorded minus paused ($expect)" }
+            $pts = ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 $pOut | ForEach-Object { [double]$_ } | Sort-Object
+            $maxGap = 0.0
+            for ($i = 1; $i -lt $pts.Count; $i++) { $gap = $pts[$i] - $pts[$i-1]; if ($gap -gt $maxGap) { $maxGap = $gap } }
+            "pause: packets=$($pts.Count) max_pts_gap=$maxGap"
+            if ($maxGap -gt (1.5 / 30)) { throw "PTS gap $maxGap s: timestamps not continuous across pause" }
+            $late = (Select-String -Path $pLog -Pattern 'late=(\d+)').Matches[0].Groups[1].Value
+            if ([int]$late -gt 3) { throw "pause was counted as $late late frames" }
+          }
           foreach ($c in @('mp4','mkv')) {
             $out = "$PWD\rec\smoke-${{ matrix.fps }}.$c"
             $log = "$PWD\rec\smoke-${{ matrix.fps }}-$c.txt"
