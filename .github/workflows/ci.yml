@@ -170,7 +170,7 @@ jobs:
         run: |
           $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
           New-Item -ItemType Directory rec -Force | Out-Null
-          $ref = "$PWD\rec\pattern.bmp"
+          $ref = "$PWD\rec\pattern.yuv"
           Start-Process $exe -ArgumentList "--render-pattern `"$ref`"" -Wait
           if (-not (Test-Path $ref)) { throw "reference pattern missing" }
           $fps = ${{ matrix.fps }}
@@ -184,15 +184,16 @@ jobs:
           "fps: target=$fps capture=$cf encode=$ef decoded_frames=$nf (expected ~$($fps*5))"
           if ($ef -lt $fps * 0.95) { throw "achieved encode fps $ef < 95% of $fps" }
           if ($nf -lt $fps * 5 * 0.95) { throw "only $nf frames for 5 s at $fps" }
-          # Compare in RGB with the correct BT.709 limited-range matrix (what the encoder signals).
-          $filt = "[0:v]scale=in_color_matrix=bt709:in_range=tv:flags=bicubic,format=gbrp[a];[1:v]format=gbrp[b];[a][b]"
-          $ss = & ffmpeg -hide_banner -i $out -loop 1 -i $ref -lavfi ($filt + "ssim") -shortest -f null - 2>&1 | Select-String 'All:([\d.]+)' | Select-Object -Last 1
-          $ps = & ffmpeg -hide_banner -i $out -loop 1 -i $ref -lavfi ($filt + "psnr") -shortest -f null - 2>&1 | Select-String 'average:([\d.inf]+)' | Select-Object -Last 1
+          # Compare against an ideal BT.709 limited-range 4:2:0 reference (exact float math, written by the app),
+          # so the score measures our conversion + the encoder, not 4:2:0 subsampling or ffmpeg's RGB matrix.
+          $refIn = @('-f','rawvideo','-pix_fmt','yuv420p','-s','1280x720','-stream_loop','-1','-i',$ref)
+          $ss = & ffmpeg -hide_banner -i $out @refIn -lavfi "[0:v]format=yuv420p[a];[a][1:v]ssim" -shortest -f null - 2>&1 | Select-String 'All:([\d.]+)' | Select-Object -Last 1
+          $ps = & ffmpeg -hide_banner -i $out @refIn -lavfi "[0:v]format=yuv420p[a];[a][1:v]psnr" -shortest -f null - 2>&1 | Select-String 'PSNR y:([\d.inf]+).*average:([\d.inf]+)' | Select-Object -Last 1
           $ssim = [double]$ss.Matches[0].Groups[1].Value
           $psnrS = $ps.Matches[0].Groups[1].Value; $psnr = if ($psnrS -eq 'inf') { 99 } else { [double]$psnrS }
-          "quality: SSIM=$ssim PSNR=$psnr dB"
-          if ($ssim -lt 0.95) { throw "SSIM $ssim < 0.95 (warping / artifacts / starved bitrate)" }
-          if ($psnr -lt 30) { throw "PSNR $psnr dB < 30" }
+          "quality: SSIM=$ssim PSNR-Y=$psnr dB"
+          if ($ssim -lt 0.97) { throw "SSIM $ssim < 0.97 (warping / artifacts / starved bitrate)" }
+          if ($psnr -lt 38) { throw "PSNR-Y $psnr dB < 38" }
       - name: ffmpeg hijack probe (a fake ffmpeg.exe in the working folder must not run)
         if: matrix.fps == 30
         shell: pwsh
