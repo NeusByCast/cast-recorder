@@ -343,6 +343,12 @@ void Recorder::run() {
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
         HRESULT hr = D3D11CreateDevice(adapter.Get(), adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                        flags, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+        bool videoSupport = SUCCEEDED(hr);
+        if (FAILED(hr)) {  // e.g. Microsoft Basic Render Driver (VMs, CI): no video support, software encode only
+            flags &= ~D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+            hr = D3D11CreateDevice(adapter.Get(), adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                   flags, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+        }
         if (FAILED(hr))
             hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
         if (FAILED(hr)) { r.message = hrMsg(L"D3D11CreateDevice", hr); return; }
@@ -378,7 +384,7 @@ void Recorder::run() {
 
         // ---- encoder selection ----
         auto vendors = hardwareVendors();
-        bool wantHw = opt_.encoder != Encoder::Software;
+        bool wantHw = opt_.encoder != Encoder::Software && videoSupport;
         std::wstring hwVendor;
         if (wantHw) {
             const wchar_t* want = vendorId(opt_.encoder);
