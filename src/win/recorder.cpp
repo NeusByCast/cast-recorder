@@ -1698,7 +1698,7 @@ struct ReplayRing::Impl {
     bool attached = false;
     size_t bytes = 0;
     size_t maxBytes = (size_t)2 << 30;  // hard RAM cap (UI sets min(25 % of RAM, 2 GB)); oldest GOPs go first
-    bool capped = false;                 // the cap (not the length) is what trimmed the ring
+    bool capped = false;                 // the cap (not the length) last trimmed the ring (sticky)
     // Key frame closest to (end - secs): with 1 s GOPs the saved length is within +-0.5 s of what was asked.
     LONGLONG startFor(int secs) const {
         LONGLONG want = lastEnd - (LONGLONG)secs * 10000000LL;
@@ -1724,8 +1724,8 @@ struct ReplayRing::Impl {
             while (k < v.size() && !v[k].key) ++k;
             if (k >= v.size() || v[k].t > lastEnd - keep) break;
             dropFirstGop();
+            capped = false;  // the length (not the cap) is trimming now
         }
-        capped = false;
         while (bytes > maxBytes && v.size() > 1) {
             size_t k = 1;
             while (k < v.size() && !v[k].key) ++k;
