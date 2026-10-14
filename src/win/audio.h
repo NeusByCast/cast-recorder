@@ -51,7 +51,9 @@ public:
     void setOrigin(long long qpcTicks, long long qpcFreq);
     void setPaused(bool p);
     // Produces interleaved s16 samples from the current position up to `mediaTime` (100 ns, recording clock).
-    void produce(long long mediaTime, bool final, std::vector<short>& out, long long& startTime);
+    // sysOut / micOut (optional): the same span with only system audio (incl. the test tone) / only the mic.
+    void produce(long long mediaTime, bool final, std::vector<short>& out, long long& startTime,
+                 std::vector<short>* sysOut = nullptr, std::vector<short>* micOut = nullptr);
     std::atomic<bool> micMuted{false};
     unsigned long long underrunFrames = 0;
     // Mute windows in media time (100 ns) for our own tones when they could be captured (mic, or system audio

@@ -5,11 +5,39 @@
 #include <thread>
 #include <vector>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include "../core/settings.h"
 #include "../core/fsm.h"
 #include "../core/handoff.h"
 
+struct IMFSample;
+struct IMFMediaType;
+
 namespace cr {
+
+// Instant replay: encoded video packets + PCM audio of the last N seconds, in RAM, trimmed to start on a key frame.
+// One ring outlives recorder sessions (buffer-only session -> recording -> buffer-only) as long as the encoder
+// configuration is unchanged, so a replay can be saved at any time, also while recording.
+class ReplayRing {
+public:
+    explicit ReplayRing(int seconds);
+    ~ReplayRing();
+    void setSeconds(int s);
+    int seconds() const;
+    double bufferedSeconds() const;   // what a save right now would contain (from the first usable key frame)
+    size_t bytes() const;             // RAM held
+    // Muxes the last `seconds()` (from a key frame) into an MP4. Blocking: call off the UI thread.
+    bool save(const std::wstring& path, double& savedSeconds, std::wstring& err);
+    // recorder side
+    void attach(IMFMediaType* videoType, int fps, int channels, int tracks, bool audio);
+    void addVideo(IMFSample* s);
+    void addAudio(long long t100ns, const std::vector<short>* const pcm[3]);
+    void detach();
+    struct Impl;
+private:
+    std::unique_ptr<Impl> p_;
+};
 
 struct RecordOptions {
     int fps = 60;
@@ -38,6 +66,13 @@ struct RecordOptions {
     long long pressQpc = 0;          // QPC when the user asked to record (latency breakdown)
     HWND notify = nullptr;           // WM_APP_RECORDER_DONE when the recording thread exits
     DWORD finalizeTimeoutMs = 8000;  // hard cap on Finalize (and separately on remux)
+    // v1.1
+    Codec codec = Codec::Auto;       // Auto: AV1 > HEVC > H.264 for MKV, H.264 for MP4 (falls back to H.264)
+    bool autoRemux = false;          // MKV: after saving, remux to MP4 (stream copy) and keep only the MP4
+    bool separateTracks = false;     // audio tracks: 1 mix, 2 system, 3 mic
+    std::shared_ptr<ReplayRing> ring;  // feed encoded packets + audio into this replay buffer
+    bool bufferOnly = false;         // replay buffer session: no file is written
+    UINT doneMsg = 0;                // notify with this instead of WM_APP_RECORDER_DONE (replay buffer session)
 };
 
 struct RecordResult {
@@ -57,6 +92,8 @@ struct RecordResult {
     double startMs = 0;              // press -> first captured frame
     std::wstring pathLog;            // adapter / encoder / zero-copy / drops for diagnostics
     bool hasAudio = false;
+    int audioTracks = 0;
+    std::wstring codec;              // H.264 / HEVC / AV1
     double captureFps = 0, encodeFps = 0, convertMsAvg = 0, encodeMsAvg = 0;
     unsigned long long frames = 0, duplicated = 0, late = 0, dropped = 0, pauses = 0, convertFailures = 0;
 };
@@ -91,6 +128,7 @@ public:
     bool micMuted() const { return micMuted_.load(); }
     bool mfAbandoned() const { return abandon_.poisoned.load(); }
     double elapsedSeconds() const;
+    std::wstring currentFile() const { std::lock_guard<std::mutex> g(fileM_); return curFile_; }  // file being written
     const RecordResult& result() const { return result_; }
 
 private:
@@ -110,12 +148,21 @@ private:
     std::wstring sessionTmp_;      // temp path for abort cleanup
     std::wstring sessionOut_;      // final output path for abort cleanup
     HANDLE doneEvent_ = nullptr;   // manual-reset, set when Idle
+    mutable std::mutex fileM_;
+    std::wstring curFile_;
 };
 
 std::wstring describeHardwareEncoders();
 // Static CI test pattern (also written by --render-pattern as the PSNR/SSIM reference).
 void testPattern(std::vector<uint32_t>& px, unsigned w, unsigned h);
 std::wstring findFfmpeg();
+// MKV/MOV -> MP4 without re-encoding (stream copy): ffmpeg when available, else Media Foundation (source reader ->
+// pass-through sink writer). engine: L"" auto, L"ffmpeg", L"mf". trackNames: title metadata for the audio tracks.
+bool remuxFile(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine = L"",
+               DWORD timeoutMs = 0, const std::vector<std::wstring>& trackNames = {});
+// Screenshot of a capture target (GDI; windows via PrintWindow PW_RENDERFULLCONTENT). jpg: quality 92.
+// Windows excluded from capture (WDA_EXCLUDEFROMCAPTURE, our toasts) never appear.
+bool saveScreenshot(HWND window, HMONITOR monitor, bool allDisplays, const std::wstring& path, bool jpg, std::wstring& err, int* outW = nullptr, int* outH = nullptr);
 // Test hook: delay before IMFSinkWriter::Finalize (simulates a stuck Finalize). 0 = off.
 void setTestHangFinalizeMs(DWORD ms);
 // Abandoned Finalize helper threads still running (they delete their temp file when they finish).

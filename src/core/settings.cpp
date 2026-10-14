@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -24,7 +25,36 @@ const char* toString(Quality q) {
         case Quality::Ultra: return "ultra"; default: return "high"; }
 }
 const char* toString(OutputScale s) {
-    switch (s) { case OutputScale::P1080: return "1080p"; case OutputScale::P720: return "720p"; default: return "native"; }
+    switch (s) { case OutputScale::P1440: return "1440p"; case OutputScale::P1080: return "1080p"; case OutputScale::P720: return "720p"; default: return "native"; }
+}
+const char* toString(Codec c) {
+    switch (c) { case Codec::H264: return "h264"; case Codec::HEVC: return "hevc"; case Codec::AV1: return "av1"; default: return "auto"; }
+}
+bool fromString(const std::string& s, Codec& c) {
+    for (Codec v : {Codec::Auto, Codec::H264, Codec::HEVC, Codec::AV1})
+        if (s == toString(v)) { c = v; return true; }
+    return false;
+}
+bool validAccent(const std::string& a) {
+    for (const char* k : {"red", "orange", "green", "blue", "purple", "pink"}) if (a == k) return true;
+    return false;
+}
+std::string fileNameFor(const std::string& pattern, int y, int mo, int d, int h, int mi, int se, const std::string& source, int counter) {
+    char date[32], tim[32];
+    std::snprintf(date, sizeof date, "%04d-%02d-%02d", y, mo, d);
+    std::snprintf(tim, sizeof tim, "%02d-%02d-%02d", h, mi, se);
+    std::string src;
+    for (unsigned char c : source) {  // keep it a valid, short file-name part
+        if (c < 0x20 || std::strchr("<>:\"/\\|?*", (int)c)) continue;
+        src += (char)c;
+        if (src.size() >= 40) break;
+    }
+    while (!src.empty() && (src.back() == ' ' || src.back() == '.')) src.pop_back();
+    if (src.empty()) src = "Screen";
+    if (pattern == "date_time") return std::string(date) + "_" + tim;
+    if (pattern == "source_date_time") return src + "_" + date + "_" + tim;
+    if (pattern == "cast_counter") { char b[32]; std::snprintf(b, sizeof b, "cast_%03d", counter < 1 ? 1 : counter); return b; }
+    return std::string("cast_") + date + "_" + tim;
 }
 const char* extension(Container c) {
     switch (c) { case Container::MKV: return ".mkv"; case Container::MOV: return ".mov"; default: return ".mp4"; }
@@ -45,7 +75,7 @@ bool fromString(const std::string& s, Quality& q) {
     return false;
 }
 bool fromString(const std::string& s, OutputScale& o) {
-    for (OutputScale v : {OutputScale::Native, OutputScale::P1080, OutputScale::P720})
+    for (OutputScale v : {OutputScale::Native, OutputScale::P1440, OutputScale::P1080, OutputScale::P720})
         if (s == toString(v)) { o = v; return true; }
     return false;
 }
@@ -224,7 +254,7 @@ struct Parser {
 std::string toJson(const Settings& s) {
     std::ostringstream o;
     o << "{\n"
-      << "  \"version\": 2,\n"
+      << "  \"version\": 3,\n"
       << "  \"fps\": " << s.fps << ",\n"
       << "  \"quality\": \"" << toString(s.quality) << "\",\n"
       << "  \"encoder\": \"" << toString(s.encoder) << "\",\n"
@@ -258,6 +288,17 @@ std::string toJson(const Settings& s) {
       << "  \"pushToTalk\": " << (s.pushToTalk ? "true" : "false") << ",\n"
       << "  \"hotkeyPushToTalk\": \"" << esc(format(s.pttKey)) << "\",\n"
       << "  \"channels\": " << s.channels << ",\n"
+      << "  \"codec\": \"" << toString(s.codec) << "\",\n"
+      << "  \"autoRemux\": " << (s.autoRemux ? "true" : "false") << ",\n"
+      << "  \"replayEnabled\": " << (s.replayEnabled ? "true" : "false") << ",\n"
+      << "  \"replaySeconds\": " << s.replaySeconds << ",\n"
+      << "  \"hotkeySaveReplay\": \"" << esc(format(s.saveReplay)) << "\",\n"
+      << "  \"hotkeyScreenshot\": \"" << esc(format(s.screenshot)) << "\",\n"
+      << "  \"screenshotFormat\": \"" << esc(s.screenshotFormat) << "\",\n"
+      << "  \"separateTracks\": " << (s.separateTracks ? "true" : "false") << ",\n"
+      << "  \"theme\": \"" << esc(s.theme) << "\",\n"
+      << "  \"accent\": \"" << esc(s.accent) << "\",\n"
+      << "  \"fileNamePattern\": \"" << esc(s.fileNamePattern) << "\",\n"
       << "  \"bitrateCap\": " << s.bitrateCap << "\n"
       << "}\n";
     return o.str();
@@ -317,6 +358,26 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     num("channels", 1, 2, s.channels);
     if (str("hotkeyPushToTalk", v) && parse(v, hk)) s.pttKey = hk;
     if (str("scale", v)) fromString(v, s.scale);
+    // v1.1
+    if (str("codec", v)) fromString(v, s.codec);
+    boo("autoRemux", s.autoRemux);
+    boo("replayEnabled", s.replayEnabled);
+    num("replaySeconds", 5, 900, s.replaySeconds);
+    auto hkOpt = [&](const char* k, Hotkey& dst) {
+        if (!str(k, v)) return;
+        if (v.empty()) dst = Hotkey{};
+        else if (parse(v, hk) && validate(hk).severity != Severity::Error) dst = hk;
+    };
+    hkOpt("hotkeySaveReplay", s.saveReplay);
+    hkOpt("hotkeyScreenshot", s.screenshot);
+    for (Hotkey* x : {&s.saveReplay, &s.screenshot})  // never two actions on one combo
+        if (!x->empty() && (*x == s.toggleRecord || *x == s.pauseToggle || *x == s.micMute || *x == s.openFolder)) *x = Hotkey{};
+    if (!s.screenshot.empty() && s.screenshot == s.saveReplay) s.screenshot = Hotkey{};
+    if (str("screenshotFormat", v) && (v == "png" || v == "jpg")) s.screenshotFormat = v;
+    boo("separateTracks", s.separateTracks);
+    if (str("theme", v) && (v == "auto" || v == "dark" || v == "light")) s.theme = v;
+    if (str("accent", v) && validAccent(v)) s.accent = v;
+    if (str("fileNamePattern", v) && (v == "cast_date_time" || v == "date_time" || v == "source_date_time" || v == "cast_counter")) s.fileNamePattern = v;
     auto git = m.find("gpuIndex");
     if (git != m.end() && git->second.t == Value::Num && std::isfinite(git->second.n) && git->second.n >= -1 && git->second.n <= 32)
         s.gpuIndex = (int)git->second.n;

@@ -18,11 +18,17 @@ struct HwEncoderInfo {
     std::wstring name;     // friendly name
     UINT pciVendor = 0;
     int index = 0;         // ordinal in the LUID-filtered enumeration
+    GUID subtype = MFVideoFormat_H264;  // H.264, HEVC or AV1 output
     bool argb = false;     // feed BGRA (MFVideoFormat_ARGB32) surfaces instead of NV12 (VideoProcessor unavailable)
 };
 
 // Hardware H.264 encoders registered for the adapter that owns `dev` (MFT_ENUM_ADAPTER_LUID).
-std::vector<HwEncoderInfo> hwEncodersForDevice(ID3D11Device* dev, std::wstring& log);
+std::vector<HwEncoderInfo> hwEncodersForDevice(ID3D11Device* dev, std::wstring& log, const GUID& subtype = MFVideoFormat_H264);
+// What this machine can encode: hardware encoders on the adapter with this LUID (MFTEnum2) per codec, plus the
+// software MFTs. Labels: "H.264 · NVIDIA", "HEVC · Software" ...
+struct CodecSupport { GUID subtype; std::wstring codec, vendor; bool hardware; };
+std::vector<CodecSupport> probeCodecSupport(const LUID* adapter);
+const wchar_t* codecName(const GUID& subtype);
 
 class HwEncoder {
 public:
@@ -32,7 +38,7 @@ public:
     bool open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h, int fps, unsigned bitrate, bool high,
               std::wstring& log);
     // Microsoft software H.264 MFT (synchronous), same driver + same pass-through MP4 writer as hardware.
-    bool openSoftware(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log);
+    bool openSoftware(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log, const GUID& subtype = MFVideoFormat_H264);
     // Non-blocking: pumps events, submits the sample if the MFT wants input. Returns S_FALSE if the frame was
     // dropped because the encoder hasn't asked for input (counts as backpressure, never blocks).
     HRESULT encode(IMFSample* s, const OutputFn& out);
@@ -54,6 +60,7 @@ private:
     HRESULT deliver(IMFSample* s, const OutputFn& out);
     std::vector<Microsoft::WRL::ComPtr<IMFSample>> queue_;  // waiting for METransformNeedInput (max 4)
     HRESULT submitQueued();
+    GUID sub_ = MFVideoFormat_H264;
     bool sync_ = false;
     bool argb_ = false;
     bool gotKey_ = false;

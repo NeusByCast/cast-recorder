@@ -347,7 +347,8 @@ struct GpuConvert {
 void scaledSize(OutputScale scale, UINT inW, UINT inH, UINT& outW, UINT& outH) {
     outW = inW & ~1u; outH = inH & ~1u;
     UINT maxH = 0;
-    if (scale == OutputScale::P1080) maxH = 1080;
+    if (scale == OutputScale::P1440) maxH = 1440;
+    else if (scale == OutputScale::P1080) maxH = 1080;
     else if (scale == OutputScale::P720) maxH = 720;
     if (maxH && outH > maxH) {
         double r = (double)maxH / (double)outH;
@@ -436,36 +437,39 @@ struct Writer {
         if (FAILED(hr)) { err = hrMsg(L"BeginWriting", hr); return false; }
         return true;
     }
-    DWORD astream = 0;
+    DWORD astreams[3] = {0, 0, 0};
+    int tracks = 1;               // 1, or 3 (mix, system, mic)
     bool audio = false;
     UINT32 achannels = 2;
-    // AAC 48 kHz stereo track encoded by the sink writer's AAC MFT from s16 PCM. Call before BeginWriting.
+    // AAC 48 kHz track(s) encoded by the sink writer's AAC MFT from s16 PCM. Call before BeginWriting.
     bool addAudio(std::wstring& err) {
-        ComPtr<IMFMediaType> o, i;
-        MFCreateMediaType(&o);
-        o->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        o->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
-        o->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        o->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
-        o->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, achannels);
-        o->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, achannels == 1 ? 16000 : 24000);  // 128 / 192 kbps
-        o->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
-        HRESULT hr = sw->AddStream(o.Get(), &astream);
-        MFCreateMediaType(&i);
-        i->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        i->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
-        i->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-        i->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
-        i->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, achannels);
-        i->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * achannels);
-        i->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AudioMixer::kRate * 2 * achannels);
-        if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(astream, i.Get(), nullptr);
-        if (FAILED(hr)) { err = hrMsg(L"Audio stream (AAC)", hr); return false; }
+        for (int k = 0; k < tracks; ++k) {
+            ComPtr<IMFMediaType> o, i;
+            MFCreateMediaType(&o);
+            o->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            o->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            o->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            o->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
+            o->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, achannels);
+            o->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, achannels == 1 ? 16000 : 24000);  // 128 / 192 kbps
+            o->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+            HRESULT hr = sw->AddStream(o.Get(), &astreams[k]);
+            MFCreateMediaType(&i);
+            i->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            i->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+            i->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            i->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, AudioMixer::kRate);
+            i->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, achannels);
+            i->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * achannels);
+            i->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AudioMixer::kRate * 2 * achannels);
+            if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(astreams[k], i.Get(), nullptr);
+            if (FAILED(hr)) { err = hrMsg(L"Audio stream (AAC)", hr); return false; }
+        }
         audio = true;
         return true;
     }
-    HRESULT writeAudio(const std::vector<short>& pcm, LONGLONG t) {
-        if (!audio || pcm.empty()) return S_OK;
+    HRESULT writeAudio(const std::vector<short>& pcm, LONGLONG t, int track = 0) {
+        if (!audio || pcm.empty() || track >= tracks) return S_OK;
         DWORD bytes = (DWORD)(pcm.size() * sizeof(short));
         ComPtr<IMFMediaBuffer> b; ComPtr<IMFSample> s;
         HRESULT hr = MFCreateMemoryBuffer(bytes, &b);
@@ -473,7 +477,7 @@ struct Writer {
         if (SUCCEEDED(hr) && SUCCEEDED(hr = b->Lock(&p, nullptr, nullptr))) { memcpy(p, pcm.data(), bytes); b->Unlock(); b->SetCurrentLength(bytes); }
         if (SUCCEEDED(hr)) hr = MFCreateSample(&s);
         if (SUCCEEDED(hr)) { s->AddBuffer(b.Get()); s->SetSampleTime(t); s->SetSampleDuration((LONGLONG)(pcm.size() / achannels) * 10000000LL / AudioMixer::kRate); }
-        if (SUCCEEDED(hr)) hr = sw->WriteSample(astream, s.Get());
+        if (SUCCEEDED(hr)) hr = sw->WriteSample(astreams[track], s.Get());
         return hr;
     }
     bool wantAudio = false;
@@ -514,25 +518,6 @@ std::wstring exeDir() {
     return k == std::wstring::npos ? L"." : s.substr(0, k);
 }
 
-bool remux(const std::wstring& ffmpeg, const std::wstring& in, const std::wstring& out, DWORD timeoutMs) {
-    // The absolute path goes in lpApplicationName so CreateProcess can't resolve a different ffmpeg.exe.
-    std::wstring cmd = L"\"" + ffmpeg + L"\" -hide_banner -loglevel error -y -i \"" + in + L"\" -c copy \"" + out + L"\"";
-    STARTUPINFOW si{sizeof si};
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    if (!CreateProcessW(ffmpeg.c_str(), buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
-    DWORD wait = timeoutMs ? timeoutMs : 8000;
-    if (WaitForSingleObject(pi.hProcess, wait) == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 2000);
-    }
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return code == 0 && GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES;
-}
 
 
 // ---- abandon bookkeeping (process lifetime) ----
@@ -599,7 +584,7 @@ static std::wstring probeKey(ID3D11Device* dev, const HwEncoderInfo& e) {
     ComPtr<IDXGIDevice> d; ComPtr<IDXGIAdapter> a; DXGI_ADAPTER_DESC ad{};
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d))) && SUCCEEDED(d->GetAdapter(&a))) a->GetDesc(&ad);
     wchar_t b[128];
-    swprintf(b, 128, L"%08lX:%08lX/%d/%ls/%d", (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart, e.index, e.vendor.c_str(), e.argb ? 1 : 0);
+    swprintf(b, 128, L"%08lX:%08lX/%d/%ls/%d/%ls", (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart, e.index, e.vendor.c_str(), e.argb ? 1 : 0, codecName(e.subtype));
     return b;
 }
 
@@ -633,7 +618,8 @@ bool Recorder::start(const RecordOptions& o) {
     started_ = false;
     sessionGen_ = claim_.arm();
     sessionOut_ = opt_.outputPath;
-    sessionTmp_ = opt_.container == Container::MP4 ? opt_.outputPath : opt_.outputPath + L".part.mp4";
+    sessionTmp_ = opt_.bufferOnly ? std::wstring() : opt_.container == Container::MP4 ? opt_.outputPath : opt_.outputPath + L".part.mp4";
+    { std::lock_guard<std::mutex> g(fileM_); curFile_ = sessionTmp_; }
     if (doneEvent_) ResetEvent(doneEvent_);
     th_ = std::thread([this] { run(); });
     return true;
@@ -672,7 +658,7 @@ void Recorder::abort() {
         fsm_.toIdle();
         started_ = true;
         if (doneEvent_) SetEvent(doneEvent_);
-        if (opt_.notify) PostMessageW(opt_.notify, opt_.warmupOnly ? WM_APP_WARMUP_DONE : WM_APP_RECORDER_DONE, 0, 0);
+        if (opt_.notify) PostMessageW(opt_.notify, opt_.warmupOnly ? WM_APP_WARMUP_DONE : opt_.doneMsg ? opt_.doneMsg : WM_APP_RECORDER_DONE, 0, 0);
     });
 }
 
@@ -886,17 +872,30 @@ void Recorder::run() {
         if (FAILED(dev->CreateTexture2D(&td, nullptr, &latest))) { r.message = L"CreateTexture2D failed"; return; }
         // ---- audio (system loopback + mic), mixed on the video media clock ----
         Writer wr;
-        std::deque<std::pair<long long, std::vector<short>>> audioPending;  // until the lazy writer opens
+        wr.tracks = opt_.separateTracks ? 3 : 1;
+        struct AChunk { long long t; std::vector<short> pcm[3]; };
+        std::deque<AChunk> audioPending;  // until the lazy writer opens
         HRESULT audioHr = S_OK;
+        const bool toFile = !opt_.bufferOnly;
+        ReplayRing* replay = opt_.ring.get();
+        bool ringAttached = false;
+        auto writeChunk = [&](const AChunk& c) -> HRESULT {
+            HRESULT h = S_OK;
+            for (int k = 0; k < wr.tracks && SUCCEEDED(h); ++k) h = wr.writeAudio(c.pcm[k], c.t, k);
+            return h;
+        };
         auto pushAudio = [&](long long mediaTime, bool final) {
             if (!wr.wantAudio) return;
             mixer.micMuted = micMuted_.load();
-            std::vector<short> pcm; long long at = 0;
-            mixer.produce(mediaTime, final, pcm, at);
-            if (pcm.empty()) return;
-            if (!wr.sw) { audioPending.emplace_back(at, std::move(pcm)); return; }
-            while (!audioPending.empty()) { wr.writeAudio(audioPending.front().second, audioPending.front().first); audioPending.pop_front(); }
-            HRESULT ah = wr.writeAudio(pcm, at);
+            AChunk c; c.t = 0;
+            const bool split = wr.tracks == 3;
+            mixer.produce(mediaTime, final, c.pcm[0], c.t, split ? &c.pcm[1] : nullptr, split ? &c.pcm[2] : nullptr);
+            if (c.pcm[0].empty()) return;
+            if (replay && ringAttached) { const std::vector<short>* tr[3] = {&c.pcm[0], split ? &c.pcm[1] : nullptr, split ? &c.pcm[2] : nullptr}; replay->addAudio(c.t, tr); }
+            if (!toFile) return;
+            if (!wr.sw) { audioPending.push_back(std::move(c)); return; }
+            while (!audioPending.empty()) { writeChunk(audioPending.front()); audioPending.pop_front(); }
+            HRESULT ah = writeChunk(c);
             if (FAILED(ah)) audioHr = ah;
         };
 
@@ -904,7 +903,7 @@ void Recorder::run() {
         // Hardware: only encoders registered for THIS device's adapter (MFT_ENUM_ADAPTER_LUID), each one
         // pre-flight probed with a short real encode; a failing/stalling one is skipped (leaked, not waited on).
         // Order: requested vendor first (if any), then the other HW encoders on this adapter, then software.
-        const std::wstring tmp = opt_.container == Container::MP4 ? opt_.outputPath : opt_.outputPath + L".part.mp4";
+        const std::wstring tmp = sessionTmp_;
         GpuConvert conv;
         bool zeroCopy = false;
         bool bgraDirect = false;  // HW encoder fed BGRA textures (no VideoProcessor)
@@ -925,11 +924,17 @@ void Recorder::run() {
         // Encoded-sample sink for the hardware path: the MP4 writer is opened on the first output so it gets the
         // encoder's final output type (sequence header).
         HRESULT muxHr = S_OK;
+        auto resetWriter = [&] { bool wa = wr.wantAudio; int tr = wr.tracks; UINT32 ch = wr.achannels; wr = Writer{}; wr.wantAudio = wa; wr.tracks = tr; wr.achannels = ch; };
         auto muxOut = [&](IMFSample* es) -> HRESULT {
+            if (replay) {
+                if (!ringAttached) { ComPtr<IMFMediaType> ot = hw->muxType(); replay->attach(ot.Get(), opt_.fps, (int)wr.achannels, wr.tracks, wr.wantAudio); ringAttached = true; }
+                replay->addVideo(es);
+            }
+            if (!toFile) return S_OK;
             if (!wr.sw) {
                 ComPtr<IMFMediaType> ot = hw->muxType();
                 std::wstring e2;
-                if (!wr.openPassthrough(tmp, ot.Get(), e2)) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } muxHr = E_FAIL; err = e2; return E_FAIL; }
+                if (!wr.openPassthrough(tmp, ot.Get(), e2)) { resetWriter(); muxHr = E_FAIL; err = e2; return E_FAIL; }
             }
             HRESULT h2 = wr.sw->WriteSample(wr.stream, es);
             if (FAILED(h2)) muxHr = h2;
@@ -946,15 +951,40 @@ void Recorder::run() {
             wr.wantAudio = mixer.active() || opt_.warmupOnly;
             wr.achannels = (UINT32)mixer.channels;
             r.hasAudio = wr.wantAudio;
+            r.audioTracks = wr.wantAudio ? wr.tracks : 0;
+            // Codec order: explicit codec first (H.264 as the last resort); Auto = AV1 > HEVC > H.264 for MKV, H.264 for MP4.
+            std::vector<GUID> codecs;
+            if (opt_.codec == Codec::AV1) codecs = {MFVideoFormat_AV1};
+            else if (opt_.codec == Codec::HEVC) codecs = {MFVideoFormat_HEVC};
+            else if (opt_.codec == Codec::Auto && opt_.container == Container::MKV && !opt_.autoRemux) codecs = {MFVideoFormat_AV1, MFVideoFormat_HEVC};
+            // Auto + auto-remux ends up as MP4: H.264 for maximum compatibility (HEVC/AV1 need extra codecs to play).
+            codecs.push_back(MFVideoFormat_H264);
+            // A non-H.264 encoder only counts if the MP4 sink can mux it (pass-through AddStream on a scratch file).
+            auto muxable = [&](HwEncoder& enc) {
+                ComPtr<IMFMediaType> t = enc.muxType();
+                GUID st{}; t->GetGUID(MF_MT_SUBTYPE, &st);
+                if (st == MFVideoFormat_H264) return true;
+                wchar_t tp[MAX_PATH], tf[MAX_PATH];
+                if (!GetTempPathW(MAX_PATH, tp) || !GetTempFileNameW(tp, L"crm", 0, tf)) return false;
+                std::wstring scratch = std::wstring(tf) + L".mp4", e3;
+                bool ok = false;
+                { Writer pw; pw.wantAudio = false; ok = pw.openPassthrough(scratch, t.Get(), e3); pw.sw.Reset(); }
+                DeleteFileW(scratch.c_str()); DeleteFileW(tf);
+                elog += std::wstring(L"mux check ") + codecName(st) + (ok ? L": ok\n" : L": MP4 sink refused (" + e3 + L")\n");
+                return ok;
+            };
+            bool vpTried = false, vpOk = false;
+            for (const GUID& st : codecs) {
+            if (opened) break;
             if (opt_.encoder != Encoder::Software && videoSupport) {
-                auto encs = hwEncodersForDevice(dev.Get(), elog);
+                auto encs = hwEncodersForDevice(dev.Get(), elog, st);
                 const UINT want = vendorPci(opt_.encoder);
                 std::stable_sort(encs.begin(), encs.end(), [want](const HwEncoderInfo& a, const HwEncoderInfo& b) {
                     return (want && a.pciVendor == want) > (want && b.pciVendor == want);
                 });
-                bool vpOk = !encs.empty() && conv.init(dev.Get(), src->w, src->h, W, H);
+                if (!encs.empty() && !vpTried) { vpTried = true; vpOk = conv.init(dev.Get(), src->w, src->h, W, H); }
                 if (!encs.empty() && !vpOk) {
-                    elog += L"GPU NV12 conversion unavailable (" + conv.why + L"): feeding the encoder BGRA surfaces directly\n";
+                    if (!bgraDirect) elog += L"GPU NV12 conversion unavailable (" + conv.why + L"): feeding the encoder BGRA surfaces directly\n";
                     conv = GpuConvert{};
                     W = src->w & ~1u; H = src->h & ~1u;  // no GPU scaler on this path: native size
                     for (auto& e : encs) e.argb = true;
@@ -985,7 +1015,7 @@ void Recorder::run() {
                         }
                         auto enc = std::make_unique<HwEncoder>();
                         unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
-                        if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) {
+                        if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog) && muxable(*enc)) {
                             hw = std::move(enc); zeroCopy = true; opened = true;
                             r.encoderUsed = std::wstring(vendorLabel(e.vendor)) + L" (hardware)";
                             break;
@@ -999,20 +1029,32 @@ void Recorder::run() {
             swNv12 = false;  // software MFT fed CPU NV12, muxed by the same pass-through writer as hardware
             if (!opened) {
                 conv = GpuConvert{};
+                W = src->w & ~1u; H = src->h & ~1u; scaledSize(opt_.scale, src->w, src->h, W, H);
+                if (W > 4096 || H > 4096) { double k = 4096.0 / (double)std::max(W, H); W = (UINT)(W * k) & ~1u; H = (UINT)(H * k) & ~1u; }
                 auto enc = std::make_unique<HwEncoder>();
                 unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
-                if (enc->openSoftware(W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) { hw = std::move(enc); swNv12 = true; opened = true; }
-                else { enc->release(); opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err); }
+                if (enc->openSoftware(W, H, opt_.fps, br, opt_.quality >= Quality::High, elog, st) && muxable(*enc)) {
+                    hw = std::move(enc); swNv12 = true; opened = true;
+                    r.encoderUsed = L"Software (Media Foundation " + std::wstring(codecName(st)) + L")";
+                    if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
+                } else enc->release();
+            }
+            if (opened) r.codec = codecName(st);
+            }
+            if (!opened && !toFile) { r.message = L"Replay buffer needs an encoder MFT (none could be opened)"; return false; }
+            if (!opened) {
+                opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
                 r.encoderUsed = L"Software (Media Foundation H.264)";
                 if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
+                r.codec = L"H.264";
             }
-            if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return false; }
+            if (!opened) { resetWriter(); DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return false; }
             const bool scaling = W != (src->w & ~1u) || H != (src->h & ~1u);
             if (!zeroCopy && !swNv12 && scaling) {  // CPU / RGB path can't scale: encode native instead
-                { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str());
+                resetWriter(); DeleteFileW(tmp.c_str());
                 W = src->w & ~1u; H = src->h & ~1u;
                 opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
-                if (!opened) { { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return false; }
+                if (!opened) { resetWriter(); DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return false; }
             }
 
             mark(L"encoder");
@@ -1044,7 +1086,7 @@ void Recorder::run() {
                 if (GetTempPathW(MAX_PATH, tp) && GetTempFileNameW(tp, L"crw", 0, tf)) {
                     std::wstring warm = std::wstring(tf) + L".mp4";
                     {
-                        Writer pw; pw.wantAudio = wr.wantAudio; std::wstring e3;
+                        Writer pw; pw.wantAudio = wr.wantAudio; pw.tracks = wr.tracks; pw.achannels = wr.achannels; std::wstring e3;
                         ComPtr<IMFMediaType> vt = hw->muxType();
                         pw.openPassthrough(warm, vt.Get(), e3);
                         pw.sw.Reset();
@@ -1059,7 +1101,7 @@ void Recorder::run() {
 
         if (opt_.warmupOnly) {
             setup();
-            r.message = L"warm-up done"; { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; } DeleteFileW(tmp.c_str()); return;
+            r.message = L"warm-up done"; resetWriter(); DeleteFileW(tmp.c_str()); return;
         }
         auto setupF = std::async(std::launch::async, [&] {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -1088,7 +1130,7 @@ void Recorder::run() {
         started_ = true;
         r.startMs = (double)(t0.QuadPart - pressQ) * 1000.0 / qf.QuadPart;
         mixer.setOrigin(t0.QuadPart, freq.QuadPart);  // audio is placed against the same QPC zero
-        if (opt_.notify && haveFrame) PostMessageW(opt_.notify, WM_APP_RECORDER_STARTED, 0, 0);
+        if (opt_.notify && haveFrame && !opt_.bufferOnly) PostMessageW(opt_.notify, WM_APP_RECORDER_STARTED, 0, 0);
 
         // ---- encoder still initialising: keep the timeline running, buffer distinct frames (bounded) ----
         struct Pending { long long idx; int slot; };
@@ -1291,16 +1333,17 @@ void Recorder::run() {
             if (!hw->drain(muxOut, 1500)) { elog += L"drain: timed out, encoder leaked\n"; hw->leak(); }
             else hw->release();
             hw.reset();
-            if (!wr.sw) r.frames = 0;  // nothing ever came out of the encoder
+            if (!wr.sw && toFile) r.frames = 0;  // nothing ever came out of the encoder
         }
         {
             double secs = (double)next * dur / 1e7;
             r.encodeFps = secs > 0.1 ? r.frames / secs : 0;
         }
-        if (wr.sw) {
+        if (wr.sw || !toFile) {
             pushAudio(next * dur, true);
-            while (!audioPending.empty()) { wr.writeAudio(audioPending.front().second, audioPending.front().first); audioPending.pop_front(); }
+            while (!audioPending.empty() && wr.sw) { writeChunk(audioPending.front()); audioPending.pop_front(); }
         }
+        if (replay && ringAttached) replay->detach();
         r.encoderLog += L"audio stats: " + mixer.stats() + L"\n";
         mixer.stop();
 
@@ -1330,6 +1373,12 @@ void Recorder::run() {
             }
         }
 
+        if (!toFile) {  // replay buffer session: nothing to finalize
+            resetWriter();
+            r.ok = r.frames > 0 && r.message.empty();
+            if (r.message.empty() && !r.frames) r.message = L"No frames encoded";
+            return;
+        }
         // ---- Finalize: budget = finalizeTimeoutMs/2 (default 4 s); remux gets the other half ----
         HRESULT fh = E_FAIL;
         if (r.frames && wr.sw) {
@@ -1370,10 +1419,10 @@ void Recorder::run() {
                 g_abandonLive.fetch_sub(1);
                 fin.join();
                 fh = st->hr.load();
-                { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; }
+                resetWriter();
             }
         } else {
-            { bool wa = wr.wantAudio; wr = Writer{}; wr.wantAudio = wa; }
+            resetWriter();
             if (!r.frames) { DeleteFileW(tmp.c_str()); if (r.message.empty()) r.message = L"No frames recorded"; }
         }
 
@@ -1383,10 +1432,16 @@ void Recorder::run() {
                 DeleteFileW(tmp.c_str());
             } else if (SUCCEEDED(fh) && r.frames) {
                 r.file = tmp;
+                std::vector<std::wstring> names;
+                if (wr.tracks == 3 && r.hasAudio) names = {L"Mix", L"System audio", L"Microphone"};
+                // remux budget: the configured half plus 1 s per 200 MB (stream copy is disk-bound)
+                WIN32_FILE_ATTRIBUTE_DATA fa{};
+                unsigned long long sz = GetFileAttributesExW(tmp.c_str(), GetFileExInfoStandard, &fa) ? ((unsigned long long)fa.nFileSizeHigh << 32 | fa.nFileSizeLow) : 0;
+                const DWORD remuxBudget = finalizeBudgetMs(opt_.finalizeTimeoutMs) + (DWORD)(sz / (200ull << 20)) * 1000;
                 if (opt_.container != Container::MP4) {
                     std::wstring ff = findFfmpeg();
-                    DWORD remuxBudget = finalizeBudgetMs(opt_.finalizeTimeoutMs);
-                    if (!ff.empty() && remux(ff, tmp, opt_.outputPath, remuxBudget)) {
+                    std::wstring rerr;
+                    if (!ff.empty() && remuxFile(tmp, opt_.outputPath, rerr, L"ffmpeg", remuxBudget, names)) {
                         DeleteFileW(tmp.c_str());
                         r.file = opt_.outputPath;
                     } else {
@@ -1400,6 +1455,24 @@ void Recorder::run() {
                         if (ff.empty()) r.message = L"ffmpeg.exe not found, saved as MP4";
                         else { r.message = L"ffmpeg remux failed, saved as MP4"; DeleteFileW(tmp.c_str()); }
                     }
+                    // Auto-remux: MKV -> MP4 by stream copy, keep only the MP4.
+                    if (opt_.autoRemux && r.file == opt_.outputPath) {
+                        std::wstring mp4 = opt_.outputPath;
+                        size_t dot = mp4.find_last_of(L'.');
+                        mp4 = mp4.substr(0, dot) + L".mp4";
+                        std::wstring rerr2;
+                        if (remuxFile(r.file, mp4, rerr2, L"", remuxBudget, names)) {
+                            DeleteFileW(r.file.c_str());
+                            r.file = mp4;
+                            r.encoderLog += L"auto-remux: MKV -> MP4 ok\n";
+                        } else r.encoderLog += L"auto-remux failed (" + rerr2 + L"): kept the MKV\n";
+                    }
+                } else if (!names.empty() && !findFfmpeg().empty()) {
+                    // MP4 with separate tracks: name the tracks (stream copy into a temp, then replace)
+                    std::wstring named = tmp + L".named.mp4", rerr;
+                    if (remuxFile(tmp, named, rerr, L"ffmpeg", remuxBudget, names) && MoveFileExW(named.c_str(), tmp.c_str(), MOVEFILE_REPLACE_EXISTING))
+                        r.encoderLog += L"audio tracks named (mix / system / mic)\n";
+                    else { DeleteFileW(named.c_str()); r.encoderLog += L"track naming failed: " + rerr + L"\n"; }
                 }
             }
         }
@@ -1421,10 +1494,298 @@ void Recorder::run() {
         fsm_.toIdle();
         started_ = true;
         if (doneEvent_) SetEvent(doneEvent_);
-        if (opt_.notify) PostMessageW(opt_.notify, opt_.warmupOnly ? WM_APP_WARMUP_DONE : WM_APP_RECORDER_DONE, 0, 0);
+        if (opt_.notify) PostMessageW(opt_.notify, opt_.warmupOnly ? WM_APP_WARMUP_DONE : opt_.doneMsg ? opt_.doneMsg : WM_APP_RECORDER_DONE, 0, 0);
     });
     // abort() already published for this session: our output is stale, remove any file we produced.
     if (!won && !r.file.empty()) DeleteFileW(r.file.c_str());
+}
+
+
+// ======================= remux (stream copy) =======================
+namespace {
+bool ffmpegCopy(const std::wstring& ffmpeg, const std::wstring& in, const std::wstring& out, DWORD timeoutMs,
+                const std::vector<std::wstring>& names, std::wstring& err) {
+    // The absolute path goes in lpApplicationName so CreateProcess can't resolve a different ffmpeg.exe.
+    std::wstring cmd = L"\"" + ffmpeg + L"\" -hide_banner -loglevel error -y -i \"" + in + L"\" -map 0 -c copy";
+    for (size_t k = 0; k < names.size(); ++k) cmd += L" -metadata:s:a:" + std::to_wstring(k) + L" title=\"" + names[k] + L"\"";
+    size_t dot = out.find_last_of(L'.');
+    std::wstring ext = dot == std::wstring::npos ? L"" : out.substr(dot);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    if (ext == L".mp4" || ext == L".mov") cmd += L" -movflags +faststart";
+    if (ext == L".mp4") cmd += L" -f mp4";
+    cmd += L" \"" + out + L"\"";
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(0);
+    if (!CreateProcessW(ffmpeg.c_str(), buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) { err = L"ffmpeg did not start"; return false; }
+    DWORD wait = timeoutMs ? timeoutMs : 8000;
+    bool timedOut = false;
+    if (WaitForSingleObject(pi.hProcess, wait) == WAIT_TIMEOUT) {
+        timedOut = true;
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 2000);
+    }
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    bool ok = code == 0 && GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!ok) { err = timedOut ? L"ffmpeg timed out" : L"ffmpeg failed (exit " + std::to_wstring(code) + L")"; DeleteFileW(out.c_str()); }
+    return ok;
+}
+
+// Media Foundation stream copy: the source reader hands out compressed samples (no output types set), the sink
+// writer muxes them unchanged. Works for the H.264/HEVC/AV1 + AAC streams we write.
+bool mfCopy(const std::wstring& in, const std::wstring& out, std::wstring& err) {
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool mf = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+    bool ok = false;
+    [&] {
+        ComPtr<IMFSourceReader> rd;
+        HRESULT hr = MFCreateSourceReaderFromURL(in.c_str(), nullptr, &rd);
+        if (FAILED(hr)) { err = hrMsg(L"open source", hr); return; }
+        ComPtr<IMFAttributes> a;
+        MFCreateAttributes(&a, 2);
+        a->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+        a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+        ComPtr<IMFSinkWriter> sw;
+        hr = MFCreateSinkWriterFromURL(out.c_str(), nullptr, a.Get(), &sw);
+        if (FAILED(hr)) { err = hrMsg(L"create MP4", hr); return; }
+        std::vector<std::pair<DWORD, DWORD>> map;  // reader stream -> writer stream
+        for (DWORD i = 0;; ++i) {
+            ComPtr<IMFMediaType> t;
+            hr = rd->GetNativeMediaType(i, 0, &t);
+            if (hr == MF_E_INVALIDSTREAMNUMBER) break;
+            if (FAILED(hr)) { err = hrMsg(L"native type", hr); return; }
+            GUID major{};
+            t->GetGUID(MF_MT_MAJOR_TYPE, &major);
+            if (major != MFMediaType_Video && major != MFMediaType_Audio) { rd->SetStreamSelection(i, FALSE); continue; }
+            rd->SetStreamSelection(i, TRUE);
+            DWORD w = 0;
+            hr = sw->AddStream(t.Get(), &w);
+            if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(w, t.Get(), nullptr);
+            if (FAILED(hr)) { err = hrMsg(L"stream copy setup", hr); return; }
+            map.push_back({i, w});
+        }
+        if (map.empty()) { err = L"no audio/video streams"; return; }
+        hr = sw->BeginWriting();
+        if (FAILED(hr)) { err = hrMsg(L"BeginWriting", hr); return; }
+        unsigned long long n = 0;
+        std::vector<DWORD> ended;
+        for (;;) {
+            DWORD si = 0, flags = 0; LONGLONG ts = 0;
+            ComPtr<IMFSample> smp;
+            hr = rd->ReadSample(MF_SOURCE_READER_ANY_STREAM, 0, &si, &flags, &ts, &smp);
+            if (FAILED(hr)) { err = hrMsg(L"ReadSample", hr); return; }
+            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+                bool all = true;  // keep reading until every selected stream ended
+                ended.push_back(si);
+                for (auto& m2 : map) if (std::find(ended.begin(), ended.end(), m2.first) == ended.end()) all = false;
+                if (all) break;
+                if (!smp) continue;
+            }
+            if (!smp) continue;
+            for (auto& m2 : map) if (m2.first == si) { hr = sw->WriteSample(m2.second, smp.Get()); break; }
+            if (FAILED(hr)) { err = hrMsg(L"WriteSample", hr); return; }
+            ++n;
+        }
+        hr = sw->Finalize();
+        if (FAILED(hr)) { err = hrMsg(L"Finalize", hr); return; }
+        ok = n > 0;
+        if (!ok) err = L"no samples";
+    }();
+    if (mf) MFShutdown();
+    if (SUCCEEDED(hrCo)) CoUninitialize();
+    if (!ok) DeleteFileW(out.c_str());
+    return ok;
+}
+}  // namespace
+
+bool remuxFile(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine, DWORD timeoutMs,
+               const std::vector<std::wstring>& trackNames) {
+    if (GetFileAttributesW(in.c_str()) == INVALID_FILE_ATTRIBUTES) { err = L"source file missing"; return false; }
+    std::wstring ff = engine == L"mf" ? std::wstring() : findFfmpeg();
+    if (!ff.empty()) {
+        if (ffmpegCopy(ff, in, out, timeoutMs, trackNames, err)) return true;
+        if (engine == L"ffmpeg") return false;
+    } else if (engine == L"ffmpeg") { err = L"ffmpeg.exe not found"; return false; }
+    size_t dot = out.find_last_of(L'.');
+    std::wstring ext = dot == std::wstring::npos ? L"" : out.substr(dot);
+    for (auto& c : ext) c = (wchar_t)towlower(c);
+    if (ext != L".mp4") { if (err.empty()) err = L"MKV output needs ffmpeg.exe"; return false; }
+    std::wstring e2;
+    if (mfCopy(in, out, e2)) { err.clear(); return true; }
+    err = err.empty() ? e2 : err + L"; MF: " + e2;
+    return false;
+}
+
+// ======================= instant replay ring =======================
+struct ReplayRing::Impl {
+    mutable std::mutex m;
+    int seconds = 30;
+    ComPtr<IMFMediaType> vtype;
+    GUID sub{}; UINT32 w = 0, h = 0; std::vector<BYTE> hdr;
+    int fps = 30, channels = 1, tracks = 1; bool audio = false;
+    struct V { ComPtr<IMFSample> s; LONGLONG t = 0, d = 0; bool key = false; size_t bytes = 0; };
+    std::deque<V> v;
+    struct A { LONGLONG t = 0; std::vector<short> pcm[3]; };
+    std::deque<A> a;
+    LONGLONG offset = 0, lastEnd = 0;
+    bool attached = false;
+    size_t bytes = 0;
+    LONGLONG startFor(int secs) const {  // newest key frame at or before (end - secs)
+        LONGLONG want = lastEnd - (LONGLONG)secs * 10000000LL;
+        LONGLONG best = -1;
+        for (auto& x : v) { if (!x.key) continue; if (best < 0 || x.t <= want) best = x.t; if (x.t > want) break; }
+        return best;
+    }
+    void trim() {
+        const LONGLONG keep = (LONGLONG)seconds * 10000000LL;
+        for (;;) {
+            size_t k = 1;
+            while (k < v.size() && !v[k].key) ++k;
+            if (k >= v.size() || v[k].t > lastEnd - keep) break;
+            for (size_t i = 0; i < k; ++i) { bytes -= v.front().bytes; v.pop_front(); }
+        }
+        LONGLONG first = v.empty() ? lastEnd : v.front().t;
+        while (!a.empty() && a.front().t + 2000000 < first) {
+            for (auto& p : a.front().pcm) bytes -= p.size() * sizeof(short);
+            a.pop_front();
+        }
+    }
+};
+
+ReplayRing::ReplayRing(int seconds) : p_(new Impl) { p_->seconds = seconds < 5 ? 5 : seconds > 900 ? 900 : seconds; }
+ReplayRing::~ReplayRing() = default;
+void ReplayRing::setSeconds(int s) { std::lock_guard<std::mutex> g(p_->m); p_->seconds = s < 5 ? 5 : s > 900 ? 900 : s; p_->trim(); }
+int ReplayRing::seconds() const { std::lock_guard<std::mutex> g(p_->m); return p_->seconds; }
+size_t ReplayRing::bytes() const { std::lock_guard<std::mutex> g(p_->m); return p_->bytes; }
+double ReplayRing::bufferedSeconds() const {
+    std::lock_guard<std::mutex> g(p_->m);
+    LONGLONG st = p_->startFor(p_->seconds);
+    return st < 0 ? 0.0 : (double)(p_->lastEnd - st) / 1e7;
+}
+
+void ReplayRing::attach(IMFMediaType* vt, int fps, int channels, int tracks, bool audio) {
+    std::lock_guard<std::mutex> g(p_->m);
+    GUID sub{}; UINT32 w = 0, h = 0; std::vector<BYTE> hdr;
+    vt->GetGUID(MF_MT_SUBTYPE, &sub);
+    MFGetAttributeSize(vt, MF_MT_FRAME_SIZE, &w, &h);
+    UINT32 sz = 0;
+    if (SUCCEEDED(vt->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &sz)) && sz) { hdr.resize(sz); vt->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), sz, nullptr); }
+    const bool same = p_->vtype && sub == p_->sub && w == p_->w && h == p_->h && hdr == p_->hdr && fps == p_->fps &&
+                      channels == p_->channels && tracks == p_->tracks && audio == p_->audio;
+    if (!same) {  // different encoder configuration: older packets could not be muxed with this one
+        p_->v.clear(); p_->a.clear(); p_->bytes = 0; p_->lastEnd = 0;
+        ComPtr<IMFMediaType> c;
+        MFCreateMediaType(&c);
+        vt->CopyAllItems(c.Get());
+        p_->vtype = c; p_->sub = sub; p_->w = w; p_->h = h; p_->hdr = hdr; p_->fps = fps; p_->channels = channels; p_->tracks = tracks; p_->audio = audio;
+    }
+    p_->offset = p_->lastEnd;  // continue the ring's timeline (session time starts at 0 again)
+    p_->attached = true;
+}
+void ReplayRing::detach() { std::lock_guard<std::mutex> g(p_->m); p_->attached = false; }
+
+void ReplayRing::addVideo(IMFSample* s) {
+    LONGLONG t = 0, d = 0;
+    if (FAILED(s->GetSampleTime(&t))) return;
+    if (FAILED(s->GetSampleDuration(&d)) || d <= 0) d = 10000000LL / 30;
+    UINT32 clean = 0;
+    if (FAILED(s->GetUINT32(MFSampleExtension_CleanPoint, &clean))) clean = 0;
+    // Own copy of the bytes: encoder MFTs may recycle their output samples from a small pool.
+    ComPtr<IMFMediaBuffer> src, dst;
+    if (FAILED(s->ConvertToContiguousBuffer(&src))) return;
+    BYTE* p = nullptr; DWORD len = 0;
+    if (FAILED(src->Lock(&p, nullptr, &len))) return;
+    HRESULT hr = MFCreateMemoryBuffer(len ? len : 1, &dst);
+    BYTE* q = nullptr;
+    if (SUCCEEDED(hr) && SUCCEEDED(hr = dst->Lock(&q, nullptr, nullptr))) { memcpy(q, p, len); dst->Unlock(); dst->SetCurrentLength(len); }
+    src->Unlock();
+    if (FAILED(hr)) return;
+    ComPtr<IMFSample> c;
+    if (FAILED(MFCreateSample(&c))) return;
+    c->AddBuffer(dst.Get());
+    std::lock_guard<std::mutex> g(p_->m);
+    if (!p_->attached) return;
+    Impl::V x; x.s = c; x.t = t + p_->offset; x.d = d; x.key = clean != 0; x.bytes = len;
+    if (p_->v.empty() && !x.key) return;  // the ring always starts on a key frame
+    p_->v.push_back(x);
+    p_->bytes += len;
+    if (x.t + d > p_->lastEnd) p_->lastEnd = x.t + d;
+    p_->trim();
+}
+
+void ReplayRing::addAudio(long long t, const std::vector<short>* const pcm[3]) {
+    std::lock_guard<std::mutex> g(p_->m);
+    if (!p_->attached || !p_->audio || p_->v.empty()) return;
+    Impl::A c; c.t = t + p_->offset;
+    for (int k = 0; k < 3; ++k) if (pcm[k] && k < p_->tracks) { c.pcm[k] = *pcm[k]; p_->bytes += pcm[k]->size() * sizeof(short); }
+    p_->a.push_back(std::move(c));
+}
+
+bool ReplayRing::save(const std::wstring& path, double& savedSeconds, std::wstring& err) {
+    savedSeconds = 0;
+    std::vector<Impl::V> vs; std::vector<Impl::A> as;
+    ComPtr<IMFMediaType> vt; int fps = 30, channels = 1, tracks = 1; bool audio = false;
+    LONGLONG start = 0, end = 0;
+    {
+        std::lock_guard<std::mutex> g(p_->m);
+        start = p_->startFor(p_->seconds);
+        if (start < 0 || !p_->vtype) { err = L"Replay buffer is empty"; return false; }
+        end = p_->lastEnd;
+        for (auto& x : p_->v) if (x.t >= start) vs.push_back(x);
+        for (auto& x : p_->a) if (x.t + 2000000 >= start) as.push_back(x);
+        vt = p_->vtype; fps = p_->fps; channels = p_->channels; tracks = p_->tracks; audio = p_->audio;
+    }
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool mf = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+    bool ok = false;
+    [&] {
+        Writer w;
+        w.wantAudio = audio && !as.empty();
+        w.tracks = tracks; w.achannels = (UINT32)channels;
+        if (!w.openPassthrough(path, vt.Get(), err)) return;
+        size_t ai = 0;
+        const LONGLONG perFrame = 10000000LL / AudioMixer::kRate;
+        auto writeAudioUpTo = [&](LONGLONG until) -> HRESULT {
+            for (; ai < as.size() && as[ai].t <= until; ++ai) {
+                const Impl::A& c = as[ai];
+                for (int k = 0; k < tracks; ++k) {
+                    const std::vector<short>& pc = c.pcm[k];
+                    if (pc.empty()) continue;
+                    LONGLONG t = c.t - start;
+                    size_t skip = 0;
+                    if (t < 0) { skip = (size_t)((-t) / perFrame) * (size_t)channels; t = 0; }
+                    if (skip >= pc.size()) continue;
+                    std::vector<short> part(pc.begin() + (ptrdiff_t)skip, pc.end());
+                    HRESULT h = w.writeAudio(part, t, k);
+                    if (FAILED(h)) return h;
+                }
+            }
+            return S_OK;
+        };
+        for (auto& x : vs) {
+            HRESULT h = w.wantAudio ? writeAudioUpTo(x.t) : S_OK;
+            ComPtr<IMFSample> c; ComPtr<IMFMediaBuffer> b;
+            if (SUCCEEDED(h)) h = MFCreateSample(&c);
+            if (SUCCEEDED(h)) h = x.s->GetBufferByIndex(0, &b);
+            if (SUCCEEDED(h)) h = c->AddBuffer(b.Get());
+            if (SUCCEEDED(h)) { c->SetSampleTime(x.t - start); c->SetSampleDuration(x.d); if (x.key) c->SetUINT32(MFSampleExtension_CleanPoint, TRUE); h = w.sw->WriteSample(w.stream, c.Get()); }
+            if (FAILED(h)) { err = hrMsg(L"WriteSample", h); return; }
+        }
+        if (w.wantAudio) writeAudioUpTo(end);
+        HRESULT h = w.sw->Finalize();
+        if (FAILED(h)) { err = hrMsg(L"Finalize", h); return; }
+        ok = true;
+    }();
+    (void)fps;
+    if (mf) MFShutdown();
+    if (SUCCEEDED(hrCo)) CoUninitialize();
+    if (ok) savedSeconds = (double)(end - start) / 1e7;
+    else DeleteFileW(path.c_str());
+    return ok;
 }
 
 }  // namespace cr

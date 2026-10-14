@@ -49,27 +49,30 @@ bool adapterLuid(ID3D11Device* dev, LUID& luid, UINT& vendor) {
     return true;
 }
 
-std::vector<ComPtr<IMFActivate>> enumForDevice(ID3D11Device* dev, std::wstring& log) {
+std::vector<ComPtr<IMFActivate>> enumForLuid(const LUID& luid, UINT vendor, std::wstring& log, const GUID& subtype) {
     std::vector<ComPtr<IMFActivate>> out;
-    LUID luid{}; UINT vendor = 0;
-    if (!adapterLuid(dev, luid, vendor)) { log += L"enum: no adapter for device\n"; return out; }
     auto fn = (MFTEnum2Fn)GetProcAddress(GetModuleHandleW(L"mfplat.dll"), "MFTEnum2");
     if (!fn) { log += L"enum: MFTEnum2 unavailable (pre-1703 Windows)\n"; return out; }
     ComPtr<IMFAttributes> attr;
     MFCreateAttributes(&attr, 1);
     attr->SetBlob(kMFT_ENUM_ADAPTER_LUID, (const UINT8*)&luid, sizeof luid);
-    MFT_REGISTER_TYPE_INFO outInfo{MFMediaType_Video, MFVideoFormat_H264};
+    MFT_REGISTER_TYPE_INFO outInfo{MFMediaType_Video, subtype};
     IMFActivate** acts = nullptr; UINT32 n = 0;
     HRESULT hr = fn(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, nullptr, &outInfo,
                     attr.Get(), &acts, &n);
     wchar_t b[160];
-    swprintf(b, 160, L"MFTEnum2(adapter LUID %08lX:%08lX, vendor %04X): 0x%08lX, %u encoder(s)\n",
+    swprintf(b, 160, L"MFTEnum2(%ls, adapter LUID %08lX:%08lX, vendor %04X): 0x%08lX, %u encoder(s)\n", codecName(subtype),
              (unsigned long)luid.HighPart, (unsigned long)luid.LowPart, vendor, (unsigned long)hr, n);
     log += b;
     if (FAILED(hr)) return out;
     for (UINT32 i = 0; i < n; ++i) { out.emplace_back(acts[i]); acts[i]->Release(); }
     CoTaskMemFree(acts);
     return out;
+}
+std::vector<ComPtr<IMFActivate>> enumForDevice(ID3D11Device* dev, std::wstring& log, const GUID& subtype) {
+    LUID luid{}; UINT vendor = 0;
+    if (!adapterLuid(dev, luid, vendor)) { log += L"enum: no adapter for device\n"; return {}; }
+    return enumForLuid(luid, vendor, log, subtype);
 }
 
 std::wstring str(IMFActivate* a, const GUID& k) {
@@ -87,9 +90,44 @@ void setCodec(ICodecAPI* c, const GUID& k, VARTYPE vt, ULONG v, const wchar_t* n
 
 }  // namespace
 
-std::vector<HwEncoderInfo> hwEncodersForDevice(ID3D11Device* dev, std::wstring& log) {
+const wchar_t* codecName(const GUID& st) {
+    if (st == MFVideoFormat_HEVC) return L"HEVC";
+    if (st == MFVideoFormat_AV1) return L"AV1";
+    return L"H.264";
+}
+
+static const wchar_t* vendorOf(const std::wstring& v) {
+    if (v.find(L"10DE") != std::wstring::npos) return L"NVIDIA";
+    if (v.find(L"1002") != std::wstring::npos || v.find(L"1022") != std::wstring::npos) return L"AMD";
+    if (v.find(L"8086") != std::wstring::npos) return L"Intel";
+    return L"Hardware";
+}
+
+std::vector<CodecSupport> probeCodecSupport(const LUID* adapter) {
+    std::vector<CodecSupport> r;
+    std::wstring log;
+    for (const GUID& st : {MFVideoFormat_AV1, MFVideoFormat_HEVC, MFVideoFormat_H264}) {
+        if (adapter) {
+            for (auto& a : enumForLuid(*adapter, 0, log, st)) {
+                CodecSupport c{st, codecName(st), vendorOf(str(a.Get(), kMFT_ENUM_HARDWARE_VENDOR_ID)), true};
+                bool dup = false;
+                for (auto& x : r) if (x.subtype == st && x.vendor == c.vendor) dup = true;
+                if (!dup) r.push_back(c);
+            }
+        }
+        MFT_REGISTER_TYPE_INFO inInfo{MFMediaType_Video, MFVideoFormat_NV12}, outInfo{MFMediaType_Video, st};
+        IMFActivate** acts = nullptr; UINT32 n = 0;
+        if (SUCCEEDED(MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, &inInfo, &outInfo, &acts, &n)) && n)
+            r.push_back(CodecSupport{st, codecName(st), L"Software", false});
+        for (UINT32 i = 0; i < n; ++i) acts[i]->Release();
+        if (acts) CoTaskMemFree(acts);
+    }
+    return r;
+}
+
+std::vector<HwEncoderInfo> hwEncodersForDevice(ID3D11Device* dev, std::wstring& log, const GUID& subtype) {
     std::vector<HwEncoderInfo> r;
-    auto acts = enumForDevice(dev, log);
+    auto acts = enumForDevice(dev, log, subtype);
     for (size_t i = 0; i < acts.size(); ++i) {
         HwEncoderInfo e;
         e.vendor = str(acts[i].Get(), kMFT_ENUM_HARDWARE_VENDOR_ID);
@@ -98,6 +136,7 @@ std::vector<HwEncoderInfo> hwEncodersForDevice(ID3D11Device* dev, std::wstring& 
         else if (e.vendor.find(L"1002") != std::wstring::npos || e.vendor.find(L"1022") != std::wstring::npos) e.pciVendor = 0x1002;
         else if (e.vendor.find(L"8086") != std::wstring::npos) e.pciVendor = 0x8086;
         e.index = (int)i;
+        e.subtype = subtype;
         log += L"  [" + std::to_wstring(i) + L"] " + e.name + L" (" + e.vendor + L")\n";
         r.push_back(e);
     }
@@ -122,7 +161,8 @@ void HwEncoder::leak() {
 
 bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h, int fps, unsigned bitrate, bool high,
                      std::wstring& log) {
-    auto acts = enumForDevice(dev, log);
+    auto acts = enumForDevice(dev, log, info.subtype);
+    sub_ = info.subtype;
     if (info.index < 0 || (size_t)info.index >= acts.size()) { log += L"open: encoder index gone\n"; return false; }
     act_ = acts[info.index];
     label = info.name;
@@ -159,11 +199,12 @@ bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT 
     return configure(w, h, fps, bitrate, high, log);
 }
 
-bool HwEncoder::openSoftware(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log) {
-    MFT_REGISTER_TYPE_INFO inInfo{MFMediaType_Video, MFVideoFormat_NV12}, outInfo{MFMediaType_Video, MFVideoFormat_H264};
+bool HwEncoder::openSoftware(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log, const GUID& subtype) {
+    sub_ = subtype;
+    MFT_REGISTER_TYPE_INFO inInfo{MFMediaType_Video, MFVideoFormat_NV12}, outInfo{MFMediaType_Video, subtype};
     IMFActivate** acts = nullptr; UINT32 n = 0;
     HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, &inInfo, &outInfo, &acts, &n);
-    logHr(log, L"MFTEnumEx(software H.264)", hr);
+    logHr(log, (std::wstring(L"MFTEnumEx(software ") + codecName(subtype) + L")").c_str(), hr);
     if (FAILED(hr) || !n) { if (acts) CoTaskMemFree(acts); return false; }
     act_ = acts[0];
     for (UINT32 i = 0; i < n; ++i) acts[i]->Release();
@@ -199,10 +240,12 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
     // Output type FIRST (required by AMF/NVENC/QSV encoders), then input.
     MFCreateMediaType(&outType_);
     outType_->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    outType_->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    const bool h264 = sub_ == MFVideoFormat_H264;
+    outType_->SetGUID(MF_MT_SUBTYPE, sub_);
     outType_->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
     outType_->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    outType_->SetUINT32(MF_MT_MPEG2_PROFILE, high ? 100u : 77u);
+    if (h264) outType_->SetUINT32(MF_MT_MPEG2_PROFILE, high ? 100u : 77u);
+    else if (sub_ == MFVideoFormat_HEVC) outType_->SetUINT32(MF_MT_MPEG2_PROFILE, 1u /* eAVEncH265VProfile_Main_420_8 */);
     outType_->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
     outType_->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
     outType_->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
@@ -211,14 +254,19 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
     MFSetAttributeRatio(outType_.Get(), MF_MT_FRAME_RATE, (UINT32)fps, 1);
     MFSetAttributeRatio(outType_.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     hr = mft_->SetOutputType(outId_, outType_.Get(), 0);
-    logHr(log, L"SetOutputType(H264)", hr);
-    if (FAILED(hr) && high) {  // some iGPUs reject High at this size: retry Main
+    logHr(log, (std::wstring(L"SetOutputType(") + codecName(sub_) + L")").c_str(), hr);
+    if (FAILED(hr) && !h264) {  // let the encoder pick its default profile
+        outType_->DeleteItem(MF_MT_MPEG2_PROFILE);
+        hr = mft_->SetOutputType(outId_, outType_.Get(), 0);
+        logHr(log, L"SetOutputType(default profile)", hr);
+    }
+    if (FAILED(hr) && high && h264) {  // some iGPUs reject High at this size: retry Main
         outType_->SetUINT32(MF_MT_MPEG2_PROFILE, 77u);
         hr = mft_->SetOutputType(outId_, outType_.Get(), 0);
         logHr(log, L"SetOutputType(H264 Main)", hr);
     }
     if (FAILED(hr)) return false;
-    outType_->GetUINT32(MF_MT_MPEG2_PROFILE, &profile_);
+    if (FAILED(outType_->GetUINT32(MF_MT_MPEG2_PROFILE, &profile_))) profile_ = 0;
 
     // Input: pick the MFT's own NV12 type (keeps its private attributes) and set our size/rate.
     ComPtr<IMFMediaType> inT;
@@ -291,7 +339,7 @@ HRESULT HwEncoder::processOutput(const OutputFn& out) {
 
 namespace {
 // Annex-B NAL walk: calls f(type, ptr-to-start-code, total length incl. start code).
-template <class F> void forNals(const BYTE* p, DWORD n, F f) {
+template <class F> void forNals(const BYTE* p, DWORD n, bool hevc, F f) {
     DWORD i = 0;
     auto sc = [&](DWORD k) -> DWORD { if (k + 3 <= n && p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 1) return 3;
                                       if (k + 4 <= n && p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 0 && p[k + 3] == 1) return 4; return 0; };
@@ -299,7 +347,7 @@ template <class F> void forNals(const BYTE* p, DWORD n, F f) {
     while (i < n) {
         DWORD l = sc(i), j = i + l;
         while (j < n && !sc(j)) ++j;
-        if (i + l < n) f(p[i + l] & 0x1f, p + i, j - i);
+        if (i + l < n) f(hevc ? (p[i + l] >> 1) & 0x3f : p[i + l] & 0x1f, p + i, j - i);
         i = j;
     }
 }
@@ -310,16 +358,27 @@ HRESULT HwEncoder::deliver(IMFSample* s, const OutputFn& out) {
     if (FAILED(s->ConvertToContiguousBuffer(&b))) return S_OK;
     BYTE* p = nullptr; DWORD len = 0;
     if (FAILED(b->Lock(&p, nullptr, &len))) return S_OK;
-    bool idr = false; std::vector<BYTE> sps, pps;
-    forNals(p, len, [&](int t, const BYTE* q, DWORD l) {
+    bool idr = false; std::vector<BYTE> vps, sps, pps;
+    const bool hevc = sub_ == MFVideoFormat_HEVC, av1 = sub_ == MFVideoFormat_AV1;
+    if (!av1) forNals(p, len, hevc, [&](int t, const BYTE* q, DWORD l) {
+        if (hevc) {
+            if (t >= 16 && t <= 21) idr = true;  // BLA / IDR / CRA
+            else if (t == 32 && vps.empty()) vps.assign(q, q + l);
+            else if (t == 33 && sps.empty()) sps.assign(q, q + l);
+            else if (t == 34 && pps.empty()) pps.assign(q, q + l);
+            return;
+        }
         if (t == 5) idr = true;
         else if (t == 7 && sps.empty()) sps.assign(q, q + l);
         else if (t == 8 && pps.empty()) pps.assign(q, q + l);
     });
     b->Unlock();
-    if (seqHeader_.empty() && !sps.empty() && !pps.empty()) { seqHeader_ = sps; seqHeader_.insert(seqHeader_.end(), pps.begin(), pps.end()); }
+    if (seqHeader_.empty() && !sps.empty() && !pps.empty()) {
+        seqHeader_ = vps; seqHeader_.insert(seqHeader_.end(), sps.begin(), sps.end()); seqHeader_.insert(seqHeader_.end(), pps.begin(), pps.end());
+    }
     UINT32 clean = 0;
     if (FAILED(s->GetUINT32(MFSampleExtension_CleanPoint, &clean))) clean = 0;
+    if (av1 && !gotKey_ && !clean) idr = true;  // the first AV1 temporal unit is always a key frame
     if (idr && !clean) { s->SetUINT32(MFSampleExtension_CleanPoint, TRUE); clean = 1; }
     if (!gotKey_) {
         if (!clean) return S_OK;  // the MP4/MKV must start on a keyframe
@@ -335,14 +394,14 @@ HRESULT HwEncoder::deliver(IMFSample* s, const OutputFn& out) {
 }
 
 ComPtr<IMFMediaType> HwEncoder::muxType() {
-    // Clean H.264 type for the pass-through writer, always carrying SPS/PPS (MF_MT_MPEG_SEQUENCE_HEADER).
+    // Clean type for the pass-through writer, always carrying the parameter sets (MF_MT_MPEG_SEQUENCE_HEADER).
     ComPtr<IMFMediaType> cur = currentOutputType(), t;
     MFCreateMediaType(&t);
     t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    t->SetGUID(MF_MT_SUBTYPE, sub_);
     t->SetUINT32(MF_MT_AVG_BITRATE, br_);
     t->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    t->SetUINT32(MF_MT_MPEG2_PROFILE, profile_);
+    if (profile_) t->SetUINT32(MF_MT_MPEG2_PROFILE, profile_);
     MFSetAttributeSize(t.Get(), MF_MT_FRAME_SIZE, w_, h_);
     MFSetAttributeRatio(t.Get(), MF_MT_FRAME_RATE, (UINT32)fps_, 1);
     MFSetAttributeRatio(t.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);

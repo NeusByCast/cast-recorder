@@ -469,8 +469,11 @@ void AudioMixer::stop() {
     sources_.clear(); tone_ = false; testMic_ = false;
 }
 
-void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& out, long long& startTime) {
+void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& out, long long& startTime,
+                         std::vector<short>* sysOut, std::vector<short>* micOut) {
     out.clear();
+    if (sysOut) sysOut->clear();
+    if (micOut) micOut->clear();
     // Mix 80 ms behind the video clock so device packets (10-30 ms latency) have been placed.
     if (!final) mediaTime -= 800000;
     long long target = mediaTime > 0 ? mediaTime * kRate / 10000000LL : 0;
@@ -478,6 +481,8 @@ void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& ou
     if (target <= pos_) return;
     size_t n = (size_t)(target - pos_);
     std::vector<float> mix(n * 2, 0.f), tmp(n * 2);
+    const bool split = sysOut || micOut;
+    std::vector<float> sysMix(split ? n * 2 : 0, 0.f), micMix(split ? n * 2 : 0, 0.f);
     const long long t100 = pos_ * 10000000LL / kRate;
     bool muteSys = final, muteMic = final;
     if (t100 < systemMuteUntil) { muteMic = true; if (!systemExcludesSelf()) muteSys = true; }
@@ -491,6 +496,7 @@ void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& ou
         if (s->isMic && (micMuted.load() || muteMic)) continue;
         if (!s->isMic && (muteSys || audioFx().systemMuted.load())) continue;
         for (size_t i = 0; i < n * 2; ++i) mix[i] += tmp[i];
+        if (split) { auto& d = s->isMic ? micMix : sysMix; for (size_t i = 0; i < n * 2; ++i) d[i] += tmp[i]; }
     }
     if (tone_) {
         toneFrames_ += n;
@@ -499,6 +505,7 @@ void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& ou
             phase_ += 2 * 3.14159265358979 * 440.0 / kRate;
             if (phase_ > 6.283185307179586) phase_ -= 6.283185307179586;
             mix[i * 2] += v; mix[i * 2 + 1] += v;
+            if (split) { sysMix[i * 2] += v; sysMix[i * 2 + 1] += v; }
         }
     }
     if (testMic_) {
@@ -529,23 +536,28 @@ void AudioMixer::produce(long long mediaTime, bool final, std::vector<short>& ou
             }
         }
         tmFrames_ += n;
-        if (!micMuted.load() && !muteMic) for (size_t i = 0; i < n * 2; ++i) mix[i] += m[i];
+        if (!micMuted.load() && !muteMic) for (size_t i = 0; i < n * 2; ++i) { mix[i] += m[i]; if (split) micMix[i] += m[i]; }
     }
-    if (channels == 1) {
-        out.resize(n);
-        for (size_t i = 0; i < n; ++i) {
-            float v = 0.5f * (mix[i * 2] + mix[i * 2 + 1]) * 1.41f;  // ~equal-loudness downmix
-            v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
-            out[i] = (short)std::lrint(v * 32767.f);
+    auto toPcm = [&](const std::vector<float>& src, std::vector<short>& dst) {
+        if (channels == 1) {
+            dst.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                float v = 0.5f * (src[i * 2] + src[i * 2 + 1]) * 1.41f;  // ~equal-loudness downmix
+                v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
+                dst[i] = (short)std::lrint(v * 32767.f);
+            }
+        } else {
+            dst.resize(n * 2);
+            for (size_t i = 0; i < n * 2; ++i) {
+                float v = src[i];
+                v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
+                dst[i] = (short)std::lrint(v * 32767.f);
+            }
         }
-    } else {
-        out.resize(n * 2);
-        for (size_t i = 0; i < n * 2; ++i) {
-            float v = mix[i];
-            v = v > 1.f ? 1.f : v < -1.f ? -1.f : v;
-            out[i] = (short)std::lrint(v * 32767.f);
-        }
-    }
+    };
+    toPcm(mix, out);
+    if (sysOut) toPcm(sysMix, *sysOut);
+    if (micOut) toPcm(micMix, *micOut);
     produced_ += n;
     pos_ = target;
 }

@@ -28,6 +28,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include "../core/hotkey.h"
 #include "../core/settings.h"
 #include "recorder.h"
+#include "hwenc.h"
 #include "preview.h"
 #include "audio.h"
 #include "applog.h"
@@ -69,6 +70,9 @@ std::wstring knownFolder(REFKNOWNFOLDERID id) {
 }
 std::wstring g_settingsOverride;  // --settings-file (tests)
 bool g_selftest = false;
+bool g_selftestHotkeys = false;  // --selftest-hotkeys: press every global hotkey with SendInput and check what it did
+std::function<void(int)> g_hkTestHook;
+void selftestHotkeysStep();
 bool g_selftestRecord = false;    // --selftest-record: press Record right after launch, stop after 2 s, exit          // --selftest-settings: drive the real UI, change settings, exit via X
 std::wstring settingsPath() {
     if (!g_settingsOverride.empty()) return g_settingsOverride;
@@ -90,6 +94,9 @@ enum Hit {
     H_NONE = 0, H_MIN, H_MAX, H_CLOSE, H_TAB_REC, H_TAB_SET, H_SRC, H_DD_FPS, H_DD_QUAL, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT,
     H_DD_SYSDEV, H_DD_MICDEV, H_MICCHIP, H_MICICON, H_SYSCHIP, H_PAUSE, H_RECORD, H_STATUSLOG, H_HK0, H_HK1, H_HK2, H_HKPTT,
     H_PATH, H_FOLDERICON, H_BROWSE, H_LOG, H_TG_SYS, H_TG_MIC, H_TG_NS, H_TG_MON, H_TG_PTT, H_SL_VOL, H_SL_GATE, H_CH_MONO, H_CH_STEREO,
+    H_TAB_RECS, H_REPLAYPILL, H_SHOT, H_TG_REMUX, H_TG_REPLAY, H_DD_REPLAYLEN, H_REPLAYSECS, H_THEME_DARK, H_THEME_LIGHT,
+    H_ACC0, H_ACC5 = H_ACC0 + 5, H_HK3, H_HK4, H_DD_FNAME, H_DD_SHOTFMT, H_TG_TRACKS, H_RSEARCH, H_TG_AUTOREMUX, H_REMUXALL, H_CTXMENU,
+    H_RLIST, H_TOAST_OPEN, H_TOAST_FOLDER, H_TOAST_CLOSE, R_BASE = 3000,
     P_BASE = 1000, P_SEARCH = 2000, P_MUTE, P_SL_VOL, P_PAD
 };
 bool g_renderOnly = false;  // --render-ui: no windows, no animations
@@ -99,14 +106,21 @@ const wchar_t* kFpsL[] = {L"15 FPS", L"30 FPS", L"60 FPS"};
 const Quality kQual[] = {Quality::Low, Quality::Medium, Quality::High, Quality::Ultra};
 const wchar_t* kQualL[] = {L"Low", L"Medium", L"High", L"Ultra"};
 const Encoder kEnc[] = {Encoder::Auto, Encoder::NVENC, Encoder::AMF, Encoder::QSV, Encoder::Software};
-const OutputScale kRes[] = {OutputScale::Native, OutputScale::P1080, OutputScale::P720};
-const wchar_t* kResL[] = {L"Native", L"1080p", L"720p"};
-const Container kCont[] = {Container::MP4, Container::MKV, Container::MOV};
-const wchar_t* kContL[] = {L"MP4", L"MKV", L"MOV"};
+const OutputScale kRes[] = {OutputScale::Native, OutputScale::P1440, OutputScale::P1080, OutputScale::P720};
+const wchar_t* kResL[] = {L"Native", L"1440p", L"1080p", L"720p"};
+const Container kCont[] = {Container::MKV, Container::MP4};
+const wchar_t* kContL[] = {L"MKV", L"MP4"};
+const int kReplayLen[] = {15, 30, 60, 120, 300, 600, 900};
+const wchar_t* kReplayLenL[] = {L"15 s", L"30 s", L"1 min", L"2 min", L"5 min", L"10 min", L"15 min"};
+const char* kFname[] = {"cast_date_time", "date_time", "source_date_time", "cast_counter"};
+const wchar_t* kFnameL[] = {L"cast_date_time", L"date_time", L"source_date_time", L"cast_counter"};
 
+enum { TK_REPLAY, TK_STARTED, TK_STOPPED, TK_SHOT, TK_SAVED, TK_ERROR, TK_TEST };  // toast kinds
 constexpr UINT WM_TRAY = WM_APP + 1;
-constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3, HK_MIC = 4;
-constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2, TIMER_SELFTEST = 3, TIMER_FRAME = 6;
+constexpr int HK_TOGGLE = 1, HK_FOLDER = 2, HK_PAUSE = 3, HK_MIC = 4, HK_REPLAY = 5, HK_SHOT = 6;
+constexpr UINT TIMER_TICK = 1, TIMER_PREVIEW = 2, TIMER_SELFTEST = 3, TIMER_FRAME = 6, TIMER_TOAST = 7, TIMER_RESCAN = 8, TIMER_HKTEST = 9;
+constexpr UINT WM_APP_REPLAY_DONE = WM_APP + 45, WM_APP_REPLAY_SAVED = WM_APP + 46, WM_APP_SHOT_SAVED = WM_APP + 47, WM_APP_REMUX_DONE = WM_APP + 48,
+               WM_APP_META = WM_APP + 50, WM_APP_DIRCHANGE = WM_APP + 51;
 constexpr int BASE_W = 1100, BASE_H = 700, MIN_W = 960, MIN_H = 620;  // v2 SPEC: Window
 // UI watchdog > worst-case teardown: capture Close 2 s + Finalize (8000/2) + remux (8000/2) + 3 s margin.
 constexpr ULONGLONG kWatchdogMs = 2000 + 8000 / 2 + 8000 / 2 + 3000;
@@ -120,13 +134,16 @@ struct App {
     Settings s;
     std::wstring settingsFile;
     Recorder rec;
+    Recorder replay;                     // replay-buffer-only session (no file) while not recording
+    std::shared_ptr<ReplayRing> ring;    // shared by the buffer session and recordings
+    bool replaySaving = false; double replaySaveT = 0;
     int hover = H_NONE, pressed = H_NONE;
     int capturing = -1;         // hotkey field being edited (0 start/stop, 1 pause), -1 none
     UINT liveMods = 0;
-    std::wstring hkMsg[3];
+    std::wstring hkMsg[6];
     std::vector<AudioDevice> outs;  // output devices for system audio (index+1 in the dropdown; 0 = default)
     CaptureTarget target;
-    COLORREF hkMsgColor[3]{};
+    COLORREF hkMsgColor[6]{};
     std::vector<AudioDevice> mics;  // index+2 in the Microphone dropdown (0 Off, 1 Default)
     bool micMuted = false;
     double lastBeepMs = 0;
@@ -234,29 +251,39 @@ void trayUpdate(DWORD) {}  // no tray icon: the window (taskbar) is the only sur
 }
 
 // ---------- hotkeys ----------
-void unregisterAll() { UnregisterHotKey(g.hwnd, HK_TOGGLE); UnregisterHotKey(g.hwnd, HK_FOLDER); UnregisterHotKey(g.hwnd, HK_PAUSE); UnregisterHotKey(g.hwnd, HK_MIC); }
+// Hotkey slots: 0 Start/Stop, 1 Pause, 2 Mic mute, 3 Push-to-talk (polled, not registered), 4 Save replay, 5 Screenshot.
+const wchar_t* kHkNames[6] = {L"Start / Stop", L"Pause", L"Mic mute", L"Push-to-talk", L"Save replay", L"Screenshot"};
+Hotkey* hkSlot(int i) {
+    switch (i) { case 0: return &g.s.toggleRecord; case 1: return &g.s.pauseToggle; case 2: return &g.s.micMute; case 3: return &g.s.pttKey;
+                 case 4: return &g.s.saveReplay; default: return &g.s.screenshot; }
+}
+const int kHkIds[6] = {HK_TOGGLE, HK_PAUSE, HK_MIC, 0, HK_REPLAY, HK_SHOT};
+void unregisterAll() { for (int id : {HK_TOGGLE, HK_FOLDER, HK_PAUSE, HK_MIC, HK_REPLAY, HK_SHOT}) UnregisterHotKey(g.hwnd, id); }
 void registerAll() {
     if (g.rec.running()) return;  // the live session keeps its hotkeys; never unregister mid-recording
     unregisterAll();
-    Hotkey* keys[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
-    const int ids[3] = {HK_TOGGLE, HK_PAUSE, HK_MIC};
-    for (int i = 0; i < 3; ++i) {
-        const Hotkey& k = *keys[i];
+    for (int i = 0; i < 6; ++i) {
+        const Hotkey& k = *hkSlot(i);
         g.hkMsg[i].clear();
         if (k.empty()) { g.hkMsgColor[i] = C_MUTED; continue; }
+        int clash = -1;
+        for (int j = 0; j < i; ++j) if (*hkSlot(j) == k) { clash = j; break; }
+        if (clash >= 0) { g.hkMsg[i] = std::wstring(L"Already used by ") + kHkNames[clash]; g.hkMsgColor[i] = C_ERR; continue; }
+        if (i == 3) { g.hkMsgColor[i] = C_OK; continue; }  // push-to-talk is polled: any held combo works
         Issue is = validate(k);
         if (is.severity == Severity::Error) { g.hkMsg[i] = W(is.message); g.hkMsgColor[i] = C_ERR; continue; }
-        if ((i == 1 && k == g.s.toggleRecord) || (i == 2 && (k == g.s.toggleRecord || k == g.s.pauseToggle))) { g.hkMsg[i] = L"Same combo as Start / Stop"; g.hkMsgColor[i] = C_ERR; continue; }
-        if (!RegisterHotKey(g.hwnd, ids[i], k.mods | MOD_NOREPEAT, k.vk)) {
-            g.hkMsg[i] = L"In use by another app"; g.hkMsgColor[i] = C_ERR; continue;
-        }
+        if (!RegisterHotKey(g.hwnd, kHkIds[i], k.mods | MOD_NOREPEAT, k.vk)) { g.hkMsg[i] = L"Already used by another app"; g.hkMsgColor[i] = C_ERR; continue; }
         if (is.severity == Severity::Warning) { g.hkMsg[i] = W(is.message); g.hkMsgColor[i] = C_WARN; }
         else g.hkMsgColor[i] = C_OK;
     }
-    // Open-folder combo has no field in the new layout but stays active if set and not clashing.
-    if (!g.s.openFolder.empty() && !(g.s.openFolder == g.s.toggleRecord) && !(g.s.openFolder == g.s.pauseToggle) && !(g.s.openFolder == g.s.micMute) &&
-        validate(g.s.openFolder).severity != Severity::Error)
+    // Open-folder combo has no field in the layout but stays active if set and not clashing.
+    bool clash = false;
+    for (int i = 0; i < 6; ++i) if (*hkSlot(i) == g.s.openFolder) clash = true;
+    if (!g.s.openFolder.empty() && !clash && validate(g.s.openFolder).severity != Severity::Error)
         RegisterHotKey(g.hwnd, HK_FOLDER, g.s.openFolder.mods | MOD_NOREPEAT, g.s.openFolder.vk);
+    std::wstring st;
+    for (int i : {0, 1, 2, 4, 5}) st += std::wstring(kHkNames[i]) + L"=" + (hkSlot(i)->empty() ? L"-" : W(format(*hkSlot(i)))) + (g.hkMsg[i].empty() ? L"" : L" (" + g.hkMsg[i] + L")") + L"; ";
+    cr::appLog(L"hotkeys: " + st);
 }
 
 void setStatus(const std::wstring& s, COLORREF c);
@@ -293,7 +320,7 @@ void save() {
 std::wstring outputDir() { return g.s.outputDir.empty() ? defaultOutputDir() : W(g.s.outputDir); }
 void setStatus(const std::wstring& s, COLORREF c) { g.status = s; g.statusColor = c; if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE); }
 
-// Our own tones (res/sounds, scripts/make-sounds.py): soft bell chimes at -24 dBFS, a -28 dBFS tick.
+// Our own tones (res/sounds, scripts/make-sounds.py): soft filtered-noise glides at -34 dBFS (tick -38, shutter -36).
 void playTone(int id) {
     LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
     if (!PlaySoundW(MAKEINTRESOURCEW(id), g.inst, SND_RESOURCE | SND_ASYNC | SND_NODEFAULT))
@@ -360,6 +387,7 @@ RecordOptions optionsFromSettings() {
     o.pauseTones = g.s.pauseTones;
     o.systemAudio = g.s.systemAudio; o.mic = g.s.micEnabled; o.micId = W(g.s.micDevice);
     o.systemId = W(g.s.systemDevice); o.channels = g.s.channels;
+    o.codec = g.s.codec; o.autoRemux = g.s.autoRemux; o.separateTracks = g.s.separateTracks;
     o.allDisplays = g.target.kind == CaptureTarget::AllDisplays;
     o.monitor = g.target.kind == CaptureTarget::Monitor ? g.target.mon : nullptr;
     o.window = g.target.kind == CaptureTarget::Window ? g.target.hwnd : nullptr;
@@ -379,8 +407,15 @@ void startWarmup() {
     g.warm.start(o);
 }
 
+void stopReplayBuffer();
+extern std::atomic<int> g_shotsBusy;
 void forceQuit() {
     g.quitting = true;
+    stopReplayBuffer();
+    for (int i = 0; i < 300 && (g.replaySaving || g_shotsBusy > 0); ++i) {  // let a replay/screenshot being written finish
+        MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        Sleep(10);
+    }
     g.rec.stop();
     setStatus(L"Closing\u2026", C_TEXT2);
     ULONGLONG end = GetTickCount64() + kWatchdogMs;  // let the file finish saving before exit
@@ -395,17 +430,17 @@ void forceQuit() {
     DestroyWindow(g.hwnd);
 }
 
+std::wstring nextFileName(const std::wstring& dir);
+void stopReplayBuffer();
+void startReplayBuffer();
+void ensureRing();
 void startRecording() {
     if (g.rec.running()) return;
     if (g.rec.mfAbandoned()) { setStatus(L"Restart Cast Recorder to record again (encoder got stuck)", C_WARN); return; }
     std::wstring dir = outputDir();
     SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
     if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) { setStatus(L"Can't create the save folder", C_ERR); return; }
-    wchar_t name[64];
-    time_t t = time(nullptr);
-    tm lt{};
-    localtime_s(&lt, &t);
-    wcsftime(name, 64, L"Cast %Y-%m-%d %H-%M-%S", &lt);
+    std::wstring name = nextFileName(dir);
     LARGE_INTEGER pq; QueryPerformanceCounter(&pq);
     // A warm-up still probing the same encoder would contend with this session (AMD session limits); it only
     // runs for a couple of seconds after launch or a settings change, and its time shows in the latency log.
@@ -417,7 +452,9 @@ void startRecording() {
     o.notify = g.hwnd;
     o.outputPath = dir + L"\\" + name + W(extension(g.s.container));
     registerAll();
-    if (!g.rec.start(o)) { setStatus(L"Already recording", C_WARN); return; }
+    stopReplayBuffer();  // the recording session takes over feeding the same ring (one capture + encoder)
+    if (g.s.replayEnabled) { ensureRing(); o.ring = g.ring; }
+    if (!g.rec.start(o)) { setStatus(L"Already recording", C_WARN); startReplayBuffer(); return; }
     g.recPending = true;
     g.gprev.setRecording(true);
     g.rec.setMicMuted(g.micMuted);
@@ -426,10 +463,12 @@ void startRecording() {
     setStatus(L"Recording\u2026", C_ACCENT_B);
     trayUpdate(NIM_MODIFY);
 }
+struct Toast; Toast* showToast(int kind, const std::wstring& title, const std::wstring& sub, const std::wstring& path, bool inApp, bool testVisible);
 void stopRecording() {
     if (!g.rec.isActive()) return;
     playTone(IDR_SND_STOP);
     g.rec.stop();
+    showToast(TK_STOPPED, L"Recording stopped", L"", L"", false, false);
     setStatus(L"Finishing file\u2026", C_TEXT2);
     trayUpdate(NIM_MODIFY);
 }
@@ -509,12 +548,40 @@ void paintToNull();
 // preview's swapchain child; the preview's chips are small layered child windows over it.
 namespace gp = Gdiplus;
 
-const unsigned T_BG = 0x0E1014, T_SURF = 0x161A20, T_ELEV = 0x1C2128, T_PREV = 0x0A0C0F, T_INPUT = 0x1A1F27, T_INPUT_H = 0x222832,
-               T_TEXT = 0xF2F3F5, T_TEXT2 = 0xA8ADB7, T_MUTED = 0x6B7280, T_DIS = 0x4B5563, T_ACC = 0xE5243B, T_ACC_B = 0xFF6B6B,
-               T_ACC_H = 0xF0354A, T_ACC_P = 0xC41E33, T_OK = 0x22C55E, T_WARN = 0xF59E0B, T_ERR = 0xEF4444, T_LISTH = 0x232A34,
-               T_TRACK = 0x2A303A, T_CLOSEH = 0xE81123;
+// v1.1 themes (tokens.json themes.dark/light) + accents. Mutable: applyTheme() swaps the palette.
+unsigned T_BG, T_SURF, T_ELEV, T_PREV, T_INPUT, T_INPUT_H, T_TEXT, T_TEXT2, T_MUTED, T_DIS, T_ACC, T_ACC_B, T_ACC_H, T_ACC_P,
+         T_LISTH, T_TRACK, T_SEGBG, T_SEGTH;
+const unsigned T_OK = 0x22C55E, T_WARN = 0xF59E0B, T_ERR = 0xEF4444, T_CLOSEH = 0xE81123;
+unsigned g_borderBase = 0xFFFFFF;
+bool g_light = false;
+struct AccentDef { const char* name; unsigned base, bright, hover, pressed; };
+const AccentDef kAccents[6] = {{"red", 0xE5243B, 0xFF6B6B, 0xF0354A, 0xC41E33}, {"orange", 0xF97316, 0xFB923C, 0xFA8231, 0xD9620F},
+                               {"green", 0x22C55E, 0x4ADE80, 0x2FD06A, 0x1AA04B}, {"blue", 0x3B82F6, 0x60A5FA, 0x4F8FF7, 0x2563EB},
+                               {"purple", 0x8B5CF6, 0xA78BFA, 0x9A6FF7, 0x7C3AED}, {"pink", 0xEC4899, 0xF472B6, 0xEF5AA5, 0xDB2777}};
+bool systemLight() {
+    DWORD v = 0, n = sizeof v;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme",
+                     RRF_RT_REG_DWORD, nullptr, &v, &n) != ERROR_SUCCESS) return false;
+    return v != 0;
+}
+int accentIndex() { for (int i = 0; i < 6; ++i) if (g.s.accent == kAccents[i].name) return i; return 0; }
+void applyTheme() {
+    g_light = g.s.theme == "light" || (g.s.theme == "auto" && systemLight());
+    if (g_light) {
+        T_BG = 0xF4F5F7; T_SURF = 0xFFFFFF; T_ELEV = 0xEEF0F3; T_INPUT = 0xFFFFFF; T_INPUT_H = 0xE8EBEF; T_LISTH = 0xE8EBEF; T_PREV = 0xE3E6EB;
+        T_TEXT = 0x14161A; T_TEXT2 = 0x4B5260; T_MUTED = 0x8A919E; T_DIS = 0xB4BAC4; T_TRACK = 0xD5D9E0; T_SEGBG = 0xE8EBEF; T_SEGTH = 0xFFFFFF;
+        g_borderBase = 0x0B0D12;
+    } else {
+        T_BG = 0x0E1014; T_SURF = 0x161A20; T_ELEV = 0x1C2128; T_INPUT = 0x1A1F27; T_INPUT_H = 0x232A34; T_LISTH = 0x232A34; T_PREV = 0x0A0C0F;
+        T_TEXT = 0xF2F3F5; T_TEXT2 = 0xA8ADB7; T_MUTED = 0x6B7280; T_DIS = 0x4B5563; T_TRACK = 0x2A303A; T_SEGBG = 0x0E1014; T_SEGTH = 0x161A20;
+        g_borderBase = 0xFFFFFF;
+    }
+    const AccentDef& a = kAccents[accentIndex()];
+    T_ACC = a.base; T_ACC_B = g_light ? a.pressed : a.bright; T_ACC_H = a.hover; T_ACC_P = a.pressed;
+    if (g.hwnd) { BOOL dark = !g_light; DwmSetWindowAttribute(g.hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark); }
+}
 gp::Color C(unsigned rgb, int a = 255) { return gp::Color((BYTE)a, (BYTE)((rgb >> 16) & 255), (BYTE)((rgb >> 8) & 255), (BYTE)(rgb & 255)); }
-gp::Color WA(int a) { return gp::Color((BYTE)a, 255, 255, 255); }  // #FFFFFFxx overlays/borders
+gp::Color WA(int a) { return C(g_borderBase, a); }  // borderBase at an alpha: borders and hover overlays in both themes
 const int A_SUBTLE = 0x14, A_DEFAULT = 0x1F, A_STRONG = 0x33, A_HOVER = 0x0A, A_PRESSED = 0x14;
 COLORREF toRef(unsigned rgb) { return RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255); }
 unsigned fromRef(COLORREF c) { return ((unsigned)GetRValue(c) << 16) | ((unsigned)GetGValue(c) << 8) | GetBValue(c); }
@@ -581,7 +648,8 @@ float txtW(gp::Graphics& gr, const std::wstring& s, gp::Font* f) {
 
 // ---------- icons (embedded PNGs, white; tinted at draw time) ----------
 enum Glyph { G_RECORD, G_PAUSE, G_STOP, G_MIC, G_MICMUTED, G_SYS, G_SYSMUTED, G_FOLDER, G_LOG, G_SETTINGS, G_MINIMIZE, G_MAXIMIZE,
-             G_RESTORE, G_CLOSE, G_CHEVRON, G_CHECK, G_MONITOR, G_WINDOW, G_FULLSCREEN, G_COUNT };
+             G_RESTORE, G_CLOSE, G_CHEVRON, G_CHECK, G_MONITOR, G_WINDOW, G_FULLSCREEN, G_CHECKCIRCLE, G_MOON, G_SUN, G_PLAY,
+             G_REMUX, G_REPLAY, G_SCREENSHOT, G_SEARCH, G_COUNT };
 gp::Bitmap* g_icons[G_COUNT][4] = {};
 gp::Bitmap* loadPngResource(int id) {
     HRSRC r = FindResourceW(g.inst, MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10) /* RT_RCDATA */);
@@ -671,7 +739,7 @@ double cubicBezier(double x1, double y1, double x2, double y2, double t) {
     for (int i = 0; i < 40; ++i) { s = (lo + hi) / 2; if (bx(s) < t) lo = s; else hi = s; }
     return by(s);
 }
-enum Ease { E_LINEAR, E_OUTEXPO, E_IN, E_STD, E_OUT, E_INOUT };
+enum Ease { E_LINEAR, E_OUTEXPO, E_IN, E_STD, E_OUT, E_INOUT, E_BACK };
 double ease(int e, double t) {
     switch (e) {
         case E_OUTEXPO: return cubicBezier(0.16, 1, 0.3, 1, t);
@@ -679,6 +747,7 @@ double ease(int e, double t) {
         case E_STD: return cubicBezier(0.2, 0, 0, 1, t);
         case E_OUT: return cubicBezier(0, 0, 0.58, 1, t);
         case E_INOUT: return cubicBezier(0.42, 0, 0.58, 1, t);
+        case E_BACK: return cubicBezier(0.34, 1.56, 0.64, 1, t);
     }
     return t < 0 ? 0 : t > 1 ? 1 : t;
 }
@@ -716,6 +785,21 @@ double g_meterT = 0;
 bool g_fakeRec = false, g_fakePaused = false;  // --render-ui recording state
 std::vector<DisplayInfo> g_displays;
 
+std::map<int, Anim> g_press;         // press scale: 70 ms to 0.97, 160 ms overshoot back (SPEC micro-animations)
+struct Tooltip { RF r; std::wstring t; } g_tooltip;
+RF g_pillRect;
+struct pressScope {
+    gp::Graphics& gr; gp::GraphicsState st;
+    pressScope(gp::Graphics& g_, RF r, int id) : gr(g_), st(g_.Save()) {
+        auto it = g_press.find(id);
+        if (it == g_press.end()) return;
+        float v = it->second.value();
+        if (std::fabs(v) < 0.001f) return;
+        float k = 1 - 0.03f * v, cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
+        gr.TranslateTransform(cx, cy); gr.ScaleTransform(k, k); gr.TranslateTransform(-cx, -cy);
+    }
+    ~pressScope() { gr.Restore(st); }
+};
 float hovA(int id) { auto it = g_hov.find(id); return it == g_hov.end() ? 0.f : it->second.value(); }
 void addReg(RF r, int id) { g_regs.push_back({r, id}); }
 gp::Color mix(unsigned a, unsigned b, float t) {
@@ -806,34 +890,90 @@ bool rowSelected(const SrcRow& r) {
 }
 
 // ---------- dropdown model ----------
-const wchar_t* kEncV2[] = {L"Auto", L"H.264 \u00b7 NVENC", L"H.264 \u00b7 AMF", L"H.264 \u00b7 Quick Sync", L"H.264 \u00b7 Software"};
+// Encoder list: Auto + every codec x vendor the selected GPU supports (hwenc probeCodecSupport), "H.264 \u00b7 NVENC".
+struct EncChoice { Codec codec; Encoder enc; std::wstring label; };
+std::vector<EncChoice> g_encChoices;
+Encoder encoderOfVendor(const std::wstring& v) {
+    if (v == L"NVIDIA") return Encoder::NVENC; if (v == L"AMD") return Encoder::AMF; if (v == L"Intel") return Encoder::QSV;
+    if (v == L"Software") return Encoder::Software; return Encoder::Auto;
+}
+const wchar_t* vendorLabel(Encoder e) {
+    switch (e) { case Encoder::NVENC: return L"NVENC"; case Encoder::AMF: return L"AMF"; case Encoder::QSV: return L"Quick Sync"; case Encoder::Software: return L"Software"; default: return L"Auto"; }
+}
+const wchar_t* codecLabel(Codec c) { return c == Codec::HEVC ? L"HEVC" : c == Codec::AV1 ? L"AV1" : L"H.264"; }
+void probeEncoders() {
+    g_encChoices.clear();
+    g_encChoices.push_back({Codec::Auto, Encoder::Auto, L"Auto"});
+    LUID luid{}; bool haveLuid = false;
+    if (g.s.gpuIndex >= 0) {
+        IDXGIFactory1* f = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&f))) {
+            IDXGIAdapter1* a = nullptr;
+            if (f->EnumAdapters1((UINT)g.s.gpuIndex, &a) == S_OK) { DXGI_ADAPTER_DESC1 d{}; a->GetDesc1(&d); luid = d.AdapterLuid; haveLuid = true; a->Release(); }
+            f->Release();
+        }
+    }
+    std::wstring log;
+    for (auto& c : probeCodecSupport(haveLuid ? &luid : nullptr)) {
+        Codec cc = c.codec == L"HEVC" ? Codec::HEVC : c.codec == L"AV1" ? Codec::AV1 : Codec::H264;
+        Encoder e = encoderOfVendor(c.vendor);
+        if (e == Encoder::Auto) continue;
+        bool dup = false;
+        for (auto& x : g_encChoices) if (x.codec == cc && x.enc == e) dup = true;
+        if (dup) continue;
+        g_encChoices.push_back({cc, e, std::wstring(codecLabel(cc)) + L" \u00b7 " + vendorLabel(e)});
+        log += g_encChoices.back().label + L"; ";
+    }
+    std::stable_sort(g_encChoices.begin() + 1, g_encChoices.end(), [](const EncChoice& a, const EncChoice& b) { return (int)a.codec < (int)b.codec; });
+    cr::appLog(L"encoders for " + (haveLuid ? W(g.s.gpuName) : std::wstring(L"Auto GPU")) + L": " + log);
+}
+int encSel() { for (size_t i = 0; i < g_encChoices.size(); ++i) if (g_encChoices[i].codec == g.s.codec && g_encChoices[i].enc == g.s.encoder) return (int)i; return -1; }
+std::wstring encoderText() {
+    int i = encSel();
+    if (i >= 0) return g_encChoices[i].label;
+    if (g.s.codec == Codec::Auto && g.s.encoder == Encoder::Auto) return L"Auto";
+    return std::wstring(g.s.codec == Codec::Auto ? L"Auto" : codecLabel(g.s.codec)) + L" \u00b7 " + vendorLabel(g.s.encoder);
+}
+std::wstring g_ctxPath;  // recording the context menu acts on
+const wchar_t* kCtxL[] = {L"Open", L"Show in folder", L"Remux to MP4", L"Rename", L"Delete"};
 int ddCount(int id) {
     switch (id) {
-        case H_DD_FPS: return 3; case H_DD_QUAL: return 4; case H_DD_ENC: return 5;
-        case H_DD_GPU: return 1 + (int)g.gpus.size(); case H_DD_RES: return 3; case H_DD_CONT: return 3;
+        case H_DD_FPS: return 3; case H_DD_QUAL: return 4; case H_DD_ENC: return (int)g_encChoices.size();
+        case H_DD_GPU: return 1 + (int)g.gpus.size(); case H_DD_RES: return 4; case H_DD_CONT: return 2;
         case H_DD_SYSDEV: return 1 + (int)g.outs.size(); case H_DD_MICDEV: return 1 + (int)g.mics.size();
+        case H_DD_REPLAYLEN: return 8; case H_DD_FNAME: return 4; case H_DD_SHOTFMT: return 2; case H_CTXMENU: return 5;
     }
     return 0;
 }
 std::wstring ddItem(int id, int i) {
     switch (id) {
-        case H_DD_FPS: return kFpsL[i]; case H_DD_QUAL: return kQualL[i]; case H_DD_ENC: return kEncV2[i];
+        case H_DD_FPS: return kFpsL[i]; case H_DD_QUAL: return kQualL[i];
+        case H_DD_ENC: return i >= 0 && i < (int)g_encChoices.size() ? g_encChoices[i].label : encoderText();
         case H_DD_GPU: return i == 0 ? std::wstring(L"Auto (display's GPU)") : g.gpus[i - 1];
         case H_DD_RES: { if (i) return kResL[i]; int w, h; sourceSize(w, h); return w ? L"Native (" + dims(w, h) + L")" : std::wstring(L"Native"); }
         case H_DD_CONT: return kContL[i];
         case H_DD_SYSDEV: return i == 0 ? std::wstring(L"Default output") : g.outs[i - 1].name;
         case H_DD_MICDEV: return i == 0 ? std::wstring(L"Default microphone") : g.mics[i - 1].name;
+        case H_DD_REPLAYLEN: return i < 7 ? std::wstring(kReplayLenL[i]) : std::wstring(L"Custom\u2026");
+        case H_DD_FNAME: return kFnameL[i];
+        case H_DD_SHOTFMT: return i ? L"JPG" : L"PNG";
+        case H_CTXMENU: return kCtxL[i];
     }
     return L"";
 }
 int ddSel(int id) {
     switch (id) {
         case H_DD_FPS: return g.s.fps == 15 ? 0 : g.s.fps == 30 ? 1 : 2;
-        case H_DD_QUAL: return (int)g.s.quality; case H_DD_ENC: return (int)g.s.encoder;
+        case H_DD_QUAL: return (int)g.s.quality; case H_DD_ENC: return encSel();
         case H_DD_GPU: return g.s.gpuIndex < 0 || g.s.gpuIndex >= (int)g.gpus.size() ? 0 : g.s.gpuIndex + 1;
-        case H_DD_RES: return (int)g.s.scale; case H_DD_CONT: return (int)g.s.container;
+        case H_DD_RES: for (int k = 0; k < 4; ++k) if (kRes[k] == g.s.scale) return k; return 0;
+        case H_DD_CONT: return g.s.container == Container::MKV ? 0 : 1;
         case H_DD_SYSDEV: for (size_t k = 0; k < g.outs.size(); ++k) if (U(g.outs[k].id) == g.s.systemDevice) return (int)k + 1; return 0;
         case H_DD_MICDEV: for (size_t k = 0; k < g.mics.size(); ++k) if (U(g.mics[k].id) == g.s.micDevice) return (int)k + 1; return 0;
+        case H_DD_REPLAYLEN: for (int k = 0; k < 7; ++k) if (kReplayLen[k] == g.s.replaySeconds) return k; return 7;
+        case H_DD_FNAME: for (int k = 0; k < 4; ++k) if (g.s.fileNamePattern == kFname[k]) return k; return 0;
+        case H_DD_SHOTFMT: return g.s.screenshotFormat == "jpg" ? 1 : 0;
+        case H_CTXMENU: return -1;
     }
     return 0;
 }
@@ -844,17 +984,35 @@ void applyAudioFx() {
     a.gateDb = (float)g.s.noiseGateDb; a.pushToTalk = g.s.pushToTalk; a.monitoring = g.s.monitoring;
     a.micMuted = g.s.micMuted; a.systemMuted = g.s.systemMuted;
 }
+void restartReplayBuffer();
+void startReplayBuffer();
+void beginEdit(int kind, RF r, const std::wstring& text, const std::wstring& path);
+void ctxAction(int item, int action);
+void applyReplaySeconds(int v) {
+    g.s.replaySeconds = v; save();
+    if (g.ring) g.ring->setSeconds(v);
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+// Encoder-relevant change: the replay buffer (when on) restarts on the new config, otherwise the warm-up re-probes.
+void encoderSettingsChanged() { if (g.s.replayEnabled && !g.rec.running()) restartReplayBuffer(); else startWarmup(); }
 void ddSet(int id, int i) {
+    if (id == H_CTXMENU) { ctxAction(0, i); return; }
     switch (id) {
         case H_DD_FPS: g.s.fps = kFps[i]; break; case H_DD_QUAL: g.s.quality = kQual[i]; break;
-        case H_DD_ENC: g.s.encoder = kEnc[i]; break; case H_DD_GPU: g.s.gpuIndex = i - 1; g.s.gpuName = i > 0 ? U(g.gpus[i - 1]) : std::string(); break;
+        case H_DD_ENC: if (i >= 0 && i < (int)g_encChoices.size()) { g.s.codec = g_encChoices[i].codec; g.s.encoder = g_encChoices[i].enc; } break;
+        case H_DD_GPU: g.s.gpuIndex = i - 1; g.s.gpuName = i > 0 ? U(g.gpus[i - 1]) : std::string(); probeEncoders(); break;
         case H_DD_RES: g.s.scale = kRes[i]; break; case H_DD_CONT: g.s.container = kCont[i]; break;
         case H_DD_SYSDEV: g.s.systemDevice = i > 0 ? U(g.outs[i - 1].id) : std::string(); break;
         case H_DD_MICDEV: g.s.micDevice = i > 0 ? U(g.mics[i - 1].id) : std::string(); break;
+        case H_DD_REPLAYLEN:
+            if (i < 7) { applyReplaySeconds(kReplayLen[i]); return; }
+            beginEdit(2, RF(150, 427, 120, 18), std::to_wstring(g.s.replaySeconds), L""); return;
+        case H_DD_FNAME: g.s.fileNamePattern = kFname[i]; break;
+        case H_DD_SHOTFMT: g.s.screenshotFormat = i ? "jpg" : "png"; break;
     }
     save();
-    if (id == H_DD_SYSDEV || id == H_DD_MICDEV) restartMeter();
-    if (id == H_DD_FPS || id == H_DD_ENC || id == H_DD_GPU || id == H_DD_RES || id == H_DD_CONT) startWarmup();
+    if (id == H_DD_SYSDEV || id == H_DD_MICDEV) { restartMeter(); if (g.replay.running()) restartReplayBuffer(); }
+    if (id == H_DD_FPS || id == H_DD_QUAL || id == H_DD_ENC || id == H_DD_GPU || id == H_DD_RES || id == H_DD_CONT) encoderSettingsChanged();
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 // While recording: source, encoder, container and resolution (SPEC: App states), plus the audio devices/routing,
@@ -863,7 +1021,8 @@ bool locked(int id) {
     if (!uiBusy()) return false;
     switch (id) {
         case H_SRC: case H_DD_ENC: case H_DD_CONT: case H_DD_RES: case H_DD_GPU: case H_DD_SYSDEV: case H_DD_MICDEV:
-        case H_TG_SYS: case H_TG_MIC: case H_CH_MONO: case H_CH_STEREO: case H_HK0: case H_HK1: case H_HK2: case H_HKPTT: case H_BROWSE:
+        case H_TG_SYS: case H_TG_MIC: case H_CH_MONO: case H_CH_STEREO: case H_HK0: case H_HK1: case H_HK2: case H_HKPTT: case H_HK3: case H_HK4:
+        case H_BROWSE: case H_TG_REMUX: case H_TG_AUTOREMUX: case H_TG_TRACKS: case H_TG_REPLAY: case H_DD_FNAME:
             return true;
     }
     return false;
@@ -930,7 +1089,7 @@ void layoutPopup() {
         P.x = P.anchor.X + P.anchor.Width / 2 - P.w / 2; P.y = P.anchor.Y - 12 - P.h;
         P.above = true; return;
     }
-    if (P.kind == PK_LIST) { P.w = P.anchor.Width; P.contentH = 8.f + ddCount(P.dd) * 32.f; }
+    if (P.kind == PK_LIST) { P.w = P.dd == H_CTXMENU ? 180.f : P.anchor.Width; P.contentH = 8.f + ddCount(P.dd) * 32.f; }
     else { P.w = 420; buildSourceRows(); }
     P.h = std::min(440.f, P.contentH);
     P.x = P.anchor.X; P.y = P.anchor.Y + P.anchor.Height + 4;
@@ -1089,6 +1248,8 @@ void buttonBg(gp::Graphics& gr, RF r, float rad, int id, unsigned bg, gp::Color 
 }
 
 // ---------- title bar ----------
+const int kTabIds[3] = {H_TAB_REC, H_TAB_RECS, H_TAB_SET};
+RF tabRect(int i) { const float tx[3] = {150, 222, 322}, tw[3] = {68, 96, 80}; return RF(tx[i], 7, tw[i], 26); }
 RF tbBtn(float W, int k) { return RF(W - 138 + 46.f * k, 0, 46, 40); }  // 0 min, 1 max, 2 close
 void paintTitleBar(gp::Graphics& gr, float W) {
     gp::SolidBrush bg(C(T_BG)); gr.FillRectangle(&bg, 0.f, 0.f, W, 40.f);
@@ -1103,16 +1264,16 @@ void paintTitleBar(gp::Graphics& gr, float W) {
         if (b) { gr.SetInterpolationMode(gp::InterpolationModeHighQualityBicubic); gr.DrawImage(b, RF(14, 12, 16, 16)); }
     }
     txt(gr, L"Cast Recorder", RF(40, 0, 104, 40), F.title, C(T_TEXT), AL_L, false);
-    const wchar_t* tabs[2] = {L"Record", L"Settings"};
-    const float tx[2] = {150, 222}, tw[2] = {68, 80};
-    for (int i = 0; i < 2; ++i) {
-        RF r(tx[i], 7, tw[i], 26);
-        int id = i ? H_TAB_SET : H_TAB_REC;
+    const wchar_t* tabs[3] = {L"Record", L"Recordings", L"Settings"};
+    for (int i = 0; i < 3; ++i) {
+        RF r = tabRect(i);
+        int id = kTabIds[i];
         bool act = g_viewIdx == i;
-        if (act) fillRR(gr, r, 6, C(T_ELEV));
-        else if (hovA(id) > 0) fillRR(gr, r, 6, WA((int)(A_HOVER * hovA(id))));
+        pressScope ps(gr, r, id);
+        if (act) fillRR(gr, r, 7, C(T_ELEV));
+        else if (hovA(id) > 0) fillRR(gr, r, 7, WA((int)(A_HOVER * hovA(id))));
         txt(gr, tabs[i], r, act ? F.btn : F.body, C(act ? T_TEXT : (hovA(id) > 0.5f ? T_TEXT2 : T_MUTED)), AL_C, false);
-        focusRing(gr, r, 6, id);
+        focusRing(gr, r, 7, id);
         addReg(r, id);
     }
     const int ids[3] = {H_MIN, H_MAX, H_CLOSE};
@@ -1127,8 +1288,347 @@ void paintTitleBar(gp::Graphics& gr, float W) {
     }
 }
 
+// ---------- v1.1 actions: file names, replay buffer, screenshots ----------
+std::wstring sourceNameForFile() {
+    if (g.target.kind == CaptureTarget::Window) return g_srcTitle.empty() ? L"Window" : g_srcTitle;
+    if (g.target.kind == CaptureTarget::Monitor) { const DisplayInfo* d = displayFor(g.target.mon); return d ? L"Monitor " + std::to_wstring(d->index) : L"Monitor"; }
+    return L"Screen";
+}
+bool anyExists(const std::wstring& base) {
+    for (const wchar_t* e : {L".mp4", L".mkv", L".mov"}) if (GetFileAttributesW((base + e).c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    return false;
+}
+std::wstring nextFileName(const std::wstring& dir) {
+    SYSTEMTIME t; GetLocalTime(&t);
+    int counter = 1;
+    if (g.s.fileNamePattern == "cast_counter") {
+        WIN32_FIND_DATAW fd{};
+        HANDLE f = FindFirstFileW((dir + L"\\cast_*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do { int n = 0; if (swscanf(fd.cFileName, L"cast_%d", &n) == 1 && n >= counter) counter = n + 1; } while (FindNextFileW(f, &fd));
+            FindClose(f);
+        }
+    }
+    std::wstring base = W(fileNameFor(g.s.fileNamePattern, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, U(sourceNameForFile()), counter));
+    std::wstring name = base;
+    for (int k = 2; anyExists(dir + L"\\" + name) && k < 1000; ++k) name = base + L" (" + std::to_wstring(k) + L")";
+    return name;
+}
+std::wstring stampName(const wchar_t* prefix, const wchar_t* ext, const std::wstring& dir) {
+    SYSTEMTIME t; GetLocalTime(&t);
+    wchar_t b[64]; swprintf(b, 64, L"%ls%02d-%02d-%02d", prefix, t.wHour, t.wMinute, t.wSecond);
+    std::wstring base = dir + L"\\" + b, p = base + ext;
+    for (int k = 2; GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES && k < 1000; ++k) p = base + L" (" + std::to_wstring(k) + L")" + ext;
+    return p;
+}
+std::wstring fileNameOf(const std::wstring& p) { size_t k = p.find_last_of(L"\\/"); return k == std::wstring::npos ? p : p.substr(k + 1); }
+std::wstring replayShort(int s) { return s % 60 == 0 && s >= 60 ? std::to_wstring(s / 60) + L"m" : std::to_wstring(s) + L"s"; }
+std::wstring replayLenText() {
+    for (int i = 0; i < 7; ++i) if (kReplayLen[i] == g.s.replaySeconds) return kReplayLenL[i];
+    return std::to_wstring(g.s.replaySeconds) + L" s (custom)";
+}
+std::wstring lastSavedText(double secs) {
+    int s = (int)std::lround(secs);
+    if (s < 60) return L"Last " + std::to_wstring(s) + (s == 1 ? L" second saved" : L" seconds saved");
+    if (s % 60 == 0) return L"Last " + std::to_wstring(s / 60) + (s == 60 ? L" minute saved" : L" minutes saved");
+    return L"Last " + std::to_wstring(s / 60) + L" min " + std::to_wstring(s % 60) + L" s saved";
+}
+void ensureRing() {
+    if (!g.ring) g.ring = std::make_shared<ReplayRing>(g.s.replaySeconds);
+    else g.ring->setSeconds(g.s.replaySeconds);
+}
+void startReplayBuffer() {
+    if (g_renderOnly || !g.hwnd || !g.s.replayEnabled || g.rec.running() || g.replay.running() || g.quitting || g.rec.mfAbandoned()) return;
+    if (g.target.kind == CaptureTarget::Window && (!g.target.hwnd || !IsWindow(g.target.hwnd))) return;
+    ensureRing();
+    RecordOptions o = optionsFromSettings();
+    o.bufferOnly = true; o.ring = g.ring; o.notify = g.hwnd; o.doneMsg = WM_APP_REPLAY_DONE;
+    wchar_t tp[MAX_PATH]; GetTempPathW(MAX_PATH, tp);
+    o.outputPath = std::wstring(tp) + L"castrec-replay" + std::to_wstring(GetCurrentProcessId()) + L".mp4";
+    LARGE_INTEGER q; QueryPerformanceCounter(&q); o.pressQpc = q.QuadPart;
+    if (g.replay.start(o)) cr::appLog(L"replay buffer: started (" + std::to_wstring(g.s.replaySeconds) + L" s)");
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void stopReplayBuffer() {
+    if (!g.replay.running()) return;
+    g.replay.stop();
+    if (!g.replay.waitUntilIdle(4000)) { g.replay.abort(); g.replay.waitUntilIdle(1000); }
+}
+void restartReplayBuffer() { stopReplayBuffer(); startReplayBuffer(); }
+struct ReplaySaved { bool ok; std::wstring path, err; double secs; };
+void saveReplay() {
+    if (!g.s.replayEnabled) { setStatus(L"Instant replay is off (turn it on in Settings)", toRef(T_TEXT2)); return; }
+    if (g.replaySaving) return;
+    if (!g.ring || g.ring->bufferedSeconds() < 0.5) { setStatus(L"Replay buffer is still filling", toRef(T_WARN)); return; }
+    std::wstring dir = outputDir();
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    std::wstring path = stampName(L"replay_", L".mp4", dir);
+    g.replaySaving = true; g.replaySaveT = nowMs(); kickAnim();
+    auto ring = g.ring; HWND h = g.hwnd;
+    std::thread([ring, path, h] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        auto* r = new ReplaySaved{false, path, L"", 0};
+        r->ok = ring->save(path, r->secs, r->err);
+        if (!PostMessageW(h, WM_APP_REPLAY_SAVED, 0, (LPARAM)r)) delete r;
+        if (SUCCEEDED(co)) CoUninitialize();
+    }).detach();
+}
+struct ShotSaved { bool ok; std::wstring path, err; int w, h; };
+std::atomic<int> g_shotsBusy{0};
+void takeScreenshot() {
+    std::wstring dir = outputDir();
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    bool jpg = g.s.screenshotFormat == "jpg";
+    std::wstring path = stampName(L"screenshot_", jpg ? L".jpg" : L".png", dir);
+    HWND win = g.target.kind == CaptureTarget::Window ? g.target.hwnd : nullptr;
+    HMONITOR mon = g.target.kind == CaptureTarget::Monitor ? g.target.mon : nullptr;
+    bool all = g.target.kind == CaptureTarget::AllDisplays;
+    HWND h = g.hwnd;
+    ++g_shotsBusy;
+    std::thread([=] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        auto* r = new ShotSaved{false, path, L"", 0, 0};
+        r->ok = saveScreenshot(win, mon, all, path, jpg, r->err, &r->w, &r->h);
+        if (!PostMessageW(h, WM_APP_SHOT_SAVED, 0, (LPARAM)r)) delete r;
+        --g_shotsBusy;
+        if (SUCCEEDED(co)) CoUninitialize();
+    }).detach();
+}
+// ---------- inline text field (rename a recording / custom replay length) ----------
+struct EditState { int kind = 0; HWND hwnd = nullptr; RF rect; std::wstring path; WNDPROC orig = nullptr; HBRUSH br = nullptr; } g_edit;
+void commitEdit(bool ok);
+LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_KEYDOWN && (wp == VK_RETURN || wp == VK_ESCAPE)) { commitEdit(wp == VK_RETURN); return 0; }
+    if (m == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;
+    if (m == WM_KILLFOCUS) { LRESULT r = CallWindowProcW(g_edit.orig, h, m, wp, lp); PostMessageW(g.hwnd, WM_APP + 49, 0, 0); return r; }
+    return CallWindowProcW(g_edit.orig, h, m, wp, lp);
+}
+void beginEdit(int kind, RF r, const std::wstring& text, const std::wstring& path) {
+    if (g_edit.hwnd) commitEdit(false);
+    const float s = scale();
+    g_edit.kind = kind; g_edit.rect = r; g_edit.path = path;
+    DWORD st = WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | (kind == 2 ? ES_NUMBER : 0);
+    g_edit.hwnd = CreateWindowExW(0, L"EDIT", text.c_str(), st, (int)std::lround(r.X * s), (int)std::lround(r.Y * s), (int)std::lround(r.Width * s), (int)std::lround(r.Height * s),
+                                  g.hwnd, nullptr, g.inst, nullptr);
+    if (!g_edit.hwnd) { g_edit.kind = 0; return; }
+    SendMessageW(g_edit.hwnd, WM_SETFONT, (WPARAM)g.fBody, TRUE);
+    SendMessageW(g_edit.hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(2, 2));
+    if (kind == 2) SendMessageW(g_edit.hwnd, EM_SETLIMITTEXT, 3, 0);
+    g_edit.orig = (WNDPROC)SetWindowLongPtrW(g_edit.hwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
+    SetFocus(g_edit.hwnd);
+    SendMessageW(g_edit.hwnd, EM_SETSEL, 0, -1);
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void scanRecordings();
+void applyReplaySeconds(int v);
+void commitEdit(bool ok) {
+    if (!g_edit.hwnd) return;
+    HWND e = g_edit.hwnd; g_edit.hwnd = nullptr;
+    int kind = g_edit.kind; g_edit.kind = 0;
+    wchar_t buf[300] = {}; GetWindowTextW(e, buf, 300);
+    std::wstring t = buf;
+    while (!t.empty() && iswspace(t.back())) t.pop_back();
+    while (!t.empty() && iswspace(t.front())) t.erase(0, 1);
+    SetWindowLongPtrW(e, GWLP_WNDPROC, (LONG_PTR)g_edit.orig);
+    DestroyWindow(e);
+    SetFocus(g.hwnd);
+    if (ok && kind == 2 && !t.empty()) {
+        int v = _wtoi(t.c_str());
+        if (v < 5 || v > 900) setStatus(L"Replay length must be 5\u2013900 seconds", toRef(T_ERR));
+        else applyReplaySeconds(v);
+    }
+    if (ok && kind == 1 && !t.empty()) {
+        const std::wstring& old = g_edit.path;
+        size_t sl = old.find_last_of(L'\\'), dot = old.find_last_of(L'.');
+        bool badc = t.find_first_of(L"<>:\"/\\|?*") != std::wstring::npos || t.back() == L'.';
+        std::wstring nu = old.substr(0, sl + 1) + t + old.substr(dot);
+        if (badc) setStatus(L"A file name can't contain < > : \" / \\ | ? *", toRef(T_ERR));
+        else if (nu != old && !MoveFileW(old.c_str(), nu.c_str()))
+            setStatus(GetLastError() == ERROR_ALREADY_EXISTS ? L"A file with that name already exists" : L"Couldn't rename (the file may be open)", toRef(T_ERR));
+        else { cr::appLog(L"recordings: renamed " + old + L" -> " + nu); scanRecordings(); }
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+// ---------- Recordings: folder scan, metadata/thumbnail worker, folder watcher ----------
+struct RecItem {
+    std::wstring path, name, ext;     // ext lower-case without the dot
+    unsigned long long size = 0; FILETIME mtime{};
+    double dur = -1; int w = 0, h = 0; double fps = 0;
+    bool replay = false, metaDone = false;
+    std::vector<uint32_t> thumbPx; int tw = 0, th = 0;  // filled by the worker
+    std::shared_ptr<gp::Bitmap> thumb;                  // made on the UI thread
+};
+std::vector<RecItem> g_items;
+const PROPERTYKEY kPK_Duration = {{0x64440490, 0x4C8B, 0x11D1, {0x8B, 0x70, 0x08, 0x00, 0x36, 0xB1, 0x1A, 0x03}}, 3};
+const PROPERTYKEY kPK_FrameW = {{0x64440491, 0x4C8B, 0x11D1, {0x8B, 0x70, 0x08, 0x00, 0x36, 0xB1, 0x1A, 0x03}}, 3};
+const PROPERTYKEY kPK_FrameH = {{0x64440491, 0x4C8B, 0x11D1, {0x8B, 0x70, 0x08, 0x00, 0x36, 0xB1, 0x1A, 0x03}}, 4};
+const PROPERTYKEY kPK_FrameRate = {{0x64440491, 0x4C8B, 0x11D1, {0x8B, 0x70, 0x08, 0x00, 0x36, 0xB1, 0x1A, 0x03}}, 6};
+std::mutex g_itemsM;
+std::wstring g_rsearch; bool g_rsearchFocus = false;
+float g_listScroll = 0;
+std::atomic<bool> g_metaBusy{false};
+std::wstring lowerExt(const std::wstring& n) { size_t d = n.find_last_of(L'.'); std::wstring e = d == std::wstring::npos ? L"" : n.substr(d + 1); return lowerW(e); }
+void metaWorker();
+void scanRecordings() {
+    std::wstring dir = outputDir();
+    std::vector<RecItem> found;
+    for (const wchar_t* pat : {L"\\*.mp4", L"\\*.mkv"}) {
+        WIN32_FIND_DATAW fd{};
+        HANDLE f = FindFirstFileW((dir + pat).c_str(), &fd);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring n = fd.cFileName, ln = lowerW(n);
+            if (ln.find(L".part.") != std::wstring::npos || ln.find(L"castrec-") == 0 || ln.find(L".tmp.") != std::wstring::npos) continue;
+            RecItem it;
+            it.path = dir + L"\\" + n; it.ext = lowerExt(n);
+            it.name = n.substr(0, n.size() - it.ext.size() - 1);
+            it.size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            it.mtime = fd.ftLastWriteTime;
+            it.replay = ln.rfind(L"replay_", 0) == 0;
+            found.push_back(std::move(it));
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    std::sort(found.begin(), found.end(), [](const RecItem& a, const RecItem& b) { return CompareFileTime(&a.mtime, &b.mtime) > 0; });
+    {
+        std::lock_guard<std::mutex> l(g_itemsM);
+        for (auto& n : found)  // keep metadata for unchanged files
+            for (auto& o : g_items)
+                if (o.path == n.path && o.size == n.size && CompareFileTime(&o.mtime, &n.mtime) == 0) {
+                    n.dur = o.dur; n.w = o.w; n.h = o.h; n.fps = o.fps; n.metaDone = o.metaDone; n.thumb = o.thumb;
+                    n.thumbPx = o.thumbPx; n.tw = o.tw; n.th = o.th;
+                }
+        g_items = std::move(found);
+    }
+    metaWorker();
+    if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+// Duration/size/fps via the shell property system, thumbnail via IShellItemImageFactory (Explorer's own cache).
+void metaWorker() {
+    if (g_renderOnly || g_metaBusy.exchange(true)) return;
+    HWND h = g.hwnd;
+    std::thread([h] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        for (;;) {
+            std::wstring path;
+            { std::lock_guard<std::mutex> l(g_itemsM); for (auto& it : g_items) if (!it.metaDone) { path = it.path; break; } }
+            if (path.empty()) break;
+            double dur = -1; int w = 0, hh = 0; double fps = 0;
+            std::vector<uint32_t> px; int tw = 0, th = 0;
+            IShellItem2* si = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&si)))) {
+                ULONGLONG d = 0; ULONG v = 0;
+                if (SUCCEEDED(si->GetUInt64(kPK_Duration, &d))) dur = d / 1e7;
+                if (SUCCEEDED(si->GetUInt32(kPK_FrameW, &v))) w = (int)v;
+                if (SUCCEEDED(si->GetUInt32(kPK_FrameH, &v))) hh = (int)v;
+                if (SUCCEEDED(si->GetUInt32(kPK_FrameRate, &v))) fps = v / 1000.0;
+                IShellItemImageFactory* f = nullptr;
+                if (SUCCEEDED(si->QueryInterface(IID_PPV_ARGS(&f)))) {
+                    HBITMAP hb = nullptr;
+                    if (SUCCEEDED(f->GetImage(SIZE{128, 72}, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK, &hb)) && hb) {
+                        BITMAP bm{}; GetObject(hb, sizeof bm, &bm);
+                        if (bm.bmWidth > 0 && bm.bmHeight != 0) {
+                            tw = bm.bmWidth; th = std::abs(bm.bmHeight);
+                            px.resize((size_t)tw * th);
+                            BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = tw; bi.bmiHeader.biHeight = -th;
+                            bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+                            HDC dc = GetDC(nullptr);
+                            if (!GetDIBits(dc, hb, 0, th, px.data(), &bi, DIB_RGB_COLORS)) { px.clear(); tw = th = 0; }
+                            ReleaseDC(nullptr, dc);
+                            for (auto& p : px) p |= 0xFF000000u;  // video frames are opaque
+                        }
+                        DeleteObject(hb);
+                    }
+                    f->Release();
+                }
+                si->Release();
+            }
+            {
+                std::lock_guard<std::mutex> l(g_itemsM);
+                for (auto& it : g_items) if (it.path == path) {
+                    it.dur = dur; it.w = w; it.h = hh; it.fps = fps; it.metaDone = true; it.thumbPx = std::move(px); it.tw = tw; it.th = th;
+                }
+            }
+            if (h) PostMessageW(h, WM_APP_META, 0, 0);
+        }
+        g_metaBusy = false;
+        if (SUCCEEDED(co)) CoUninitialize();
+    }).detach();
+}
+// Folder watcher: FindFirstChangeNotification on the output folder, debounced refresh on the UI thread.
+HANDLE g_watchStop = nullptr; std::thread g_watchTh; std::wstring g_watchDir;
+void stopWatcher() { if (g_watchStop) SetEvent(g_watchStop); if (g_watchTh.joinable()) g_watchTh.join(); if (g_watchStop) { CloseHandle(g_watchStop); g_watchStop = nullptr; } }
+void startWatcher() {
+    if (g_renderOnly) return;
+    std::wstring dir = outputDir();
+    if (dir == g_watchDir && g_watchTh.joinable()) return;
+    stopWatcher();
+    g_watchDir = dir;
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    g_watchStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE stop = g_watchStop; HWND h = g.hwnd;
+    g_watchTh = std::thread([dir, stop, h] {
+        HANDLE ch = FindFirstChangeNotificationW(dir.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+        if (ch == INVALID_HANDLE_VALUE) return;
+        HANDLE hs[2] = {stop, ch};
+        while (WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+            PostMessageW(h, WM_APP_DIRCHANGE, 0, 0);
+            if (!FindNextChangeNotification(ch)) break;
+        }
+        FindCloseChangeNotification(ch);
+    });
+}
+// Remux jobs (stream copy, recorder.cpp remuxFile): one at a time, in order.
+std::mutex g_remuxM;
+std::vector<std::wstring> g_remuxQueue;
+std::wstring g_remuxCur, g_remuxOut; unsigned long long g_remuxInSize = 0;
+std::atomic<bool> g_remuxRun{false};
+struct RemuxDone { bool ok; std::wstring in, out, err; };
+std::wstring remuxTarget(const std::wstring& in) {
+    std::wstring base = in.substr(0, in.size() - 4), out = base + L".mp4";
+    for (int k = 2; GetFileAttributesW(out.c_str()) != INVALID_FILE_ATTRIBUTES && k < 100; ++k) out = base + L" (" + std::to_wstring(k) + L").mp4";
+    return out;
+}
+void remuxPump() {
+    if (g_remuxRun.exchange(true)) return;
+    HWND h = g.hwnd;
+    std::thread([h] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        for (;;) {
+            std::wstring in;
+            { std::lock_guard<std::mutex> l(g_remuxM); if (g_remuxQueue.empty()) { g_remuxCur.clear(); break; } in = g_remuxQueue.front(); g_remuxQueue.erase(g_remuxQueue.begin()); g_remuxCur = in; }
+            WIN32_FILE_ATTRIBUTE_DATA fa{};
+            g_remuxInSize = GetFileAttributesExW(in.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
+            auto* r = new RemuxDone{false, in, remuxTarget(in), L""};
+            { std::lock_guard<std::mutex> l(g_remuxM); g_remuxOut = r->out; }
+            r->ok = remuxFile(in, r->out, r->err, L"", (DWORD)(30000 + g_remuxInSize / (50ull << 20) * 1000));
+            if (!PostMessageW(h, WM_APP_REMUX_DONE, 0, (LPARAM)r)) delete r;
+        }
+        g_remuxRun = false;
+        if (SUCCEEDED(co)) CoUninitialize();
+    }).detach();
+}
+void queueRemux(const std::vector<std::wstring>& files) {
+    { std::lock_guard<std::mutex> l(g_remuxM);
+      for (auto& f : files) if (f != g_remuxCur && std::find(g_remuxQueue.begin(), g_remuxQueue.end(), f) == g_remuxQueue.end()) g_remuxQueue.push_back(f); }
+    remuxPump();
+    if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+// 0..1 progress for a file being remuxed (output size vs input size), -1 if queued, -2 if not involved
+float remuxProgress(const std::wstring& path) {
+    std::lock_guard<std::mutex> l(g_remuxM);
+    if (path == g_remuxCur) {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        unsigned long long o = GetFileAttributesExW(g_remuxOut.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
+        return g_remuxInSize ? std::min(0.98f, (float)o / (float)g_remuxInSize) : 0.f;
+    }
+    for (auto& q : g_remuxQueue) if (q == path) return -1;
+    return -2;
+}
+bool hasMp4Sibling(const std::wstring& mkv) { return GetFileAttributesW((mkv.substr(0, mkv.size() - 4) + L".mp4").c_str()) != INVALID_FILE_ATTRIBUTES; }
 // ---------- Record view ----------
-struct RecLayout { RF src, fps, qual, preview, surf, mic, micIcon, sys, pause, record, status; };
+struct RecLayout { RF src, fps, qual, preview, surf, mic, micIcon, sys, shot, pause, record, status, pill; };
 RecLayout recLayout(float W, float H) {
     RecLayout L;
     L.src = RF(20, 56, 360, 36);
@@ -1142,10 +1642,12 @@ RecLayout recLayout(float W, float H) {
     float cy = H - 52;
     L.mic = RF(std::floor(W / 2 - 130), cy - 20, 136, 40);
     L.micIcon = RF(L.mic.X, L.mic.Y, 34, 40);
-    L.sys = RF(L.mic.X + 148, cy - 20, 136, 40);
+    L.sys = RF(L.mic.X + 150, cy - 20, 136, 40);
     L.record = RF(W - 20 - 122, cy - 22, 122, 44);
     L.pause = RF(L.record.X - 10 - 44, cy - 22, 44, 44);
-    L.status = RF(20, cy - 14, L.mic.X - 40, 28);
+    L.shot = RF(L.pause.X - 10 - 44, cy - 22, 44, 44);
+    L.pill = RF(170, cy - 15, 138, 30);
+    L.status = RF(20, cy - 14, 146, 28);
     return L;
 }
 RECT toPx(RF r) { float s = scale(); return RECT{(LONG)std::floor(r.X * s), (LONG)std::floor(r.Y * s), (LONG)std::ceil((r.X + r.Width) * s), (LONG)std::ceil((r.Y + r.Height) * s)}; }
@@ -1156,20 +1658,22 @@ RECT previewRectNow() { return toPx(recLayout(clientW(), clientH()).surf); }
 void paintLiveChip(gp::Graphics& gr, float x, float y) {
     std::wstring t = L"Live preview";
     float w = txtW(gr, t, F.caption) + 30;
-    fillRR(gr, RF(x, y, w, 22), 11, C(T_PREV, 235));
-    strokeRR(gr, RF(x, y, w, 22), 11, WA(A_SUBTLE));
-    fillCircle(gr, x + 12, y + 11, 3.5f, C(g.gprev.live() || g.prevLive || g_renderOnly ? T_OK : T_MUTED));
-    txt(gr, t, RF(x + 21, y, w - 24, 22), F.caption, C(T_TEXT2), AL_L, false);
+    fillRR(gr, RF(x, y, w, 22), 11, gp::Color(235, 10, 12, 15));
+    strokeRR(gr, RF(x, y, w, 22), 11, gp::Color(0x14, 255, 255, 255));
+    unsigned dot = uiActive() ? T_ACC : (g.gprev.live() || g.prevLive || g_renderOnly ? T_OK : 0x6B7280);
+    fillCircle(gr, x + 12, y + 11, 3.5f, C(dot));
+    txt(gr, t, RF(x + 21, y, w - 24, 22), F.caption, C(0xD5D8DE), AL_L, false);
 }
 std::wstring sizeFpsText() { int w, h; sourceSize(w, h); return (w ? dims(w, h) + L" \u00b7 " : L"") + std::to_wstring(g.s.fps) + L" fps"; }
-void paintSizeChip(gp::Graphics& gr, RF r) {  // right-aligned muted text with a soft backing for legibility on live content
+void paintSizeChip(gp::Graphics& gr, RF r) {  // on the captured image: always the dark pill
     std::wstring t = sizeFpsText();
-    float w = txtW(gr, t, F.caption) + 16;
-    fillRR(gr, RF(r.X + r.Width - w, r.Y, w, 22), 11, gp::Color(110, 10, 12, 15));
-    txt(gr, t, RF(r.X + r.Width - w, r.Y, w - 8, 22), F.caption, C(T_TEXT2), AL_R, false);
+    float w = txtW(gr, t, F.caption) + 22;
+    fillRR(gr, RF(r.X + r.Width - w, r.Y, w, 22), 11, gp::Color(235, 10, 12, 15));
+    strokeRR(gr, RF(r.X + r.Width - w, r.Y, w, 22), 11, gp::Color(0x14, 255, 255, 255));
+    txt(gr, t, RF(r.X + r.Width - w, r.Y, w, 22), F.caption, C(0xD5D8DE), AL_C, false);
 }
 void paintPreviewFallback(gp::Graphics& gr, RF s) {
-    fillRR(gr, s, 4, C(0x1A1F27));
+    fillRR(gr, s, 6, C(g_light ? 0xD5D9E0 : 0x1A1F27));
     if (g.prevBmp) {
         gp::Bitmap b(g.prevBmp, nullptr);
         gr.SetInterpolationMode(gp::InterpolationModeHighQualityBilinear);
@@ -1184,10 +1688,19 @@ void paintPreviewFallback(gp::Graphics& gr, RF s) {
     }
 }
 std::wstring timerText() {
-    int sec = g_fakeRec ? 83 : (int)g.rec.elapsedSeconds();
+    int sec = g_fakeRec ? 84 : (int)g.rec.elapsedSeconds();
     wchar_t tm[32]; swprintf(tm, 32, L"%02d:%02d:%02d", sec / 3600, sec / 60 % 60, sec % 60);
     return tm;
 }
+std::wstring sizeText(unsigned long long b, bool decimalsBelowGb = true) {
+    wchar_t t[32];
+    double mb = b / 1048576.0;
+    if (mb >= 1024) swprintf(t, 32, L"%.1f GB", mb / 1024);
+    else if (decimalsBelowGb) swprintf(t, 32, L"%.1f MB", mb);
+    else swprintf(t, 32, L"%.0f MB", mb);
+    return t;
+}
+unsigned long long g_recBytes = 0;  // file size so far (refreshed every second while recording)
 void paintRecordView(gp::Graphics& gr, float W, float H) {
     RecLayout L = recLayout(W, H);
     bool active = uiActive(), paused = uiPaused();
@@ -1196,86 +1709,132 @@ void paintRecordView(gp::Graphics& gr, float W, float H) {
     // toolbar
     int glyph = g.target.kind == CaptureTarget::AllDisplays ? G_FULLSCREEN : g.target.kind == CaptureTarget::Monitor ? G_MONITOR : G_WINDOW;
     ddField(gr, L.src, H_SRC, sourceText(), glyph, g.target.kind == CaptureTarget::Window ? g_srcIcon : nullptr);
-    focusRing(gr, L.src, 6, H_SRC);
+    focusRing(gr, L.src, 8, H_SRC);
     ddField(gr, L.fps, H_DD_FPS, ddItem(H_DD_FPS, ddSel(H_DD_FPS)));
-    focusRing(gr, L.fps, 6, H_DD_FPS);
+    focusRing(gr, L.fps, 8, H_DD_FPS);
     ddField(gr, L.qual, H_DD_QUAL, ddItem(H_DD_QUAL, ddSel(H_DD_QUAL)));
-    focusRing(gr, L.qual, 6, H_DD_QUAL);
+    focusRing(gr, L.qual, 8, H_DD_QUAL);
     // preview
-    card(gr, L.preview, 10, C(T_PREV), WA(A_SUBTLE));
+    card(gr, L.preview, 12, C(T_PREV), WA(A_SUBTLE));
     if (!g.gprev.live()) paintPreviewFallback(gr, L.surf);
     else { gp::SolidBrush b(C(0x000000)); gr.FillRectangle(&b, L.surf); }
-    if (active) strokeRR(gr, L.preview, 10, C(T_ACC), 2.f);
+    if (active) strokeRR(gr, L.preview, 12, C(T_ACC), 2.f);
     paintLiveChip(gr, L.surf.X + 12, L.surf.Y + 12);
     paintSizeChip(gr, RF(L.surf.X + 12, L.surf.Y + 12, L.surf.Width - 24, 22));
     // status (left)
     {
         RF s = L.status;
-        unsigned dotc, tc; std::wstring t;
-        if (active) { dotc = paused ? T_WARN : T_ACC; tc = paused ? T_WARN : T_TEXT; t = (paused ? L"Paused  " : L"Recording  ") + timerText(); }
-        else if (finishing) { dotc = T_MUTED; tc = T_TEXT2; t = L"Finishing file\u2026"; }
-        else {
-            unsigned sc = fromRef(g.statusColor);
-            t = g.status.empty() ? L"Ready" : g.status;
-            bool err = sc == T_ERR;
-            dotc = err ? T_ERR : sc == T_WARN ? T_WARN : T_OK; tc = err ? T_ERR : sc == T_WARN ? T_WARN : (t == L"Ready" ? T_TEXT2 : sc);
+        float cy = s.Y + s.Height / 2;
+        if (active) {
+            unsigned dc = paused ? T_WARN : T_ACC;
+            double ph = fmod(nowMs(), 1200.0) / 1200.0;
+            if (!paused && animationsOn()) fillCircle(gr, s.X + 6, cy, 6 + 4 * (float)ph, C(dc, (int)(90 * (1 - ph))));
+            fillCircle(gr, s.X + 6, cy, 5, C(dc));
+            std::wstring t = timerText();
+            float tw = txtW(gr, t, F.btn);
+            txt(gr, t, RF(s.X + 18, s.Y, tw + 4, s.Height), F.btn, C(paused ? T_WARN : T_TEXT), AL_L, false);
+            std::wstring sz = paused ? std::wstring(L"Paused") : sizeText(g_fakeRec ? 48ull << 20 : g_recBytes, false);
+            txt(gr, sz, RF(s.X + 18 + tw + 12, s.Y, s.Width - tw - 30, s.Height), F.status, C(paused ? T_WARN : T_MUTED), AL_L, false);
+        } else {
+            unsigned dotc, tc; std::wstring t;
+            if (finishing) { dotc = T_MUTED; tc = T_TEXT2; t = L"Saving\u2026"; }
+            else {
+                unsigned sc = fromRef(g.statusColor);
+                t = g.status.empty() ? L"Ready" : g.status;
+                bool err = sc == T_ERR;
+                dotc = err ? T_ERR : sc == T_WARN ? T_WARN : T_OK;
+                tc = err ? T_ERR : sc == T_WARN ? T_WARN : sc == T_OK && t != L"Ready" ? T_OK : T_TEXT2;
+            }
+            fillCircle(gr, s.X + 6, cy, 4, C(dotc));
+            bool err = !finishing && fromRef(g.statusColor) == T_ERR;
+            // The status can be long (saved file, errors): it may run under the pill when the pill is hidden.
+            float avail = (g.s.replayEnabled || g_fakeRec ? L.pill.X - 8 : L.mic.X - 16) - (s.X + 18);
+            float linkW = err ? txtW(gr, L"Open log", F.status) + 14 : 0;
+            float tw = std::min(txtW(gr, t, F.status) + 2, avail - linkW);
+            txt(gr, t, RF(s.X + 18, s.Y, tw, s.Height), F.status, C(tc));
+            if (err) {
+                RF lr(s.X + 18 + tw + 10, s.Y + 4, linkW - 10, s.Height - 8);
+                txt(gr, L"Open log", lr, F.status, C(hovA(H_STATUSLOG) > 0.5f ? T_TEXT : T_ACC_B), AL_L, false);
+                hline(gr, lr.X, lr.X + lr.Width, lr.Y + lr.Height - 2, C(T_ACC_B, 160));
+                addReg(lr, H_STATUSLOG);
+            }
         }
-        fillCircle(gr, s.X + 4, s.Y + s.Height / 2, 4, C(dotc));
-        float avail = s.Width - 16;
-        bool err = !active && !finishing && fromRef(g.statusColor) == T_ERR;
-        float linkW = err ? txtW(gr, L"Open log", F.status) + 14 : 0;
-        float tw = std::min(txtW(gr, t, F.status) + 2, avail - linkW);
-        txt(gr, t, RF(s.X + 16, s.Y, tw, s.Height), F.status, C(tc));
-        if (err) {
-            RF lr(s.X + 16 + tw + 10, s.Y + 4, linkW - 10, s.Height - 8);
-            txt(gr, L"Open log", lr, F.status, C(hovA(H_STATUSLOG) > 0.5f ? T_TEXT : T_ACC_B), AL_L, false);
-            hline(gr, lr.X, lr.X + lr.Width, lr.Y + lr.Height - 2, C(T_ACC_B, 160));
-            addReg(lr, H_STATUSLOG);
-        }
-        g_statusRect = s;
+        g_statusRect = RF(s.X, s.Y, std::max(s.Width, L.mic.X - 16 - s.X), s.Height);
     }
+    // replay pill (only while the buffer is on)
+    if (g.s.replayEnabled) {
+        RF p = L.pill;
+        pressScope ps(gr, p, H_REPLAYPILL);
+        fillRR(gr, p, 15, mix(T_SURF, T_INPUT_H, hovA(H_REPLAYPILL)));
+        strokeRR(gr, p, 15, WA(A_DEFAULT));
+        bool spin = g.replaySaving && nowMs() - g.replaySaveT < 300;
+        icon(gr, G_REPLAY, p.X + 12, p.Y + 7, 16, C(T_TEXT2), spin ? (float)fmod(nowMs() * 0.72, 360.0) : 0.f);
+        std::wstring t = L"Replay \u00b7 " + replayShort(g.s.replaySeconds);
+        txt(gr, t, RF(p.X + 34, p.Y, p.Width - 56, p.Height), F.label, C(T_TEXT), AL_L, false);
+        bool live = g_renderOnly || g.replay.isActive() || (g.rec.isActive() && g.ring);
+        double ph = fmod(nowMs(), 1600.0) / 1600.0, tri = ph < 0.5 ? ph * 2 : 2 - ph * 2;
+        float a = live ? (animationsOn() ? 0.4f + 0.6f * (float)ease(E_INOUT, tri) : 1.f) : 1.f;
+        fillCircle(gr, p.X + p.Width - 16, p.Y + 15, 4, C(live ? T_OK : T_MUTED, (int)(255 * a)));
+        focusRing(gr, p, 15, H_REPLAYPILL);
+        addReg(p, H_REPLAYPILL);
+        g_pillRect = p;
+    } else g_pillRect = RF(0, 0, 0, 0);
     // audio chips
     {
         bool micOn = g.s.micEnabled, muted = g.s.micMuted;
         bool open = P.kind == PK_MIC && !P.closing;
         RF m = L.mic;
+        { pressScope ps(gr, m, H_MICCHIP);
         fillRR(gr, m, 8, mix(T_SURF, T_INPUT_H, hovA(H_MICCHIP) * 0.8f));
         strokeRR(gr, m, 8, open ? C(T_ACC) : WA(A_DEFAULT));
         if (hovA(H_MICICON) > 0) fillRR(gr, RF(m.X + 4, m.Y + 4, 28, 32), 6, WA((int)(A_PRESSED * hovA(H_MICICON))));
         icon(gr, muted ? G_MICMUTED : G_MIC, m.X + 10, m.Y + 12, 16, C(!micOn ? T_DIS : muted ? T_ACC_B : T_TEXT2));
         meterW(gr, m.X + 38, m.Y + 17, m.Width - 38 - 14, 6, g_meter[0], micOn && !muted);
-        focusRing(gr, m, 8, H_MICCHIP);
+        focusRing(gr, m, 8, H_MICCHIP); }
         addReg(m, H_MICCHIP);
         addReg(L.micIcon, H_MICICON);
         RF s = L.sys;
         bool sysOn = g.s.systemAudio, smuted = g.s.systemMuted;
+        { pressScope ps(gr, s, H_SYSCHIP);
         fillRR(gr, s, 8, mix(T_SURF, T_INPUT_H, hovA(H_SYSCHIP) * 0.8f));
         strokeRR(gr, s, 8, WA(A_DEFAULT));
         icon(gr, smuted ? G_SYSMUTED : G_SYS, s.X + 10, s.Y + 12, 16, C(!sysOn ? T_DIS : smuted ? T_ACC_B : T_TEXT2));
         meterW(gr, s.X + 38, s.Y + 17, s.Width - 38 - 14, 6, g_meter[1], sysOn && !smuted);
-        focusRing(gr, s, 8, H_SYSCHIP);
+        focusRing(gr, s, 8, H_SYSCHIP); }
         addReg(s, H_SYSCHIP);
+    }
+    // Screenshot
+    {
+        pressScope ps(gr, L.shot, H_SHOT);
+        buttonBg(gr, L.shot, 12, H_SHOT, T_ELEV, WA(A_DEFAULT));
+        icon(gr, G_SCREENSHOT, L.shot.X + 14, L.shot.Y + 14, 16, C(T_TEXT));
+        addReg(L.shot, H_SHOT);
     }
     // Pause (disabled when idle; Paused shows the record glyph = resume)
     {
         bool dis = !active;
-        buttonBg(gr, L.pause, 10, H_PAUSE, T_ELEV, WA(A_DEFAULT), dis);
+        pressScope ps(gr, L.pause, dis ? H_NONE : H_PAUSE);
+        buttonBg(gr, L.pause, 12, H_PAUSE, T_ELEV, WA(A_DEFAULT), dis);
         icon(gr, paused ? G_RECORD : G_PAUSE, L.pause.X + 14, L.pause.Y + 14, 16, C(dis ? T_DIS : paused ? T_ACC_B : T_TEXT));
         addReg(L.pause, H_PAUSE);
     }
     // Record / Stop with the pulse (1200 ms loop, glow alpha .15 <-> .45)
     {
         RF r = L.record;
+        pressScope ps(gr, r, H_RECORD);
+        float bloom = 0;
+        { auto it = g_press.find(H_RECORD); if (it != g_press.end()) bloom = std::max(0.f, it->second.value()); }
         if (active || finishing) {
             if (active && !paused) {
                 double ph = fmod(nowMs(), 1200.0) / 1200.0;
                 double tri = ph < 0.5 ? ph * 2 : 2 - ph * 2;
                 float a = 0.15f + 0.30f * (float)ease(E_INOUT, tri);
                 if (!animationsOn()) a = 0.3f;
-                for (int i = 6; i >= 1; --i) strokeRR(gr, inflate(r, (float)i), 10.f + i, C(T_ACC, (int)(255 * a * (7 - i) / 14.f)), 2.f);
+                a = std::max(a, 0.25f + 0.2f * bloom);
+                for (int i = 6; i >= 1; --i) strokeRR(gr, inflate(r, (float)i), 12.f + i, C(T_ACC, (int)(255 * a * (7 - i) / 14.f)), 2.f);
             }
-            buttonBg(gr, r, 10, H_RECORD, T_ELEV, finishing ? WA(A_DEFAULT) : C(T_ACC));
-            if (!finishing) strokeRR(gr, r, 10, C(T_ACC), 1.5f);
+            buttonBg(gr, r, 12, H_RECORD, T_ELEV, finishing ? WA(A_DEFAULT) : gp::Color(0, 0, 0, 0));
+            if (!finishing) strokeRR(gr, r, 12, C(T_ACC), 2.f);
             std::wstring t = finishing ? L"Saving" : L"Stop";
             float tw = txtW(gr, t, F.btnP);
             float x0 = r.X + (r.Width - (16 + 8 + tw)) / 2;
@@ -1283,149 +1842,341 @@ void paintRecordView(gp::Graphics& gr, float W, float H) {
             txt(gr, t, RF(x0 + 24, r.Y, tw + 4, r.Height), F.btnP, C(finishing ? T_TEXT2 : T_TEXT), AL_L, false);
         } else {
             float hv = hovA(H_RECORD);
+            if (bloom > 0) for (int i = 6; i >= 1; --i) strokeRR(gr, inflate(r, (float)i), 12.f + i, C(T_ACC, (int)(255 * 0.45f * bloom * (7 - i) / 14.f)), 2.f);
             bool pr = g.pressed == H_RECORD && g.hover == H_RECORD;
             gp::Color bg = pr ? C(T_ACC_P) : mix(T_ACC, T_ACC_H, hv);
-            fillRR(gr, r, 10, bg);
+            fillRR(gr, r, 12, bg);
             std::wstring t = L"Record";
             float tw = txtW(gr, t, F.btnP);
             float x0 = r.X + (r.Width - (16 + 8 + tw)) / 2;
             icon(gr, G_RECORD, x0, r.Y + 14, 16, C(0xFFFFFF));
             txt(gr, t, RF(x0 + 24, r.Y, tw + 4, r.Height), F.btnP, C(0xFFFFFF), AL_L, false);
-            focusRing(gr, r, 10, H_RECORD);
+            focusRing(gr, r, 12, H_RECORD);
         }
         addReg(r, H_RECORD);
         g_recordRect = inflate(r, 8);
     }
 }
-
-// ---------- Settings view ----------
-void cardTitle(gp::Graphics& gr, RF c, const wchar_t* t) { txt(gr, t, RF(c.X + 20, c.Y + 14, c.Width - 40, 18), F.section, C(T_MUTED), AL_L, false); }
-void label(gp::Graphics& gr, const wchar_t* t, float x, float cy, bool dis = false) { txt(gr, t, RF(x, cy - 12, 180, 24), F.label, C(dis ? T_DIS : T_TEXT2), AL_L, false); }
+// ---------- Settings view (v1.1: 3 columns x 340, SPEC "Settings view") ----------
+void cardTitle(gp::Graphics& gr, RF c, const wchar_t* t) { txt(gr, t, RF(c.X + 18, c.Y + 12, c.Width - 36, 18), F.section, C(T_MUTED), AL_L, false); }
+void label(gp::Graphics& gr, const wchar_t* t, float x, float cy, bool dis = false) { txt(gr, t, RF(x, cy - 12, 220, 24), F.label, C(dis ? T_DIS : T_TEXT2), AL_L, false); }
 void hotkeyField(gp::Graphics& gr, RF r, int id, int idx, const Hotkey& hk, bool dimmed = false) {
     bool cap = g.capturing == idx, dis = locked(id);
-    fillRR(gr, r, 6, mix(T_INPUT, T_INPUT_H, cap ? 1.f : dis ? 0.f : hovA(id)));
-    COLORREF mc = idx < 3 ? g.hkMsgColor[idx] : 0;
-    bool bad = idx < 3 && fromRef(mc) == T_ERR && !cap;
-    strokeRR(gr, r, 6, cap ? C(T_ACC) : bad ? C(T_ERR) : WA(A_DEFAULT));
+    pressScope ps(gr, r, id);
+    fillRR(gr, r, 8, mix(T_INPUT, T_INPUT_H, cap ? 0.f : dis ? 0.f : hovA(id)));
+    COLORREF mc = g.hkMsgColor[idx];
+    bool bad = fromRef(mc) == T_ERR && !cap && !hk.empty();
+    strokeRR(gr, r, 8, cap ? C(T_ACC) : bad ? C(T_ERR) : WA(A_DEFAULT), cap || bad ? 1.5f : 1.f);
     std::wstring t; unsigned tc = T_TEXT;
     if (cap) { t = g.liveMods ? modsText(g.liveMods) + L"\u2026" : L"Press a key\u2026"; tc = T_MUTED; }
     else if (hk.empty()) { t = L"Not set"; tc = T_MUTED; }
     else t = hkText(hk);
     if ((dis || dimmed) && !cap) tc = T_DIS;
     txt(gr, t, r, F.hotkey, C(tc), AL_C);
-    if (bad && idx < 3 && !g.hkMsg[idx].empty()) { /* the reason shows as the field's tooltip-like suffix */ }
-    focusRing(gr, r, 6, id);
+    if (bad && hovA(id) > 0.5f && !g.hkMsg[idx].empty()) g_tooltip = {r, g.hkMsg[idx]};
+    focusRing(gr, r, 8, id);
     addReg(r, id);
 }
-void segmented(gp::Graphics& gr, float x, float cy) {
-    RF r(x, cy - 16, 160, 32);
-    fillRR(gr, r, 7, C(T_BG));
-    strokeRR(gr, r, 7, WA(A_DEFAULT));
-    float target = g.s.channels == 2 ? 1.f : 0.f;
-    if (g_chan.to != target) g_chan.go(target, 160, E_STD);
-    float k = g_chan.value();
-    RF th(x + 3 + k * 77, cy - 13, 77, 26);
-    fillRR(gr, th, 5, C(T_ELEV));
-    strokeRR(gr, th, 5, WA(A_SUBTLE));
-    bool dis = locked(H_CH_MONO);
-    txt(gr, L"Mono", RF(x + 3, cy - 13, 77, 26), g.s.channels == 1 ? F.btn : F.body, C(dis ? T_DIS : g.s.channels == 1 ? T_TEXT : T_TEXT2), AL_C, false);
-    txt(gr, L"Stereo", RF(x + 80, cy - 13, 77, 26), g.s.channels == 2 ? F.btn : F.body, C(dis ? T_DIS : g.s.channels == 2 ? T_TEXT : T_TEXT2), AL_C, false);
-    addReg(RF(x, cy - 16, 80, 32), H_CH_MONO);
-    addReg(RF(x + 80, cy - 16, 80, 32), H_CH_STEREO);
-    focusRing(gr, r, 7, H_CH_MONO);
+// Two-option segmented control. sel 0/1, anim drives the thumb.
+void segmented2(gp::Graphics& gr, RF r, int idA, int idB, const wchar_t* a, const wchar_t* b, int sel, Anim& an, int glyphA = -1, int glyphB = -1, bool dis = false) {
+    fillRR(gr, r, 8, C(T_SEGBG));
+    strokeRR(gr, r, 8, WA(A_DEFAULT));
+    float target = (float)sel;
+    if (an.to != target) an.go(target, 160, E_STD);
+    float k = an.value(), hw = (r.Width - 6) / 2;
+    RF th(r.X + 3 + k * hw, r.Y + 3, hw, r.Height - 6);
+    fillRR(gr, th, 6, C(g_light ? T_SEGTH : T_ELEV));
+    strokeRR(gr, th, 6, WA(A_SUBTLE));
+    for (int i = 0; i < 2; ++i) {
+        RF c(r.X + 3 + i * hw, r.Y + 3, hw, r.Height - 6);
+        const wchar_t* t = i ? b : a;
+        int gl = i ? glyphB : glyphA;
+        gp::Font* f = sel == i ? F.btn : F.body;
+        unsigned col = dis ? T_DIS : sel == i ? T_TEXT : T_TEXT2;
+        float tw = txtW(gr, t, f), gw = gl >= 0 ? 22.f : 0.f;
+        float x0 = c.X + (c.Width - tw - gw) / 2;
+        if (gl >= 0) icon(gr, gl, x0, c.Y + c.Height / 2 - 8, 16, C(col));
+        txt(gr, t, RF(x0 + gw, c.Y, tw + 4, c.Height), f, C(col), AL_L, false);
+        addReg(RF(r.X + i * r.Width / 2, r.Y, r.Width / 2, r.Height), i ? idB : idA);
+    }
+    focusRing(gr, r, 8, idA);
 }
+Anim g_themeSeg;
 void paintSettingsView(gp::Graphics& gr, float W, float H) {
     (void)W; (void)H;
-    RF video(20, 60, 520, 244), hot(20, 316, 520, 170), out(20, 498, 520, 102), audio(560, 60, 520, 540);
-    for (RF c : {video, hot, out, audio}) card(gr, c, 10, C(T_SURF), WA(A_SUBTLE));
+    RF video(20, 60, 340, 268), replay(20, 340, 340, 122), look(20, 474, 340, 126), audio(380, 60, 340, 540), hot(740, 60, 340, 284), out(740, 356, 340, 244);
+    for (RF c : {video, replay, look, audio, hot, out}) card(gr, c, 12, C(T_SURF), WA(A_SUBTLE));
     // Video
     cardTitle(gr, video, L"VIDEO");
     const wchar_t* vl[4] = {L"Encoder", L"GPU", L"Resolution", L"Container"};
     const int vid[4] = {H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT};
     for (int i = 0; i < 4; ++i) {
-        float top = 110.f + 46 * i;
-        label(gr, vl[i], 40, top + 16, locked(vid[i]));
-        RF f(180, top, 340, 32);
-        ddField(gr, f, vid[i], ddItem(vid[i], ddSel(vid[i])));
-        focusRing(gr, f, 6, vid[i]);
+        float cy = 119.f + 44 * i;
+        label(gr, vl[i], 38, cy, locked(vid[i]));
+        RF f(138, cy - 16, 204, 32);
+        ddField(gr, f, vid[i], vid[i] == H_DD_ENC ? encoderText() : ddItem(vid[i], ddSel(vid[i])));
+        focusRing(gr, f, 8, vid[i]);
     }
+    if (g.s.codec == Codec::AV1) txt(gr, L"AV1 plays best in MKV", RF(138, 268, 204, 14), F.caption, C(T_MUTED), AL_L, false);
+    label(gr, L"Auto-remux to MP4", 38, 299, locked(H_TG_REMUX));
+    toggleW(gr, 306, 299, H_TG_REMUX, g.s.autoRemux);
+    // Instant replay
+    cardTitle(gr, replay, L"INSTANT REPLAY");
+    label(gr, L"Replay buffer", 38, 397, locked(H_TG_REPLAY));
+    toggleW(gr, 306, 397, H_TG_REPLAY, g.s.replayEnabled);
+    label(gr, L"Length", 38, 436);
+    RF lf(138, 420, 204, 32);
+    if (g_edit.kind == 2) { g_edit.rect = lf; fillRR(gr, lf, 8, C(T_INPUT)); strokeRR(gr, lf, 8, C(T_ACC), 1.5f);
+                            txt(gr, L"seconds", RF(lf.X + 12, lf.Y, lf.Width - 24, lf.Height), F.label, C(T_MUTED), AL_R, false); }
+    else { ddField(gr, lf, H_DD_REPLAYLEN, replayLenText()); focusRing(gr, lf, 8, H_DD_REPLAYLEN); }
+    // Appearance
+    cardTitle(gr, look, L"APPEARANCE");
+    label(gr, L"Theme", 38, 530);
+    segmented2(gr, RF(138, 514, 204, 32), H_THEME_DARK, H_THEME_LIGHT, L"Dark", L"Light", g_light ? 1 : 0, g_themeSeg, G_MOON, G_SUN);
+    label(gr, L"Accent", 38, 571);
+    for (int i = 0; i < 6; ++i) {
+        float cx = 150.f + 32 * i, cy = 571;
+        int id = H_ACC0 + i;
+        bool sel = accentIndex() == i;
+        pressScope ps(gr, RF(cx - 12, cy - 12, 24, 24), id);
+        if (sel) { gp::Pen p(C(kAccents[i].base), 2.f); gr.DrawEllipse(&p, cx - 11, cy - 11, 22.f, 22.f); }
+        else if (hovA(id) > 0) { gp::Pen p(WA((int)(A_STRONG * hovA(id))), 2.f); gr.DrawEllipse(&p, cx - 11, cy - 11, 22.f, 22.f); }
+        fillCircle(gr, cx, cy, 8, C(kAccents[i].base));
+        focusRing(gr, RF(cx - 12, cy - 12, 24, 24), 12, id);
+        addReg(RF(cx - 14, cy - 14, 28, 28), id);
+    }
+    // Audio
+    cardTitle(gr, audio, L"AUDIO");
+    const float lx = 398, rx = 701, sx = 530, sw = 123;
+    label(gr, L"System audio", lx, 107, locked(H_TG_SYS));
+    toggleW(gr, rx - 36, 107, H_TG_SYS, g.s.systemAudio);
+    ddField(gr, RF(lx, 128, rx - lx, 32), H_DD_SYSDEV, ddItem(H_DD_SYSDEV, ddSel(H_DD_SYSDEV)), g.s.systemMuted ? G_SYSMUTED : G_SYS);
+    focusRing(gr, RF(lx, 128, rx - lx, 32), 8, H_DD_SYSDEV);
+    meterW(gr, lx, 168, rx - lx, 4, g_meter[1], g.s.systemAudio && !g.s.systemMuted);
+    hline(gr, lx, rx, 189, WA(A_SUBTLE));
+    label(gr, L"Microphone", lx, 214, locked(H_TG_MIC));
+    toggleW(gr, rx - 36, 214, H_TG_MIC, g.s.micEnabled);
+    ddField(gr, RF(lx, 234, rx - lx, 32), H_DD_MICDEV, ddItem(H_DD_MICDEV, ddSel(H_DD_MICDEV)), g.s.micMuted ? G_MICMUTED : G_MIC);
+    focusRing(gr, RF(lx, 234, rx - lx, 32), 8, H_DD_MICDEV);
+    meterW(gr, lx, 274, rx - lx, 4, g_meter[0], g.s.micEnabled && !g.s.micMuted);
+    float y = 307;
+    label(gr, L"Volume", lx, y);
+    sliderW(gr, sx, y, sw, H_SL_VOL, g.s.micVolume / 200.f);
+    addReg(RF(sx - 10, y - 14, sw + 20, 28), H_SL_VOL);
+    txt(gr, std::to_wstring(g.s.micVolume) + L"%", RF(sx + sw + 12, y - 12, 50, 24), F.label, C(T_TEXT2), AL_L, false);
+    y = 347;
+    label(gr, L"Noise suppression", lx, y);
+    toggleW(gr, rx - 36, y, H_TG_NS, g.s.noiseSuppression);
+    y = 387;
+    label(gr, L"Noise gate", lx, y);
+    sliderW(gr, sx, y, sw, H_SL_GATE, (g.s.noiseGateDb + 80) / 80.f);
+    addReg(RF(sx - 10, y - 14, sw + 20, 28), H_SL_GATE);
+    txt(gr, g.s.noiseGateDb <= -80 ? std::wstring(L"Off") : std::to_wstring(g.s.noiseGateDb) + L" dB", RF(sx + sw + 12, y - 12, 50, 24), F.label, C(T_TEXT2), AL_L, false);
+    y = 427;
+    label(gr, L"Monitoring", lx, y);
+    toggleW(gr, rx - 36, y, H_TG_MON, g.s.monitoring);
+    y = 467;
+    label(gr, L"Push-to-talk", lx, y);
+    hotkeyField(gr, RF(sx, y - 15, 116, 30), H_HKPTT, 3, g.s.pttKey, !g.s.pushToTalk);
+    toggleW(gr, rx - 36, y, H_TG_PTT, g.s.pushToTalk);
+    y = 507;
+    label(gr, L"Channels", lx, y, locked(H_CH_MONO));
+    segmented2(gr, RF(sx, y - 16, rx - sx, 32), H_CH_MONO, H_CH_STEREO, L"Mono", L"Stereo", g.s.channels == 2 ? 1 : 0, g_chan, -1, -1, locked(H_CH_MONO));
+    hline(gr, lx, rx, 537, WA(A_SUBTLE));
+    label(gr, L"Separate audio tracks", lx, 560, locked(H_TG_TRACKS));
+    txt(gr, L"Track 1 mix \u00b7 2 system \u00b7 3 mic", RF(lx, 572, 240, 16), F.caption, C(T_MUTED), AL_L, false);
+    toggleW(gr, rx - 36, 566, H_TG_TRACKS, g.s.separateTracks);
     // Hotkeys
     cardTitle(gr, hot, L"HOTKEYS");
-    const wchar_t* hl[3] = {L"Start / Stop", L"Pause", L"Mic mute"};
-    const Hotkey* hks[3] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute};
-    for (int i = 0; i < 3; ++i) {
-        float top = 362.f + 40 * i;
-        label(gr, hl[i], 40, top + 16);
-        hotkeyField(gr, RF(180, top, 340, 32), H_HK0 + i, i, *hks[i]);
+    const int order[5] = {0, 1, 2, 4, 5};
+    const int hid[5] = {H_HK0, H_HK1, H_HK2, H_HK3, H_HK4};
+    for (int i = 0; i < 5; ++i) {
+        float top = 103.f + 46 * i;
+        label(gr, kHkNames[order[i]], 758, top + 16);
+        hotkeyField(gr, RF(872, top, 190, 32), hid[i], order[i], *hkSlot(order[i]));
     }
     // Output
     cardTitle(gr, out, L"OUTPUT");
+    label(gr, L"Folder", 758, 405);
     {
-        RF pf(40, 548, 282, 32);
-        fillRR(gr, pf, 6, mix(T_INPUT, T_INPUT_H, hovA(H_PATH)));
-        strokeRR(gr, pf, 6, WA(A_DEFAULT));
+        RF pf(758, 416, 304, 32);
+        fillRR(gr, pf, 8, mix(T_INPUT, T_INPUT_H, hovA(H_PATH)));
+        strokeRR(gr, pf, 8, WA(A_DEFAULT));
         RF fi(pf.X + 4, pf.Y + 4, 28, 24);
-        if (hovA(H_FOLDERICON) > 0) fillRR(gr, fi, 4, WA((int)(A_PRESSED * hovA(H_FOLDERICON))));
+        if (hovA(H_FOLDERICON) > 0) fillRR(gr, fi, 6, WA((int)(A_PRESSED * hovA(H_FOLDERICON))));
         icon(gr, G_FOLDER, pf.X + 10, pf.Y + 8, 16, C(T_TEXT2));
         txt(gr, outputDir(), RF(pf.X + 36, pf.Y, pf.Width - 44, pf.Height), F.label, C(T_TEXT), AL_L, true, true);
-        focusRing(gr, pf, 6, H_PATH);
+        focusRing(gr, pf, 8, H_PATH);
         addReg(pf, H_PATH);
         addReg(fi, H_FOLDERICON);
-        RF br(330, 548, 84, 32), lg(422, 548, 98, 32);
+        RF br(758, 457, 148, 32), lg(914, 457, 148, 32);
         bool bdis = locked(H_BROWSE);
-        buttonBg(gr, br, 6, H_BROWSE, T_INPUT, WA(A_DEFAULT), bdis);
-        txt(gr, L"Browse", br, F.body, C(bdis ? T_DIS : T_TEXT), AL_C, false);
+        { pressScope ps(gr, br, H_BROWSE); buttonBg(gr, br, 8, H_BROWSE, T_INPUT, WA(A_DEFAULT), bdis);
+          txt(gr, L"Browse", br, F.body, C(bdis ? T_DIS : T_TEXT), AL_C, false); }
         addReg(br, H_BROWSE);
-        buttonBg(gr, lg, 6, H_LOG, T_INPUT, WA(A_DEFAULT));
-        float lw = txtW(gr, L"Log", F.body);
-        float lx = lg.X + (lg.Width - (16 + 8 + lw)) / 2;
-        icon(gr, G_LOG, lx, lg.Y + 8, 16, C(T_TEXT2));
-        txt(gr, L"Log", RF(lx + 24, lg.Y, lw + 4, lg.Height), F.body, C(T_TEXT), AL_L, false);
+        { pressScope ps(gr, lg, H_LOG); buttonBg(gr, lg, 8, H_LOG, T_INPUT, WA(A_DEFAULT));
+          float lw = txtW(gr, L"Log", F.body);
+          float lx2 = lg.X + (lg.Width - (16 + 8 + lw)) / 2;
+          icon(gr, G_LOG, lx2, lg.Y + 8, 16, C(T_TEXT2));
+          txt(gr, L"Log", RF(lx2 + 24, lg.Y, lw + 4, lg.Height), F.body, C(T_TEXT), AL_L, false); }
         addReg(lg, H_LOG);
     }
-    // Audio (labels x+20, controls x+212)
-    cardTitle(gr, audio, L"AUDIO");
-    const float lx = 580, cx = 772;
-    label(gr, L"System audio", lx, 126);
-    toggleW(gr, cx - 52, 126, H_TG_SYS, g.s.systemAudio);
-    ddField(gr, RF(cx, 110, 288, 32), H_DD_SYSDEV, ddItem(H_DD_SYSDEV, ddSel(H_DD_SYSDEV)), g.s.systemMuted ? G_SYSMUTED : G_SYS);
-    focusRing(gr, RF(cx, 110, 288, 32), 6, H_DD_SYSDEV);
-    meterW(gr, cx, 150, 288, 4, g_meter[1], g.s.systemAudio && !g.s.systemMuted);
-    hline(gr, lx, 1060, 176, WA(A_SUBTLE));
-    label(gr, L"Microphone", lx, 210);
-    toggleW(gr, cx - 52, 210, H_TG_MIC, g.s.micEnabled);
-    ddField(gr, RF(cx, 194, 288, 32), H_DD_MICDEV, ddItem(H_DD_MICDEV, ddSel(H_DD_MICDEV)), g.s.micMuted ? G_MICMUTED : G_MIC);
-    focusRing(gr, RF(cx, 194, 288, 32), 6, H_DD_MICDEV);
-    meterW(gr, cx, 234, 288, 4, g_meter[0], g.s.micEnabled && !g.s.micMuted);
-    float y = 273;
-    label(gr, L"Volume", lx, y);
-    sliderW(gr, cx, y, 240, H_SL_VOL, g.s.micVolume / 200.f);
-    addReg(RF(cx - 10, y - 14, 260, 28), H_SL_VOL);
-    txt(gr, std::to_wstring(g.s.micVolume) + L"%", RF(cx + 256, y - 12, 50, 24), F.label, C(T_TEXT2), AL_L, false);
-    y += 48;
-    label(gr, L"Noise suppression", lx, y);
-    toggleW(gr, cx, y, H_TG_NS, g.s.noiseSuppression);
-    y += 48;
-    label(gr, L"Noise gate", lx, y);
-    sliderW(gr, cx, y, 240, H_SL_GATE, (g.s.noiseGateDb + 80) / 80.f);
-    addReg(RF(cx - 10, y - 14, 260, 28), H_SL_GATE);
-    txt(gr, g.s.noiseGateDb <= -80 ? std::wstring(L"Off") : std::to_wstring(g.s.noiseGateDb) + L" dB", RF(cx + 256, y - 12, 56, 24), F.label, C(T_TEXT2), AL_L, false);
-    y += 48;
-    label(gr, L"Monitoring", lx, y);
-    toggleW(gr, cx, y, H_TG_MON, g.s.monitoring);
-    y += 48;
-    label(gr, L"Push-to-talk", lx, y);
-    toggleW(gr, cx, y, H_TG_PTT, g.s.pushToTalk);
-    hotkeyField(gr, RF(cx + 52, y - 16, 140, 32), H_HKPTT, 3, g.s.pttKey, !g.s.pushToTalk);
-    y += 48;
-    label(gr, L"Channels", lx, y);
-    segmented(gr, cx, y);
-    txt(gr, L"Changes save automatically.", RF(20, 664 - 9 + (H - 700), 400, 18), F.caption, C(T_MUTED), AL_L, false);
+    label(gr, L"File name", 758, 520);
+    ddField(gr, RF(858, 504, 204, 32), H_DD_FNAME, ddItem(H_DD_FNAME, ddSel(H_DD_FNAME)));
+    focusRing(gr, RF(858, 504, 204, 32), 8, H_DD_FNAME);
+    label(gr, L"Screenshots", 758, 564);
+    ddField(gr, RF(858, 548, 204, 32), H_DD_SHOTFMT, ddItem(H_DD_SHOTFMT, ddSel(H_DD_SHOTFMT)));
+    focusRing(gr, RF(858, 548, 204, 32), 8, H_DD_SHOTFMT);
+}
+// ---------- Recordings view (SPEC "Recordings tab") ----------
+float colX(float W, float x) { return 20 + (x - 20) * (W - 40) / 1060.f; }
+std::wstring durText(double d) {
+    if (d < 0) return L"\u2014";
+    int s = (int)std::lround(d); wchar_t t[32];
+    if (s >= 3600) swprintf(t, 32, L"%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60); else swprintf(t, 32, L"%02d:%02d", s / 60, s % 60);
+    return t;
+}
+std::wstring dateText(const FILETIME& ft) {
+    SYSTEMTIME u, l, now; FileTimeToSystemTime(&ft, &u); SystemTimeToTzSpecificLocalTime(nullptr, &u, &l); GetLocalTime(&now);
+    auto dayNum = [](const SYSTEMTIME& s) { FILETIME f; SYSTEMTIME d = s; d.wHour = d.wMinute = d.wSecond = d.wMilliseconds = 0; SystemTimeToFileTime(&d, &f);
+                                            return (long long)((((unsigned long long)f.dwHighDateTime << 32) | f.dwLowDateTime) / 864000000000ull); };
+    long long dd = dayNum(now) - dayNum(l);
+    wchar_t t[48];
+    static const wchar_t* mon[12] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun", L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+    if (dd == 0) swprintf(t, 48, L"Today %02d:%02d", l.wHour, l.wMinute);
+    else if (dd == 1) swprintf(t, 48, L"Yesterday");
+    else if (l.wYear == now.wYear) swprintf(t, 48, L"%ls %d", mon[(l.wMonth + 11) % 12], l.wDay);
+    else swprintf(t, 48, L"%ls %d, %d", mon[(l.wMonth + 11) % 12], l.wDay, l.wYear);
+    return t;
+}
+std::vector<int> visibleItems() {  // indexes into g_items matching the search (caller holds g_itemsM)
+    std::vector<int> v; std::wstring q = lowerW(g_rsearch);
+    for (int i = 0; i < (int)g_items.size(); ++i) if (q.empty() || lowerW(g_items[i].name).find(q) != std::wstring::npos) v.push_back(i);
+    return v;
+}
+RF listCard(float W, float H) { return RF(20, 104, W - 40, H - 204); }
+float listContentH() { std::lock_guard<std::mutex> l(g_itemsM); return 44 + visibleItems().size() * 62.f + 6; }
+void clampListScroll(float W, float H) { float m = std::max(0.f, listContentH() - listCard(W, H).Height); g_listScroll = std::max(0.f, std::min(g_listScroll, m)); }
+void iconBtn(gp::Graphics& gr, RF r, int id, int glyph) {
+    pressScope ps(gr, r, id);
+    if (hovA(id) > 0) fillRR(gr, r, 8, WA((int)(A_PRESSED * hovA(id))));
+    icon(gr, glyph, r.X + r.Width / 2 - 8, r.Y + r.Height / 2 - 8, 16, C(hovA(id) > 0.5f ? T_TEXT : T_TEXT2));
+    addReg(r, id);
+}
+void paintRecordingsView(gp::Graphics& gr, float W, float H) {
+    // toolbar
+    RF sf(20, 56, 320, 36);
+    fillRR(gr, sf, 8, mix(T_INPUT, T_INPUT_H, g_rsearchFocus ? 0.f : hovA(H_RSEARCH)));
+    strokeRR(gr, sf, 8, g_rsearchFocus ? C(T_ACC) : WA(A_DEFAULT), g_rsearchFocus ? 1.5f : 1.f);
+    icon(gr, G_SEARCH, sf.X + 12, sf.Y + 10, 16, C(T_MUTED));
+    if (g_rsearch.empty()) txt(gr, L"Search recordings", RF(sf.X + 36, sf.Y, sf.Width - 48, sf.Height), F.body, C(T_MUTED));
+    else txt(gr, g_rsearch, RF(sf.X + 36, sf.Y, sf.Width - 48, sf.Height), F.body, C(T_TEXT));
+    if (g_rsearchFocus && fmod(nowMs(), 1000.0) < 600) {
+        float cw = std::min(g_rsearch.empty() ? 0.f : txtW(gr, g_rsearch, F.body), sf.Width - 50);
+        gp::SolidBrush cb(C(T_TEXT)); gr.FillRectangle(&cb, sf.X + 37 + cw, sf.Y + 10, 1.f, 16.f);
+    }
+    addReg(sf, H_RSEARCH);
+    RF ra(W - 20 - 132, 56, 132, 36);
+    { pressScope ps(gr, ra, H_REMUXALL); buttonBg(gr, ra, 8, H_REMUXALL, T_ELEV, WA(A_DEFAULT));
+      float tw = txtW(gr, L"Remux all", F.body), x0 = ra.X + (ra.Width - 24 - tw) / 2;
+      icon(gr, G_REMUX, x0, ra.Y + 10, 16, C(T_TEXT2));
+      txt(gr, L"Remux all", RF(x0 + 24, ra.Y, tw + 4, ra.Height), F.body, C(T_TEXT), AL_L, false); }
+    addReg(ra, H_REMUXALL);
+    toggleW(gr, ra.X - 16 - 36, 74, H_TG_AUTOREMUX, g.s.autoRemux);
+    txt(gr, L"Auto-remux", RF(ra.X - 16 - 36 - 12 - 120, 62, 120, 24), F.label, C(T_TEXT2), AL_R, false);
+    // list
+    RF lc = listCard(W, H);
+    card(gr, lc, 12, C(T_SURF), WA(A_SUBTLE));
+    const float cols[5] = {40, 560, 660, 760, 900};
+    const wchar_t* heads[5] = {L"NAME", L"DURATION", L"SIZE", L"DATE", L"FORMAT"};
+    for (int i = 0; i < 5; ++i) txt(gr, heads[i], RF(colX(W, cols[i]), 120, 120, 20), F.tiny, C(T_MUTED), AL_L, false);
+    hline(gr, lc.X, lc.X + lc.Width, 144, WA(A_SUBTLE));
+    gp::GraphicsState st = gr.Save();
+    gr.SetClip(RF(lc.X, 145, lc.Width, lc.Y + lc.Height - 146), gp::CombineModeIntersect);
+    std::lock_guard<std::mutex> l(g_itemsM);
+    auto vis = visibleItems();
+    if (vis.empty()) {
+        txt(gr, g_items.empty() ? L"No recordings yet" : L"No matching recordings", RF(lc.X, 190, lc.Width, 24), F.title, C(T_TEXT2), AL_C);
+        if (g_items.empty()) txt(gr, L"Recordings, replays and remuxed files in " + outputDir() + L" show up here.", RF(lc.X + 40, 216, lc.Width - 80, 20), F.label, C(T_MUTED), AL_C, true, true);
+    }
+    for (size_t k = 0; k < vis.size(); ++k) {
+        RecItem& it = g_items[vis[k]];
+        float top = 150 + k * 62.f - g_listScroll;
+        if (top > lc.Y + lc.Height || top + 56 < 145) continue;
+        int base = R_BASE + vis[k] * 4;
+        RF row(lc.X + 8, top, lc.Width - 16, 56);
+        float hv = std::max(hovA(base), (g_ctxPath == it.path && P.kind == PK_LIST && P.dd == H_CTXMENU && !P.closing) ? 1.f : 0.f);
+        hv = std::max({hv, hovA(base + 1), hovA(base + 2), hovA(base + 3)});
+        if (hv > 0) fillRR(gr, row, 10, C(T_LISTH, (int)(255 * hv)));
+        addReg(row, base);
+        // thumbnail 64x36 r6
+        RF tr(colX(W, 40) - 2, top + 10, 64, 36);
+        fillRR(gr, tr, 6, C(g_light ? 0xD5D9E0 : 0x222631));
+        if (!it.thumb && it.tw > 0 && !it.thumbPx.empty()) {
+            auto b = std::make_shared<gp::Bitmap>(it.tw, it.th, PixelFormat32bppARGB);
+            gp::BitmapData bd; gp::Rect lr(0, 0, it.tw, it.th);
+            if (b->LockBits(&lr, gp::ImageLockModeWrite, PixelFormat32bppARGB, &bd) == gp::Ok) {
+                for (int y = 0; y < it.th; ++y) memcpy((BYTE*)bd.Scan0 + y * bd.Stride, it.thumbPx.data() + (size_t)y * it.tw, (size_t)it.tw * 4);
+                b->UnlockBits(&bd);
+                it.thumb = b;
+            }
+        }
+        if (it.thumb) {
+            gp::GraphicsPath cp; rrPath(cp, tr, 6);
+            gp::GraphicsState s2 = gr.Save(); gr.SetClip(&cp, gp::CombineModeIntersect);
+            float bw = (float)it.thumb->GetWidth(), bh = (float)it.thumb->GetHeight(), kk = std::max(tr.Width / bw, tr.Height / bh);
+            gr.SetInterpolationMode(gp::InterpolationModeHighQualityBicubic);
+            gr.DrawImage(it.thumb.get(), RF(tr.X + (tr.Width - bw * kk) / 2, tr.Y + (tr.Height - bh * kk) / 2, bw * kk, bh * kk));
+            gr.Restore(s2);
+        }
+        if (it.replay) { if (it.thumb) fillRR(gr, tr, 6, gp::Color(110, 0, 0, 0)); icon(gr, G_REPLAY, tr.X + 24, tr.Y + 10, 16, C(it.thumb ? 0xFFFFFF : T_TEXT2)); }
+        float nx = tr.X + 76;
+        bool renaming = g_edit.kind == 1 && g_edit.path == it.path;
+        if (!renaming) txt(gr, it.name, RF(nx, top + 8, colX(W, 560) - nx - 16, 20), F.body, C(T_TEXT));
+        std::wstring det = it.replay ? std::wstring(L"Instant replay") : it.w ? dims(it.w, it.h) + (it.fps > 0 ? L" \u00b7 " + std::to_wstring((int)std::lround(it.fps)) + L" fps" : L"") : std::wstring();
+        if (det.empty() && !it.metaDone) det = L"\u2026";
+        txt(gr, det, RF(nx, top + 28, colX(W, 560) - nx - 16, 18), F.label, C(T_MUTED));
+        txt(gr, durText(it.dur), RF(colX(W, 560), top, 90, 56), F.label, C(T_TEXT2), AL_L, false);
+        txt(gr, sizeText(it.size), RF(colX(W, 660), top, 90, 56), F.label, C(T_TEXT2), AL_L, false);
+        txt(gr, dateText(it.mtime), RF(colX(W, 760), top, 130, 56), F.label, C(T_TEXT2), AL_L, false);
+        bool mkv = it.ext == L"mkv";
+        RF bd(colX(W, 900), top + 17, 44, 22);
+        unsigned bc = mkv ? T_WARN : T_OK;
+        fillRR(gr, bd, 11, C(bc, 0x29));
+        txt(gr, mkv ? L"MKV" : L"MP4", bd, F.tiny, C(bc), AL_C, false);
+        float R = lc.X + lc.Width;
+        float pr = mkv ? remuxProgress(it.path) : -2;
+        if (mkv && !hasMp4Sibling(it.path)) {
+            RF rb(R - 126, top + 12, 84, 32);
+            pressScope ps(gr, rb, base + 3);
+            buttonBg(gr, rb, 8, base + 3, T_ELEV, WA(A_DEFAULT));
+            if (pr >= 0) {
+                fillRR(gr, RF(rb.X + 10, rb.Y + 22, (rb.Width - 20), 3), 1.5f, C(T_TRACK));
+                fillRR(gr, RF(rb.X + 10, rb.Y + 22, (rb.Width - 20) * pr, 3), 1.5f, C(T_ACC));
+                txt(gr, L"Remuxing", RF(rb.X, rb.Y - 3, rb.Width, rb.Height - 6), F.caption, C(T_TEXT2), AL_C, false);
+            } else if (pr == -1) txt(gr, L"Queued", rb, F.label, C(T_MUTED), AL_C, false);
+            else {
+                float tw = txtW(gr, L"Remux", F.body), x0 = rb.X + (rb.Width - 22 - tw) / 2;
+                icon(gr, G_REMUX, x0, rb.Y + 8, 16, C(T_TEXT2));
+                txt(gr, L"Remux", RF(x0 + 22, rb.Y, tw + 4, rb.Height), F.body, C(T_TEXT), AL_L, false);
+            }
+            addReg(rb, base + 3);
+        } else {
+            iconBtn(gr, RF(R - 90, top + 12, 32, 32), base + 1, G_PLAY);
+            iconBtn(gr, RF(R - 55, top + 12, 32, 32), base + 2, G_FOLDER);
+        }
+    }
+    gr.Restore(st);
+    float ch = 44 + vis.size() * 62.f + 6;
+    if (ch > lc.Height) {  // scrollbar
+        float vh = lc.Height - 50, th = std::max(24.f, vh * vh / (ch - 44)), ty = 148 + (vh - th) * (g_listScroll / std::max(1.f, ch - lc.Height));
+        fillRR(gr, RF(lc.X + lc.Width - 6, ty, 3, th), 1.5f, WA(A_STRONG));
+    }
 }
 
 // ---------- whole window ----------
 void paintView(gp::Graphics& gr, int view, float W, float H) {
-    if (view == 0) paintRecordView(gr, W, H); else paintSettingsView(gr, W, H);
+    if (view == 0) paintRecordView(gr, W, H); else if (view == 1) paintRecordingsView(gr, W, H); else paintSettingsView(gr, W, H);
 }
 void setupGraphics(gp::Graphics& gr, bool clearType) {
     gr.SetSmoothingMode(gp::SmoothingModeAntiAlias);
@@ -1433,8 +2184,9 @@ void setupGraphics(gp::Graphics& gr, bool clearType) {
     gr.SetTextRenderingHint(clearType ? gp::TextRenderingHintClearTypeGridFit : gp::TextRenderingHintAntiAliasGridFit);
     gr.SetCompositingQuality(gp::CompositingQualityHighSpeed);
 }
+gp::Bitmap* g_themeFade = nullptr; Anim g_themeAnim;
 void paintAll(gp::Graphics& gr, float W, float H) {
-    g_regs.clear(); g_meterRects.clear();
+    g_regs.clear(); g_meterRects.clear(); g_tooltip.t.clear();
     gp::SolidBrush bg(C(T_BG)); gr.FillRectangle(&bg, -1.f, -1.f, W + 2, H + 2);
     paintTitleBar(gr, W);
     if (g_view.active()) {  // view switch: content fades in, translateX 8 -> 0
@@ -1455,6 +2207,19 @@ void paintAll(gp::Graphics& gr, float W, float H) {
     } else {
         paintView(gr, g_viewIdx, W, H);
     }
+    if (!g_tooltip.t.empty()) {  // hotkey conflict tooltip ("Already used by ...")
+        float tw = txtW(gr, g_tooltip.t, F.caption) + 20;
+        RF tr(g_tooltip.r.X + g_tooltip.r.Width - tw, g_tooltip.r.Y - 30, tw, 24);
+        fillRR(gr, tr, 6, C(g_light ? 0x14161A : 0x2A303A));
+        txt(gr, g_tooltip.t, tr, F.caption, C(g_light ? 0xFFFFFF : T_TEXT), AL_C, false);
+        g_tooltip.t.clear();
+    }
+    if (g_themeFade && g_themeAnim.active()) {  // theme / accent switch: the old frame fades out on top (200 ms)
+        float a = 1 - g_themeAnim.value();
+        gp::ColorMatrix m = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, a, 0}, {0, 0, 0, 0, 1}}};
+        gp::ImageAttributes ia; ia.SetColorMatrix(&m);
+        gr.DrawImage(g_themeFade, RF(0, 0, W, H), 0, 0, (gp::REAL)g_themeFade->GetWidth(), (gp::REAL)g_themeFade->GetHeight(), gp::UnitPixel, &ia);
+    } else if (g_themeFade) { delete g_themeFade; g_themeFade = nullptr; }
 }
 // ---------- popup painting ----------
 float popHov(int id) { auto it = P.hov.find(id); return it == P.hov.end() ? 0.f : it->second.value(); }
@@ -1661,6 +2426,183 @@ void ensurePopupWindow() {
     P.hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1, g.hwnd, nullptr, g.inst, nullptr);
 }
 
+// ---------- toasts: own top-level layered windows, excluded from capture (SPEC "Toasts") ----------
+// On-screen toasts sit at the top-right of the primary monitor, topmost over games, click-through, ~1 s then a glide out.
+// The in-app "Recording saved" toast sits 16 px inside the preview's top-right with Open / Show in folder.
+void kickToasts();
+struct Toast {
+    HWND hwnd = nullptr;
+    int kind = TK_STARTED;
+    bool inApp = false, closing = false, hover = false, excluded = false;
+    std::wstring title, sub, path;
+    float w = 284, h = 64, x = 0, y = 0;
+    double holdMs = 1000, shownAt = 0, hoverAt = 0, pausedMs = 0;
+    Anim in, out;
+    int hot = 0, pressed = 0;  // H_TOAST_* under the mouse
+    bool testVisible = false;  // --test-toast-visible: no capture exclusion (CI control)
+};
+std::vector<std::unique_ptr<Toast>> g_toasts;
+bool g_affinityWarned = false;
+constexpr DWORD kWdaExclude = 0x11;  // WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+)
+void paintToast(gp::Graphics& gr, const Toast& t) {
+    RF r(0, 0, t.w, t.h);
+    if (t.kind == TK_TEST) { gp::SolidBrush b(gp::Color(255, 255, 0, 255)); gr.FillRectangle(&b, r); return; }
+    for (int i = 8; i >= 1; --i) fillRR(gr, RF(r.X - i, r.Y - i + 4, r.Width + 2.f * i, r.Height + 2.f * i), 14.f + i, gp::Color(g_light ? 4 : 8, 0, 0, 0));
+    fillRR(gr, r, 14, C(T_ELEV));
+    strokeRR(gr, r, 14, t.kind == TK_SAVED ? C(T_OK, 140) : t.kind == TK_ERROR ? C(T_ERR, 140) : WA(A_DEFAULT));
+    if (t.kind == TK_SAVED) {
+        icon(gr, G_CHECKCIRCLE, 16, 16, 20, C(T_OK));
+        txt(gr, t.title, RF(46, 12, t.w - 46 - 40, 28), F.title, C(T_TEXT));
+        txt(gr, t.sub, RF(46, 36, t.w - 46 - 16, 20), F.label, C(T_MUTED));
+        if (t.inApp) {
+            RF ob(46, 70, 84, 30), fb(138, 70, 148, 30);
+            for (int k = 0; k < 2; ++k) {
+                RF b = k ? fb : ob; int id = k ? H_TOAST_FOLDER : H_TOAST_OPEN;
+                fillRR(gr, b, 8, mix(T_INPUT, T_INPUT_H, t.hot == id ? 1.f : 0.f));
+                strokeRR(gr, b, 8, WA(A_DEFAULT));
+                const wchar_t* lbl = k ? L"Show in folder" : L"Open";
+                float tw = txtW(gr, lbl, F.body), x0 = b.X + (b.Width - 22 - tw) / 2;
+                icon(gr, k ? G_FOLDER : G_PLAY, x0, b.Y + 7, 16, C(T_TEXT2));
+                txt(gr, lbl, RF(x0 + 22, b.Y, tw + 4, b.Height), F.body, C(T_TEXT), AL_L, false);
+            }
+        }
+    } else {
+        unsigned ac = t.kind == TK_ERROR ? T_ERR : T_ACC;
+        float cy = t.h / 2;
+        fillCircle(gr, 32, cy, 16, C(ac, 0x29));
+        int gl = t.kind == TK_REPLAY ? G_REPLAY : t.kind == TK_STARTED ? G_RECORD : t.kind == TK_STOPPED ? G_STOP : t.kind == TK_SHOT ? G_SCREENSHOT : G_LOG;
+        icon(gr, gl, 24, cy - 8, 16, C(t.kind == TK_ERROR ? T_ERR : T_ACC_B));
+        if (t.sub.empty()) txt(gr, t.title, RF(58, 0, t.w - 58 - 16, t.h), F.title, C(T_TEXT));
+        else {
+            txt(gr, t.title, RF(58, cy - 20, t.w - 58 - (t.inApp ? 40 : 16), 20), F.title, C(T_TEXT));
+            txt(gr, t.sub, RF(58, cy + 1, t.w - 58 - 16, 18), F.label, C(T_MUTED), AL_L, true, true);
+        }
+    }
+    if (t.inApp) {
+        RF cb(t.w - 34, 10, 24, 24);
+        if (t.hot == H_TOAST_CLOSE) fillRR(gr, cb, 6, WA(A_PRESSED));
+        icon(gr, G_CLOSE, cb.X + 4, cb.Y + 4, 16, C(T_MUTED));
+    }
+}
+int toastHit(const Toast& t, float x, float y) {
+    if (!t.inApp) return 0;
+    if (inRF(RF(t.w - 34, 10, 24, 24), x, y)) return H_TOAST_CLOSE;
+    if (t.kind == TK_SAVED && inRF(RF(46, 70, 84, 30), x, y)) return H_TOAST_OPEN;
+    if (t.kind == TK_SAVED && inRF(RF(138, 70, 148, 30), x, y)) return H_TOAST_FOLDER;
+    return 0;
+}
+const float kToastM = 12.f;  // shadow margin
+float toastScale() { return g.dpi / 96.f; }
+void layoutToasts() {
+    // on-screen: primary monitor work area, top-right, stacking downward 8 px apart
+    MONITORINFO mi{sizeof mi}; GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const float s = toastScale();
+    float sy = mi.rcWork.top / s + 16, ay = 0;
+    RecLayout L = recLayout(clientW(), clientH());
+    POINT org{0, 0}; if (g.hwnd) ClientToScreen(g.hwnd, &org);
+    ay = org.y / s + L.surf.Y + 46;  // below the preview's resolution pill
+    for (auto& t : g_toasts) {
+        if (t->inApp) { t->x = org.x / s + L.surf.X + L.surf.Width - 16 - t->w; t->y = ay; ay += t->h + 8; }
+        else { t->x = mi.rcWork.right / s - 16 - t->w; t->y = sy; sy += t->h + 8; }
+    }
+}
+void renderToast(Toast& t) {
+    if (!t.hwnd) return;
+    const float s = toastScale(), M = kToastM;
+    float o, dx = 0, dy = 0;
+    if (t.closing) { float e = (float)ease(E_IN, t.out.progress()); o = 1 - e; dx = 28 * e; }
+    else { float e = t.in.value(); o = std::max(0.f, std::min(1.f, e)); dy = -8 * (1 - e); }
+    int pw = (int)std::ceil((t.w + 2 * M) * s), ph = (int)std::ceil((t.h + 2 * M) * s);
+    POINT pt{(LONG)std::lround((t.x - M + dx) * s), (LONG)std::lround((t.y - M + dy) * s)};
+    ulw(t.hwnd, pw, ph, &pt, (BYTE)std::lround(255 * o), [&](gp::Graphics& gr) {
+        gr.ScaleTransform(s, s); gr.TranslateTransform(M, M); paintToast(gr, t);
+    });
+}
+void dismissToast(Toast* t) { if (!t->closing) { t->closing = true; t->out.set(0); t->out.go(1, 260, E_IN); if (!t->out.ms) t->out.set(1); kickToasts(); } }
+void openPath(const std::wstring& p) { ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+void showInFolder(const std::wstring& p) {
+    PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(p.c_str());
+    if (pidl) { SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0); ILFree(pidl); }
+    else ShellExecuteW(nullptr, L"open", outputDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    Toast* t = nullptr;
+    for (auto& x : g_toasts) if (x->hwnd == h) t = x.get();
+    if (!t) return DefWindowProcW(h, m, wp, lp);
+    const float s = toastScale();
+    float x = GET_X_LPARAM(lp) / s - kToastM, y = GET_Y_LPARAM(lp) / s - kToastM;
+    switch (m) {
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_NCHITTEST: return t->inApp ? HTCLIENT : HTTRANSPARENT;
+        case WM_SETCURSOR: SetCursor(LoadCursor(nullptr, t->hot ? IDC_HAND : IDC_ARROW)); return TRUE;
+        case WM_MOUSEMOVE: {
+            if (!t->hover) { t->hover = true; t->hoverAt = nowMs(); TRACKMOUSEEVENT tm{sizeof tm, TME_LEAVE, h, 0}; TrackMouseEvent(&tm); }
+            int id = toastHit(*t, x, y);
+            if (id != t->hot) { t->hot = id; renderToast(*t); }
+            return 0;
+        }
+        case WM_MOUSELEAVE: if (t->hover) { t->pausedMs += nowMs() - t->hoverAt; t->hover = false; } t->hot = 0; renderToast(*t); return 0;
+        case WM_LBUTTONDOWN: t->pressed = toastHit(*t, x, y); return 0;
+        case WM_LBUTTONUP: {
+            int id = toastHit(*t, x, y);
+            if (id && id == t->pressed) {
+                if (id == H_TOAST_OPEN) openPath(t->path);
+                else if (id == H_TOAST_FOLDER) showInFolder(t->path);
+                dismissToast(t);
+            }
+            t->pressed = 0;
+            return 0;
+        }
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+bool captureLive() { return g.rec.isActive() || g.replay.running(); }
+Toast* showToast(int kind, const std::wstring& title, const std::wstring& sub, const std::wstring& path, bool inApp, bool testVisible = false) {
+    if (g_renderOnly) return nullptr;
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc{}; wc.lpfnWndProc = ToastProc; wc.hInstance = g.inst; wc.lpszClassName = L"CastRecorderToast"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&wc); reg = true; }
+    auto t = std::make_unique<Toast>();
+    t->kind = kind; t->title = title; t->sub = sub; t->path = path; t->inApp = inApp; t->testVisible = testVisible;
+    if (kind == TK_SAVED) { t->w = 320; t->h = inApp ? 116 : 64; t->holdMs = inApp ? 6000 : 1500; }
+    else if (kind == TK_ERROR) { t->w = 320; t->h = 64; t->holdMs = inApp ? 6000 : 2500; }
+    else if (kind == TK_TEST) { t->w = 240; t->h = 120; t->holdMs = 60000; }
+    else { t->w = sub.empty() ? 240 : 284; t->h = sub.empty() ? 52 : 64; t->holdMs = 1000; }
+    DWORD ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | (inApp ? 0 : WS_EX_TRANSPARENT);
+    t->hwnd = CreateWindowExW(ex, L"CastRecorderToast", L"", WS_POPUP, 0, 0, 1, 1, inApp ? g.hwnd : nullptr, nullptr, g.inst, nullptr);
+    if (!t->hwnd) return nullptr;
+    t->excluded = !testVisible && SetWindowDisplayAffinity(t->hwnd, kWdaExclude);
+    if (!t->excluded && !testVisible) {
+        if (!g_affinityWarned) { cr::appLog(L"toast: WDA_EXCLUDEFROMCAPTURE unavailable (" + std::to_wstring(GetLastError()) + L"); toasts are skipped while capturing"); g_affinityWarned = true; }
+        if (captureLive()) { DestroyWindow(t->hwnd); return nullptr; }  // never let a toast end up in a recording
+    }
+    while (g_toasts.size() >= 4) { DestroyWindow(g_toasts.front()->hwnd); g_toasts.erase(g_toasts.begin()); }
+    t->in.set(0); t->in.go(1, 220, E_OUTEXPO); if (!t->in.ms || kind == TK_TEST) t->in.set(1);
+    t->shownAt = nowMs();
+    Toast* raw = t.get();
+    g_toasts.push_back(std::move(t));
+    layoutToasts();
+    for (auto& x : g_toasts) renderToast(*x);
+    ShowWindow(raw->hwnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(raw->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    kickToasts();
+    return raw;
+}
+void toastTick() {
+    double now = nowMs();
+    bool any = false;
+    for (size_t i = 0; i < g_toasts.size();) {
+        Toast& t = *g_toasts[i];
+        if (!t.closing && !t.hover && now - t.shownAt - t.pausedMs > 220 + t.holdMs) dismissToast(&t);
+        if (t.closing && !t.out.active()) { DestroyWindow(t.hwnd); g_toasts.erase(g_toasts.begin() + i); layoutToasts(); continue; }
+        if (t.in.active() || t.out.active()) renderToast(t);
+        any = true; ++i;
+    }
+    if (!any && g.hwnd) KillTimer(g.hwnd, TIMER_TOAST);
+}
+void kickToasts() { if (g.hwnd) SetTimer(g.hwnd, TIMER_TOAST, 16, nullptr); }
+void relayoutToasts() { if (g_toasts.empty()) return; layoutToasts(); for (auto& t : g_toasts) renderToast(*t); }
+bool appOnScreen() { return g.hwnd && IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd); }
+
 // ---------- preview chips: layered child windows above the swapchain child ----------
 HWND g_chipL = nullptr, g_chipR = nullptr;
 float measureText(const std::wstring& t, gp::Font* f) {
@@ -1751,8 +2693,11 @@ void switchView(int v) {
     if (g.capturing >= 0) endCapture();
     g_viewIdx = v;
     g_view.set(0); g_view.go(1, 150, E_OUT);
+    g_rsearchFocus = false;
+    if (g_edit.hwnd) commitEdit(false);
     g.gprev.setVisible(v == 0 && IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd));
-    if (v == 1) { g.mics = listMicrophones(); g.outs = listOutputDevices(); enumGpus(); }
+    if (v == 2) { g.mics = listMicrophones(); g.outs = listOutputDevices(); enumGpus(); }
+    if (v == 1) scanRecordings();
     updateChips();
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
@@ -1773,8 +2718,8 @@ void toggleSys() {
     else setStatus(g.s.systemMuted ? L"System audio muted" : L"System audio on", toRef(g.s.systemMuted ? T_WARN : T_OK));
 }
 void setSlider(int id, float x) {
-    const float cx = 772;
-    float f = std::max(0.f, std::min(1.f, (x - cx) / 240.f));
+    const float cx = 530;
+    float f = std::max(0.f, std::min(1.f, (x - cx) / 123.f));
     if (id == H_SL_VOL) setMicVolume((int)std::lround(f * 200), false);
     else if (id == H_SL_GATE) { g.s.noiseGateDb = (int)std::lround(-80 + f * 80); applyAudioFx(); InvalidateRect(g.hwnd, nullptr, FALSE); }
 }
@@ -1799,7 +2744,7 @@ UINT currentMods() {
 }
 bool hotkeyKey(UINT vk, bool down) {
     if (g.capturing < 0) return false;
-    Hotkey* dst = g.capturing == 0 ? &g.s.toggleRecord : g.capturing == 1 ? &g.s.pauseToggle : g.capturing == 2 ? &g.s.micMute : &g.s.pttKey;
+    Hotkey* dst = hkSlot(g.capturing);
     UINT mods = currentMods();
     if (isModifierKey(vk)) { g.liveMods = mods; InvalidateRect(g.hwnd, nullptr, FALSE); return true; }
     if (!down && vk != VK_SNAPSHOT) return true;
@@ -1808,16 +2753,14 @@ bool hotkeyKey(UINT vk, bool down) {
     Hotkey hk{mods, vk};
     int idx = g.capturing;
     if (keyName(vk).empty()) { setStatus(L"Key not supported", toRef(T_ERR)); return true; }
-    const Hotkey* all[4] = {&g.s.toggleRecord, &g.s.pauseToggle, &g.s.micMute, &g.s.pttKey};
-    const wchar_t* names[4] = {L"Start / Stop", L"Pause", L"Mic mute", L"Push-to-talk"};
     int clash = -1;
-    for (int k = 0; k < 4; ++k) if (k != idx && hk == *all[k]) clash = k;
+    for (int k = 0; k < 6; ++k) if (k != idx && hk == *hkSlot(k)) clash = k;
     Issue is = validate(hk);
-    bool bad = idx < 3 && is.severity == Severity::Error;  // push-to-talk is polled, not registered: any held combo works
+    bool bad = idx != 3 && is.severity == Severity::Error;  // push-to-talk is polled, not registered: any held combo works
     if (bad || clash >= 0) {
         g.capturing = -1; g.liveMods = 0;
         registerAll();
-        setStatus(W(format(hk)) + (clash >= 0 ? std::wstring(L" is used by ") + names[clash] : L": " + W(is.message)), toRef(T_ERR));
+        setStatus(W(format(hk)) + (clash >= 0 ? std::wstring(L" is already used by ") + kHkNames[clash] : L": " + W(is.message)), toRef(T_ERR));
         InvalidateRect(g.hwnd, nullptr, FALSE);
         return true;
     }
@@ -1832,58 +2775,163 @@ void showWindow() {
     ShowWindow(g.hwnd, IsIconic(g.hwnd) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g.hwnd);
 }
+extern HBITMAP g_back; extern int g_backW, g_backH; extern void* g_backBits;
+void themeChanged() {
+    if (g_back && g_backBits && animationsOn() && g.hwnd && IsWindowVisible(g.hwnd)) {
+        delete g_themeFade;
+        g_themeFade = new gp::Bitmap(g_backW, g_backH, PixelFormat32bppRGB);
+        gp::BitmapData bd; gp::Rect lr(0, 0, g_backW, g_backH);
+        if (g_themeFade->LockBits(&lr, gp::ImageLockModeWrite, PixelFormat32bppRGB, &bd) == gp::Ok) {
+            for (int y = 0; y < g_backH; ++y) memcpy((BYTE*)bd.Scan0 + y * bd.Stride, (BYTE*)g_backBits + (size_t)y * g_backW * 4, (size_t)g_backW * 4);
+            g_themeFade->UnlockBits(&bd);
+        }
+        g_themeAnim.set(0); g_themeAnim.go(1, 200, E_LINEAR);
+    }
+    applyTheme();
+    save();
+    updateChips();
+    relayoutToasts();
+    if (g.hwnd) InvalidateRect(g.hwnd, nullptr, TRUE);
+}
+std::wstring itemPath(int idx) { std::lock_guard<std::mutex> l(g_itemsM); return idx >= 0 && idx < (int)g_items.size() ? g_items[idx].path : std::wstring(); }
+void deleteRecording(const std::wstring& path) {
+    std::wstring msg = L"Move \u201c" + fileNameOf(path) + L"\u201d to the Recycle Bin?";
+    if (MessageBoxW(g.hwnd, msg.c_str(), L"Delete recording", MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2) != IDOK) return;
+    std::wstring from = path; from.push_back(L'\0');  // double-NUL terminated
+    SHFILEOPSTRUCTW op{}; op.hwnd = g.hwnd; op.wFunc = FO_DELETE; op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    int rc = SHFileOperationW(&op);
+    if (rc || op.fAnyOperationsAborted) setStatus(L"Couldn't delete (the file may be open)", toRef(T_ERR));
+    else cr::appLog(L"recordings: moved to Recycle Bin " + path);
+    scanRecordings();
+}
+void startRename(const std::wstring& path) {
+    RF r(0, 0, 0, 0); std::wstring name;
+    {
+        std::lock_guard<std::mutex> l(g_itemsM);
+        auto vis = visibleItems();
+        for (size_t k = 0; k < vis.size(); ++k) if (g_items[vis[k]].path == path) {
+            float W = clientW(), top = 150 + k * 62.f - g_listScroll, nx = colX(W, 40) - 2 + 76;
+            r = RF(nx, top + 7, colX(W, 560) - nx - 16, 22); name = g_items[vis[k]].name;
+        }
+    }
+    if (r.Width > 0) beginEdit(1, r, name, path);
+}
+void ctxAction(int, int action) {
+    std::wstring p = g_ctxPath;
+    if (p.empty()) return;
+    switch (action) {
+        case 0: openPath(p); break;
+        case 1: showInFolder(p); break;
+        case 2: if (lowerExt(p) == L"mkv") queueRemux({p}); else setStatus(L"Already an MP4", toRef(T_TEXT2)); break;
+        case 3: startRename(p); break;
+        case 4: deleteRecording(p); break;
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+void remuxAll() {
+    std::vector<std::wstring> v;
+    { std::lock_guard<std::mutex> l(g_itemsM); for (auto& it : g_items) if (it.ext == L"mkv" && !hasMp4Sibling(it.path)) v.push_back(it.path); }
+    if (v.empty()) { setStatus(L"No MKV files to remux", toRef(T_TEXT2)); return; }
+    queueRemux(v);
+}
 void click(int id) {
-    if (id != H_HK0 && id != H_HK1 && id != H_HK2 && id != H_HKPTT && g.capturing >= 0) endCapture();
+    bool hk = id == H_HK0 || id == H_HK1 || id == H_HK2 || id == H_HKPTT || id == H_HK3 || id == H_HK4;
+    if (!hk && g.capturing >= 0) endCapture();
+    if (id != H_RSEARCH) g_rsearchFocus = false;
     const RF r = regionOf(id);
+    if (id >= R_BASE) {  // Recordings rows: R_BASE + item*4 + part (0 row, 1 play, 2 folder, 3 remux)
+        int item = (id - R_BASE) / 4, part = (id - R_BASE) % 4;
+        std::wstring p = itemPath(item);
+        if (p.empty()) return;
+        if (part == 1) openPath(p);
+        else if (part == 2) showInFolder(p);
+        else if (part == 3) queueRemux({p});
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+        return;
+    }
     switch (id) {
         case H_MIN: ShowWindow(g.hwnd, SW_MINIMIZE); return;
         case H_CLOSE: forceQuit(); return;  // exits; a live recording is stopped and saved first
         case H_MAX: ShowWindow(g.hwnd, IsZoomed(g.hwnd) ? SW_RESTORE : SW_MAXIMIZE); save(); return;
         case H_TAB_REC: switchView(0); return;
-        case H_TAB_SET: switchView(1); return;
+        case H_TAB_RECS: switchView(1); return;
+        case H_TAB_SET: switchView(2); return;
         case H_LOG: case H_STATUSLOG: openLog(); return;
         case H_RECORD: toggleRecording(); break;
         case H_PAUSE: if (g.rec.isActive()) togglePause(); break;
+        case H_SHOT: takeScreenshot(); break;
+        case H_REPLAYPILL: saveReplay(); break;
         case H_MICICON: toggleMic(); break;
         case H_SYSCHIP: toggleSys(); break;
         case H_MICCHIP: openPopup(PK_MIC, H_MICCHIP, r); break;
         case H_SRC:
             if (locked(id)) { setStatus(L"Stop recording to change the source", toRef(T_TEXT2)); break; }
+            stopReplayBuffer();  // restarted on the new source by selectSource -> startWarmup
             openPopup(PK_SOURCE, H_SRC, r); break;
         case H_DD_FPS: case H_DD_QUAL: case H_DD_ENC: case H_DD_GPU: case H_DD_RES: case H_DD_CONT: case H_DD_SYSDEV: case H_DD_MICDEV:
+        case H_DD_REPLAYLEN: case H_DD_FNAME: case H_DD_SHOTFMT:
             if (locked(id)) { setStatus(L"Stop recording to change this", toRef(T_TEXT2)); break; }
             if (id == H_DD_GPU) enumGpus();
+            if (id == H_DD_ENC && g_encChoices.size() <= 1) probeEncoders();
             if (id == H_DD_MICDEV) g.mics = listMicrophones();
             if (id == H_DD_SYSDEV) g.outs = listOutputDevices();
             openPopup(PK_LIST, id, r); break;
-        case H_HK0: case H_HK1: case H_HK2: case H_HKPTT:
+        case H_HK0: case H_HK1: case H_HK2: case H_HKPTT: case H_HK3: case H_HK4:
             if (locked(id)) { setStatus(L"Stop recording to change hotkeys", toRef(T_TEXT2)); break; }
-            g.capturing = id == H_HKPTT ? 3 : id - H_HK0;
+            g.capturing = id == H_HKPTT ? 3 : id == H_HK3 ? 4 : id == H_HK4 ? 5 : id - H_HK0;
             g.liveMods = 0;
             unregisterAll();
             SetFocus(g.hwnd);
             break;
         case H_FOLDERICON: openFolder(); break;
-        case H_PATH: case H_BROWSE: if (!locked(H_BROWSE)) pickFolder(); break;
-        case H_TG_SYS: if (!locked(id)) { g.s.systemAudio = !g.s.systemAudio; save(); restartMeter(); } break;
-        case H_TG_MIC: if (!locked(id)) { g.s.micEnabled = !g.s.micEnabled; save(); restartMeter(); } break;
+        case H_PATH: case H_BROWSE: if (!locked(H_BROWSE)) { pickFolder(); startWatcher(); } break;
+        case H_TG_SYS: if (!locked(id)) { g.s.systemAudio = !g.s.systemAudio; save(); restartMeter(); if (g.replay.running()) restartReplayBuffer(); } break;
+        case H_TG_MIC: if (!locked(id)) { g.s.micEnabled = !g.s.micEnabled; save(); restartMeter(); if (g.replay.running()) restartReplayBuffer(); } break;
         case H_TG_NS: g.s.noiseSuppression = !g.s.noiseSuppression; applyAudioFx(); save(); break;
         case H_TG_MON: g.s.monitoring = !g.s.monitoring; applyAudioFx(); save(); break;
         case H_TG_PTT: g.s.pushToTalk = !g.s.pushToTalk; syncPtt(); save(); break;
+        case H_TG_REMUX: case H_TG_AUTOREMUX:
+            if (locked(id)) { setStatus(L"Stop recording to change this", toRef(T_TEXT2)); break; }
+            g.s.autoRemux = !g.s.autoRemux; save(); encoderSettingsChanged(); break;
+        case H_TG_TRACKS:
+            if (locked(id)) { setStatus(L"Stop recording to change this", toRef(T_TEXT2)); break; }
+            g.s.separateTracks = !g.s.separateTracks; save(); break;
+        case H_TG_REPLAY:
+            if (locked(id)) { setStatus(L"Stop recording to change this", toRef(T_TEXT2)); break; }
+            g.s.replayEnabled = !g.s.replayEnabled; save();
+            if (g.s.replayEnabled) { if (g.warm.running()) g.warm.waitUntilIdle(3000); startReplayBuffer(); }
+            else { stopReplayBuffer(); g.ring.reset(); }
+            break;
+        case H_THEME_DARK: case H_THEME_LIGHT: {
+            std::string t = id == H_THEME_LIGHT ? "light" : "dark";
+            if ((id == H_THEME_LIGHT) != g_light || g.s.theme != t) { g.s.theme = t; themeChanged(); }
+            break;
+        }
         case H_CH_MONO: case H_CH_STEREO:
-            if (!locked(id)) { int c = id == H_CH_MONO ? 1 : 2; if (g.s.channels != c) { g.s.channels = c; save(); } } break;
+            if (!locked(id)) { int c = id == H_CH_MONO ? 1 : 2; if (g.s.channels != c) { g.s.channels = c; save(); if (g.replay.running()) restartReplayBuffer(); } } break;
+        case H_RSEARCH: g_rsearchFocus = true; SetFocus(g.hwnd); kickAnim(); break;
+        case H_REMUXALL: remuxAll(); break;
+        default:
+            if (id >= H_ACC0 && id <= H_ACC5) { int i = id - H_ACC0; if (g.s.accent != kAccents[i].name) { g.s.accent = kAccents[i].name; themeChanged(); } }
+            break;
     }
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 std::vector<int> focusOrder() {
     if (g_viewIdx == 0) {
-        std::vector<int> v = {H_TAB_REC, H_TAB_SET, H_SRC, H_DD_FPS, H_DD_QUAL, H_MICCHIP, H_SYSCHIP};
+        std::vector<int> v = {H_TAB_REC, H_TAB_RECS, H_TAB_SET, H_SRC, H_DD_FPS, H_DD_QUAL};
+        if (g.s.replayEnabled) v.push_back(H_REPLAYPILL);
+        v.insert(v.end(), {H_MICCHIP, H_SYSCHIP, H_SHOT});
         if (uiActive()) v.push_back(H_PAUSE);
         v.push_back(H_RECORD);
         return v;
     }
-    return {H_TAB_REC, H_TAB_SET, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT, H_HK0, H_HK1, H_HK2, H_PATH, H_BROWSE, H_LOG,
-            H_TG_SYS, H_DD_SYSDEV, H_TG_MIC, H_DD_MICDEV, H_SL_VOL, H_TG_NS, H_SL_GATE, H_TG_MON, H_TG_PTT, H_HKPTT, H_CH_MONO};
+    if (g_viewIdx == 1) return {H_TAB_REC, H_TAB_RECS, H_TAB_SET, H_RSEARCH, H_TG_AUTOREMUX, H_REMUXALL};
+    return {H_TAB_REC, H_TAB_RECS, H_TAB_SET, H_DD_ENC, H_DD_GPU, H_DD_RES, H_DD_CONT, H_TG_REMUX, H_TG_REPLAY, H_DD_REPLAYLEN, H_THEME_DARK,
+            H_ACC0, H_ACC0 + 1, H_ACC0 + 2, H_ACC0 + 3, H_ACC0 + 4, H_ACC5,
+            H_TG_SYS, H_DD_SYSDEV, H_TG_MIC, H_DD_MICDEV, H_SL_VOL, H_TG_NS, H_SL_GATE, H_TG_MON, H_HKPTT, H_TG_PTT, H_CH_MONO, H_TG_TRACKS,
+            H_HK0, H_HK1, H_HK2, H_HK3, H_HK4, H_PATH, H_BROWSE, H_LOG, H_DD_FNAME, H_DD_SHOTFMT};
 }
 void moveFocus(int dir) {
     auto v = focusOrder();
@@ -1921,7 +2969,7 @@ void frameTick() {
         if (std::fabs(d - g_meter[k]) > 0.004f) changed = true;
         g_meter[k] = d;
     }
-    bool anim = g_view.active() || g_chan.active() || anyActive(g_tog) || anyActive(g_hov);
+    bool anim = g_view.active() || g_chan.active() || g_themeSeg.active() || g_themeAnim.active() || anyActive(g_tog) || anyActive(g_hov) || anyActive(g_press);
     if (P.kind != PK_NONE) {
         bool pa = P.open.active() || P.close.active() || anyActive(P.hov);
         if (pa || (changed && P.kind == PK_MIC)) renderPopup();
@@ -1935,7 +2983,11 @@ void frameTick() {
     else {
         if (changed) for (auto& r : g_meterRects) invalidateLogical(r);
         if (uiActive()) { invalidateLogical(g_recordRect); invalidateLogical(g_statusRect); }
+        if (g_viewIdx == 0 && g_pillRect.Width > 0) invalidateLogical(g_pillRect);  // replay dot pulse / save spinner
+        static double lastSlow = 0;
+        if (g_viewIdx == 1 && (g_rsearchFocus || g_remuxRun) && t - lastSlow > 100) { lastSlow = t; InvalidateRect(g.hwnd, nullptr, FALSE); }
     }
+    if (g.replaySaving && t - g.replaySaveT > 300 && g_pillRect.Width > 0) invalidateLogical(g_pillRect);
 }
 // ---------- window procedure ----------
 HBITMAP g_back = nullptr; int g_backW = 0, g_backH = 0; void* g_backBits = nullptr;
@@ -1976,7 +3028,7 @@ int ncHit(HWND h, POINT sp) {
         float W = rc.right / s;
         if (inRF(tbBtn(W, 1), x, y)) return HTMAXBUTTON;  // Win11 snap layouts flyout
         if (inRF(tbBtn(W, 0), x, y) || inRF(tbBtn(W, 2), x, y)) return HTCLIENT;
-        if (inRF(RF(150, 7, 68, 26), x, y) || inRF(RF(222, 7, 80, 26), x, y)) return HTCLIENT;
+        for (int i = 0; i < 3; ++i) if (inRF(tabRect(i), x, y)) return HTCLIENT;
         return HTCAPTION;  // double-click toggles maximize
     }
     return HTCLIENT;
@@ -2025,7 +3077,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_ENTERSIZEMOVE: closePopup(false); break;
-    case WM_MOVE: if (P.kind != PK_NONE) closePopup(false); break;
+    case WM_MOVE: if (P.kind != PK_NONE) closePopup(false); relayoutToasts(); break;
     case WM_SHOWWINDOW:
         if (wp) { updatePreview(); SetTimer(h, TIMER_PREVIEW, 500, nullptr); SetTimer(h, TIMER_FRAME, 16, nullptr); }
         else { KillTimer(h, TIMER_PREVIEW); KillTimer(h, TIMER_FRAME); }
@@ -2037,6 +3089,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         g.gprev.setVisible(wp != SIZE_MINIMIZED && IsWindowVisible(h) && g_viewIdx == 0);
         if (wp == SIZE_MINIMIZED) KillTimer(h, TIMER_FRAME); else SetTimer(h, TIMER_FRAME, 16, nullptr);
         updateChips();
+        relayoutToasts();
+        if (g_viewIdx == 1) clampListScroll(clientW(), clientH());
+        if (g_edit.hwnd) commitEdit(false);
         InvalidateRect(h, nullptr, FALSE);
         break;
     case WM_APP + 41:  // GPU preview went live (1) or failed (0)
@@ -2085,6 +3140,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (id == owner || (owner == H_MICCHIP && id == H_MICCHIP)) { g.pressed = H_NONE; return 0; }
         }
         g.pressed = id;
+        if (id != H_NONE && id != H_SL_VOL && id != H_SL_GATE && !locked(id) && !(id == H_PAUSE && !uiActive())) g_press[id].go(1, 70, E_OUT);
         if ((id == H_SL_VOL || id == H_SL_GATE) && !locked(id)) { g_drag = id; g_focus = id; setSlider(id, x); }
         SetCapture(h);
         InvalidateRect(h, nullptr, FALSE);
@@ -2095,6 +3151,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         float x = GET_X_LPARAM(lp) / s, y = GET_Y_LPARAM(lp) / s;
         if (g_drag != H_NONE) { g_drag = H_NONE; save(); g.pressed = H_NONE; InvalidateRect(h, nullptr, FALSE); return 0; }
         int id = hitTest(x, y);
+        if (g.pressed != H_NONE && g_press.count(g.pressed)) g_press[g.pressed].go(0, 160, E_BACK);
         if (id != H_NONE && id == g.pressed) { if (id != H_PAUSE || uiActive()) click(id); }
         else if (id == H_NONE && g.capturing >= 0) endCapture();
         g.pressed = H_NONE;
@@ -2102,10 +3159,50 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEWHEEL:
-        if (P.kind == PK_SOURCE || P.kind == PK_LIST) { PopupProc(P.hwnd, msg, wp, lp); return 0; }
+        if (P.kind == PK_SOURCE || (P.kind == PK_LIST && P.dd != H_CTXMENU)) { PopupProc(P.hwnd, msg, wp, lp); return 0; }
+        if (g_viewIdx == 1) {
+            closePopup(false);
+            if (g_edit.hwnd) commitEdit(true);
+            g_listScroll -= GET_WHEEL_DELTA_WPARAM(wp) / 120.f * 62.f;
+            clampListScroll(clientW(), clientH());
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONDBLCLK: {
+        float x = GET_X_LPARAM(lp) / s, y = GET_Y_LPARAM(lp) / s;
+        int id = hitTest(x, y);
+        if (g_viewIdx == 1 && id >= R_BASE && (id - R_BASE) % 4 == 0) { std::wstring p = itemPath((id - R_BASE) / 4); if (!p.empty()) openPath(p); return 0; }
+        return WndProc(h, WM_LBUTTONDOWN, wp, lp);  // a fast second click on anything else is just a click
+    }
+    case WM_RBUTTONUP: {
+        float x = GET_X_LPARAM(lp) / s, y = GET_Y_LPARAM(lp) / s;
+        int id = hitTest(x, y);
+        if (g_viewIdx == 1 && id >= R_BASE) {
+            closePopup(false);
+            g_ctxPath = itemPath((id - R_BASE) / 4);
+            if (!g_ctxPath.empty()) openPopup(PK_LIST, H_CTXMENU, RF(x, y, 0, 0));
+            return 0;
+        }
+        break;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp;
+        SetTextColor(dc, toRef(T_TEXT)); SetBkColor(dc, toRef(T_INPUT));
+        if (g_edit.br) DeleteObject(g_edit.br);
+        g_edit.br = CreateSolidBrush(toRef(T_INPUT));
+        return (LRESULT)g_edit.br;
+    }
+    case WM_APP + 49: if (g_edit.hwnd && GetFocus() != g_edit.hwnd) commitEdit(true); return 0;
+    case WM_SETTINGCHANGE:
+        if (lp && wcscmp((const wchar_t*)lp, L"ImmersiveColorSet") == 0 && g.s.theme == "auto") { applyTheme(); updateChips(); InvalidateRect(h, nullptr, FALSE); }
         break;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (hotkeyKey((UINT)wp, true)) return 0;
+        if (g_rsearchFocus && msg == WM_KEYDOWN && P.kind == PK_NONE) {
+            if (wp == VK_ESCAPE) { if (g_rsearch.empty()) g_rsearchFocus = false; g_rsearch.clear(); g_listScroll = 0; InvalidateRect(h, nullptr, FALSE); return 0; }
+            if (wp == VK_BACK) { if (!g_rsearch.empty()) g_rsearch.pop_back(); g_listScroll = 0; InvalidateRect(h, nullptr, FALSE); return 0; }
+        }
         if (P.kind != PK_NONE && !P.closing) {
             if (wp == VK_ESCAPE) { closePopup(); return 0; }
             if (wp == VK_UP || wp == VK_DOWN || wp == VK_RETURN) { g_kbUsed = true; popupKey((UINT)wp); return 0; }
@@ -2135,6 +3232,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSCHAR: case WM_CHAR:
         if (g.capturing >= 0) return 0;
         if (P.kind == PK_SOURCE && !P.closing && msg == WM_CHAR && wp >= 32 && wp != 127) { popupType(P.search + (wchar_t)wp); return 0; }
+        if (g_rsearchFocus && msg == WM_CHAR && wp >= 32 && wp != 127) { if (g_rsearch.size() < 80) g_rsearch += (wchar_t)wp; g_listScroll = 0; InvalidateRect(h, nullptr, FALSE); return 0; }
         break;
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE) { if (g.capturing >= 0) endCapture(); closePopup(); }
@@ -2145,9 +3243,15 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == HK_MIC) toggleMic();
         else if (wp == HK_PAUSE) togglePause();
         else if (wp == HK_FOLDER) openFolder();
+        else if (wp == HK_REPLAY) saveReplay();
+        else if (wp == HK_SHOT) takeScreenshot();
+        if (g_hkTestHook) g_hkTestHook((int)wp);
         return 0;
     case WM_TIMER:
         if (wp == TIMER_FRAME) { frameTick(); return 0; }
+        if (wp == TIMER_TOAST) { toastTick(); return 0; }
+        if (wp == TIMER_RESCAN) { KillTimer(h, wp); scanRecordings(); return 0; }
+        if (wp == TIMER_HKTEST) { selftestHotkeysStep(); return 0; }
         if (wp == TIMER_SELFTEST + 1) { KillTimer(h, wp); click(H_CLOSE); return 0; }  // stop + save + exit
         if (wp == TIMER_SELFTEST) { KillTimer(h, TIMER_SELFTEST); selftestSettings(); return 0; }
         if (wp == TIMER_PREVIEW) {
@@ -2168,6 +3272,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     KillTimer(h, TIMER_TICK);
                 }
             } else finishSince = 0;
+            static ULONGLONG lastSize = 0;
+            if (g.rec.isActive() && GetTickCount64() - lastSize >= 1000) {
+                lastSize = GetTickCount64();
+                WIN32_FILE_ATTRIBUTE_DATA fa{};
+                std::wstring f = g.rec.currentFile();
+                if (!f.empty() && GetFileAttributesExW(f.c_str(), GetFileExInfoStandard, &fa)) g_recBytes = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            }
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
@@ -2178,10 +3289,66 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_WARMUP_DONE:
         g.warm.waitUntilIdle(200);
         if (!g.warm.running()) { writeSessionLog(g.warm.result(), L"warm-up (encoder probe cache)"); g.warmLogged = true; }
+        startReplayBuffer();
         return 0;
     case WM_APP_RECORDER_STARTED:
-        if (g.rec.isActive()) playTone(IDR_SND_START);
+        if (g.rec.isActive()) { playTone(IDR_SND_START); showToast(TK_STARTED, L"Recording started", L"", L"", false, false); }
         return 0;
+    case WM_APP_REPLAY_DONE: {
+        g.replay.waitUntilIdle(200);
+        if (g.replay.running()) return 0;
+        const RecordResult& r = g.replay.result();
+        writeSessionLog(r, L"replay buffer session");
+        if (!r.ok && !r.message.empty() && !g.quitting && !g.rec.running()) setStatus(L"Replay buffer stopped: " + r.message, toRef(T_WARN));
+        if (r.windowClosed && !g.rec.running()) {
+            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g_srcTitle.clear(); g.gprev.setTarget(g.target);
+            startReplayBuffer();
+        }
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_APP_REPLAY_SAVED: {
+        std::unique_ptr<ReplaySaved> r((ReplaySaved*)lp);
+        g.replaySaving = false;
+        if (r->ok) {
+            playTone(IDR_SND_REPLAY);
+            cr::appLog(L"replay saved: " + r->path + L" (" + std::to_wstring(r->secs) + L" s)");
+            showToast(TK_REPLAY, lastSavedText(r->secs), fileNameOf(r->path), r->path, false);
+            setStatus(L"Saved " + fileNameOf(r->path), toRef(T_OK));
+            scanRecordings();
+        } else {
+            cr::appLog(L"replay save FAILED: " + r->err);
+            setStatus(L"Couldn't save the replay: " + r->err, toRef(T_ERR));
+            showToast(TK_ERROR, L"Replay not saved", r->err, L"", false);
+        }
+        if (g_hkTestHook) g_hkTestHook(r->ok ? 105 : 205);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_APP_SHOT_SAVED: {
+        std::unique_ptr<ShotSaved> r((ShotSaved*)lp);
+        if (r->ok) {
+            playTone(IDR_SND_SHOT);
+            cr::appLog(L"screenshot saved: " + r->path + L" " + dims(r->w, r->h));
+            showToast(TK_SHOT, L"Screenshot saved", fileNameOf(r->path), r->path, false);
+            setStatus(L"Saved " + fileNameOf(r->path), toRef(T_OK));
+        } else {
+            cr::appLog(L"screenshot FAILED: " + r->err);
+            setStatus(L"Screenshot failed: " + r->err, toRef(T_ERR));
+        }
+        if (g_hkTestHook) g_hkTestHook(r->ok ? 106 : 206);
+        return 0;
+    }
+    case WM_APP_REMUX_DONE: {
+        std::unique_ptr<RemuxDone> r((RemuxDone*)lp);
+        cr::appLog(L"remux " + std::wstring(r->ok ? L"ok: " : L"FAILED: ") + r->in + L" -> " + r->out + (r->ok ? L"" : L" (" + r->err + L")"));
+        if (r->ok) setStatus(L"Remuxed to " + fileNameOf(r->out), toRef(T_OK));
+        else setStatus(L"Remux failed: " + r->err, toRef(T_ERR));
+        scanRecordings();
+        return 0;
+    }
+    case WM_APP_META: InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_APP_DIRCHANGE: SetTimer(h, TIMER_RESCAN, 400, nullptr); return 0;
     case WM_APP_RECORDER_DONE: {
         g.rec.waitUntilIdle(100);
         if (!g.recPending) return 0;  // already handled (e.g. logged by forceQuit)
@@ -2203,9 +3370,22 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (r.dropped) msg2 += L"  \u00b7  " + std::to_wstring(r.dropped) + L" dropped";
             if (!r.encoderFallbacks.empty()) msg2 += L"  \u00b7  " + r.encoderFallbacks.front() + L" failed its test encode, fell back";
             setStatus(msg2, toRef(T_OK));
+            WIN32_FILE_ATTRIBUTE_DATA fa{};
+            unsigned long long sz = GetFileAttributesExW(r.file.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
+            std::wstring sub = fname + L" \u00b7 " + sizeText(sz);
+            if (!g.quitting) {
+                if (appOnScreen()) showToast(TK_SAVED, L"Recording saved", sub, r.file, true);
+                if (!appOnScreen() || GetForegroundWindow() != h) showToast(TK_SAVED, L"Recording saved", sub, r.file, false);
+            }
         } else if (r.abandoned) setStatus(L"Encoder got stuck, file discarded. Restart Cast Recorder to record again.", toRef(T_WARN));
         else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, toRef(T_WARN));
-        else setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), toRef(T_ERR));
+        else {
+            setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), toRef(T_ERR));
+            if (!r.message.empty() && !g.quitting) showToast(TK_ERROR, L"Recording failed", r.message, L"", appOnScreen());
+        }
+        g_recBytes = 0;
+        if (g_hkTestHook) g_hkTestHook(r.ok ? 101 : 201);
+        if (!g.quitting) { startReplayBuffer(); if (g_viewIdx == 1) scanRecordings(); }
         updatePreview();
         InvalidateRect(h, nullptr, FALSE);
         if (g.quitting) DestroyWindow(h);
@@ -2220,6 +3400,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         save();
         closePopup(false);
+        for (auto& t : g_toasts) DestroyWindow(t->hwnd);
+        g_toasts.clear();
+        stopWatcher();
         g.gprev.stop();
         unregisterAll();
         PostQuitMessage(0);
@@ -2233,6 +3416,7 @@ void paintToNull() { gp::Bitmap b(8, 8, PixelFormat32bppPARGB); gp::Graphics gr(
 void selftestSettings() {
     auto pick = [](int dd, int idx) { click(dd); popupActivate(idx); };
     click(H_TAB_REC);
+    paintToNull();
     pick(H_DD_FPS, 1);   // 30 fps
     pick(H_DD_QUAL, 3);  // Ultra
     // Source: open the picker, type into its search box, take the first matching window (CI starts Notepad)
@@ -2244,19 +3428,99 @@ void selftestSettings() {
     cr::appLog(L"selftest: source " + sourceText());
     click(H_TAB_SET);
     paintToNull();
-    pick(H_DD_CONT, 1);  // MKV
+    pick(H_DD_CONT, 1);  // MP4
+    pick(H_DD_RES, 1);   // 1440p
+    if (g_encChoices.size() > 1) pick(H_DD_ENC, (int)g_encChoices.size() - 1);
+    cr::appLog(L"selftest: encoder " + encoderText());
+    if (g.s.autoRemux) click(H_TG_REMUX);      // off
+    if (!g.s.replayEnabled) click(H_TG_REPLAY);  // on
+    pick(H_DD_REPLAYLEN, 2);                     // 1 min
+    paintToNull();
+    pick(H_DD_REPLAYLEN, 7);                     // Custom... -> seconds field
+    if (g_edit.hwnd) { SetWindowTextW(g_edit.hwnd, L"45"); commitEdit(true); }
+    click(H_THEME_LIGHT);
+    paintToNull();
+    click(H_ACC0 + 3);                           // blue
+    if (!g.s.separateTracks) click(H_TG_TRACKS);
+    pick(H_DD_FNAME, 1);                         // date_time
+    pick(H_DD_SHOTFMT, 1);                       // JPG
     if (g.s.systemAudio) click(H_TG_SYS);  // off
     if (!g.s.micEnabled) click(H_TG_MIC);  // on (default microphone)
     if (!g.s.noiseSuppression) click(H_TG_NS);
     if (!g.s.pushToTalk) click(H_TG_PTT);
     if (!g.s.monitoring) click(H_TG_MON);
     click(H_CH_STEREO);
-    setSlider(H_SL_VOL, 772 + 240 * 0.75f);   // 150 %
-    setSlider(H_SL_GATE, 772 + 240 * 0.375f); // -50 dB
+    setSlider(H_SL_VOL, 530 + 123 * 0.75f);    // 150 %
+    setSlider(H_SL_GATE, 530 + 123 * 0.375f);  // -50 dB
     save();
-    g.s.micMute = Hotkey{MOD_CTRL_ | MOD_ALT_, 0x7B}; save();  // Ctrl+Alt+F12
+    g.s.micMute = Hotkey{MOD_CTRL_ | MOD_ALT_, 0x7B};     // Ctrl+Alt+F12
+    g.s.saveReplay = Hotkey{MOD_CTRL_ | MOD_ALT_, 0x76};  // Ctrl+Alt+F7
+    g.s.screenshot = Hotkey{MOD_CTRL_ | MOD_ALT_, 0x75};  // Ctrl+Alt+F6
+    save(); registerAll();
+    click(H_TAB_RECS);
+    paintToNull();
+    cr::appLog(L"selftest: recordings listed " + std::to_wstring(g_items.size()));
     click(H_MAX);
     click(H_CLOSE);
+}
+// CI: every global hotkey through the real path (SendInput -> RegisterHotKey -> WM_HOTKEY -> action).
+std::vector<int> g_hkEvents;
+int g_hkStep = 0, g_hkOk = 0, g_hkFail = 0; ULONGLONG g_hkT0 = 0; bool g_hkSent = false, g_hkMic0 = false;
+void sendCombo(const Hotkey& k) {
+    std::vector<INPUT> in;
+    auto key = [&](WORD vk, bool up) { INPUT i{}; i.type = INPUT_KEYBOARD; i.ki.wVk = vk; i.ki.dwFlags = up ? KEYEVENTF_KEYUP : 0; in.push_back(i); };
+    std::vector<WORD> mods;
+    if (k.mods & MOD_CTRL_) mods.push_back(VK_CONTROL);
+    if (k.mods & MOD_ALT_) mods.push_back(VK_MENU);
+    if (k.mods & MOD_SHIFT_) mods.push_back(VK_SHIFT);
+    if (k.mods & MOD_WIN_) mods.push_back(VK_LWIN);
+    for (WORD m : mods) key(m, false);
+    key((WORD)k.vk, false); key((WORD)k.vk, true);
+    for (auto it = mods.rbegin(); it != mods.rend(); ++it) key(*it, true);
+    UINT n = SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
+    cr::appLog(L"selftest hotkey: sent " + W(format(k)) + L" (" + std::to_wstring(n) + L"/" + std::to_wstring(in.size()) + L" events)");
+}
+bool hkEvent(int e) { return std::find(g_hkEvents.begin(), g_hkEvents.end(), e) != g_hkEvents.end(); }
+void selftestHotkeysStep() {
+    struct Step { const wchar_t* name; int slot; };
+    static const Step steps[] = {{L"Save replay", 4}, {L"Screenshot", 5}, {L"Start", 0}, {L"Pause", 1}, {L"Resume", 1},
+                                 {L"Mic mute", 2}, {L"Mic unmute", 2}, {L"Stop", 0}};
+    const int n = (int)(sizeof steps / sizeof steps[0]);
+    ULONGLONG now = GetTickCount64();
+    if (!g_hkT0) g_hkT0 = now;
+    if (g_hkStep >= n) {
+        KillTimer(g.hwnd, TIMER_HKTEST);
+        cr::appLog(L"selftest-hotkeys: " + std::to_wstring(g_hkOk) + L"/" + std::to_wstring(n) + L" ok");
+        click(H_CLOSE);
+        return;
+    }
+    const Step& st = steps[g_hkStep];
+    if (!g_hkSent) {
+        bool ready = true;
+        if (g_hkStep == 0) ready = g.ring && g.ring->bufferedSeconds() >= 2.0;
+        if (g_hkStep == 3) ready = now - g_hkT0 > 1500;  // let the recording run a moment
+        if (!ready && now - g_hkT0 < 20000) return;
+        g_hkEvents.clear(); g_hkMic0 = g.s.micMuted;
+        sendCombo(*hkSlot(st.slot));
+        g_hkSent = true; g_hkT0 = now;
+        return;
+    }
+    bool done = false;
+    switch (g_hkStep) {
+        case 0: done = hkEvent(105); break;
+        case 1: done = hkEvent(106); break;
+        case 2: done = g.rec.isActive(); break;
+        case 3: done = g.rec.isPaused(); break;
+        case 4: done = g.rec.isActive() && !g.rec.isPaused(); break;
+        case 5: case 6: done = g.s.micMuted != g_hkMic0; break;
+        case 7: done = hkEvent(101); break;
+    }
+    bool timeout = now - g_hkT0 > (g_hkStep == 7 || g_hkStep == 0 ? 20000u : 6000u);
+    if (done || timeout) {
+        cr::appLog(std::wstring(L"selftest hotkey ") + st.name + L" (" + W(format(*hkSlot(st.slot))) + L"): " + (done ? L"ok" : L"FAILED"));
+        (done ? g_hkOk : g_hkFail)++;
+        ++g_hkStep; g_hkSent = false; g_hkT0 = now;
+    }
 }
 
 // Headless render for docs/CI screenshots (PNG or BMP). States: idle | source | settings | recording | micpop
@@ -2268,19 +3532,55 @@ int encoderClsid(const wchar_t* mime, CLSID* out) {
     for (UINT i = 0; i < n; ++i) if (wcscmp(info[i].MimeType, mime) == 0) { *out = info[i].Clsid; return (int)i; }
     return -1;
 }
-int renderUi(const std::wstring& path, const std::wstring& state, int dpi) {
+void fakeRecordings() {
+    struct F { const wchar_t* n; const wchar_t* e; double d; unsigned long long sz; int w, h, fps; int daysAgo, hh, mm; bool rep; };
+    static const F fs[] = {{L"cast_2026-10-14_22-12", L"mp4", 134, 134637158ull, 2560, 1440, 60, 0, 22, 12, false},
+                           {L"replay_22-10-05", L"mp4", 30, 25270681ull, 0, 0, 0, 0, 22, 10, true},
+                           {L"cast_2026-10-14_19-40", L"mkv", 662, 642567372ull, 1920, 1080, 60, 0, 19, 40, false},
+                           {L"cast_2026-10-13_23-05", L"mp4", 2718, 2040109465ull, 2560, 1440, 30, 1, 23, 5, false},
+                           {L"cast_2026-10-13_18-22", L"mkv", 407, 406847488ull, 2560, 1440, 60, 1, 18, 22, false},
+                           {L"cast_2026-10-12_14-02", L"mp4", 115, 64277299ull, 1920, 1080, 30, 2, 14, 2, false},
+                           {L"replay_14-01-30", L"mp4", 30, 23802675ull, 0, 0, 0, 2, 14, 1, true}};
+    std::lock_guard<std::mutex> l(g_itemsM);
+    g_items.clear();
+    SYSTEMTIME now; GetLocalTime(&now);
+    for (auto& f : fs) {
+        RecItem it; it.name = f.n; it.ext = f.e; it.path = outputDir() + L"\\" + f.n + L"." + f.e; it.dur = f.d; it.size = f.sz; it.w = f.w; it.h = f.h; it.fps = f.fps;
+        it.replay = f.rep; it.metaDone = true;
+        SYSTEMTIME t = now; t.wHour = (WORD)f.hh; t.wMinute = (WORD)f.mm; t.wSecond = 0; t.wMilliseconds = 0;
+        FILETIME lf, uf; SystemTimeToFileTime(&t, &lf);
+        ULARGE_INTEGER u; u.LowPart = lf.dwLowDateTime; u.HighPart = lf.dwHighDateTime; u.QuadPart -= (ULONGLONG)f.daysAgo * 864000000000ull;
+        lf.dwLowDateTime = u.LowPart; lf.dwHighDateTime = u.HighPart;
+        LocalFileTimeToFileTime(&lf, &uf); it.mtime = uf;
+        // stand-in thumbnail: a dark gradient like a desktop frame
+        it.tw = 128; it.th = 72; it.thumbPx.resize(128 * 72);
+        for (int y = 0; y < 72; ++y) for (int x = 0; x < 128; ++x) {
+            int r = 0x1C + x / 10 + (f.rep ? 0 : y / 8), gg = 0x20 + y / 12, b = 0x2E + (127 - x) / 8;
+            it.thumbPx[(size_t)y * 128 + x] = 0xFF000000u | (r << 16) | (gg << 8) | b;
+        }
+        g_items.push_back(std::move(it));
+    }
+}
+// Headless render: idle | recording | settings | recordings | replaytoast | savedtoast | source | dropdown | micpop | ctxmenu
+int renderUi(const std::wstring& path, const std::wstring& state, int dpi, const std::wstring& theme) {
     g_renderOnly = true;
     g.dpi = dpi;
+    if (!theme.empty()) g.s.theme = U(theme);
+    else if (g.s.theme == "auto") g.s.theme = "dark";  // CI renders are deterministic
+    applyTheme();
     makeFonts(); makeUiFonts(); loadUiIcons();
     enumGpus();
+    probeEncoders();
     g.mics = listMicrophones(); g.outs = listOutputDevices();
     resolveSource();
     g.status = L"Ready"; g.statusColor = toRef(T_TEXT2);
-    for (int i = 0; i < 3; ++i) g.hkMsgColor[i] = toRef(T_OK);
+    for (int i = 0; i < 6; ++i) g.hkMsgColor[i] = toRef(T_OK);
     g_meter[0] = 0.58f; g_meter[1] = 0.66f;
     g.s.micEnabled = true;  // screenshots show both chips live
+    g.s.replayEnabled = true;
     if (state == L"recording") { g_fakeRec = true; }
-    if (state == L"settings") { g_viewIdx = 1; }
+    if (state == L"settings") { g_viewIdx = 2; g.capturing = 4; }  // Save replay field shows "Press a key..."
+    if (state == L"recordings" || state == L"ctxmenu") { g_viewIdx = 1; fakeRecordings(); }
     updatePreview();
     const float s = scale(), W = 1100, H = 700;
     gp::Bitmap bmp((INT)std::lround(W * s), (INT)std::lround(H * s), PixelFormat32bppARGB);
@@ -2288,18 +3588,27 @@ int renderUi(const std::wstring& path, const std::wstring& state, int dpi) {
         gp::Graphics gr(&bmp);
         setupGraphics(gr, false);
         gr.ScaleTransform(s, s);
+        if (state == L"recordings") { std::lock_guard<std::mutex> l(g_itemsM); g_remuxCur = g_items[4].path; g_remuxInSize = 0; }
         paintAll(gr, W, H);
         RecLayout L = recLayout(W, H);
-        if (state == L"source" || state == L"dropdown" || state == L"micpop") {
-            P.kind = state == L"micpop" ? PK_MIC : PK_SOURCE;
-            P.dd = state == L"micpop" ? H_MICCHIP : H_SRC;
-            P.anchor = state == L"micpop" ? L.mic : L.src;
+        if (state == L"source" || state == L"dropdown" || state == L"micpop" || state == L"ctxmenu") {
+            P.kind = state == L"micpop" ? PK_MIC : state == L"ctxmenu" ? PK_LIST : PK_SOURCE;
+            P.dd = state == L"micpop" ? H_MICCHIP : state == L"ctxmenu" ? H_CTXMENU : H_SRC;
+            P.anchor = state == L"micpop" ? L.mic : state == L"ctxmenu" ? RF(300, 290, 0, 0) : L.src;
+            if (state == L"ctxmenu") g_ctxPath = g_items[2].path;
             layoutPopup();
             P.open.set(1);
             P.kb = -1;
             paintAll(gr, W, H);  // field shows its open state
             gr.TranslateTransform(P.x, P.y);
             drawPopupFrame(gr);
+        }
+        if (state == L"replaytoast" || state == L"savedtoast") {
+            Toast t; t.inApp = true;
+            if (state == L"replaytoast") { t.kind = TK_REPLAY; t.w = 284; t.h = 64; t.title = lastSavedText(30); t.sub = L"replay_22-10-05.mp4"; }
+            else { t.kind = TK_SAVED; t.w = 320; t.h = 116; t.title = L"Recording saved"; t.sub = L"cast_2026-10-14_22-12.mp4 \u00b7 128.4 MB"; }
+            gr.TranslateTransform(L.surf.X + L.surf.Width - 16 - t.w, L.surf.Y + 16 + 30);
+            paintToast(gr, t);
         }
     }
     CLSID cl{};
@@ -2361,20 +3670,35 @@ int runCli(int argc, wchar_t** argv) {
         "  --test-mic           synthetic noisy microphone through the real mic chain (CI)\n"
         "  --noise-suppression on|off / --noise-gate DB (-80 = off) / --mic-volume PCT / --channels 1|2\n"
         "  --list-windows       list capturable windows\n"
-        "  --render-ui FILE.bmp  paint the settings window to a BMP (docs/CI)\n"
-        "  --ui-state idle|source|settings|recording|micpop\n"
+        "  --codec auto|h264|hevc|av1   video codec (Auto: H.264 for MP4; AV1 > HEVC > H.264 for MKV)\n"
+        "  --auto-remux on|off  MKV: remux to MP4 after saving and keep the MP4\n"
+        "  --separate-tracks    three audio tracks: 1 mix, 2 system, 3 mic\n"
+        "  --replay SECONDS     keep an instant-replay buffer (5..900 s) while recording\n"
+        "  --replay-only        buffer only, write no recording (with --save-replay-at)\n"
+        "  --save-replay-at S   save the replay buffer S seconds in; --replay-out FILE.mp4\n"
+        "  --remux IN OUT       stream-copy IN to OUT (no re-encode); --remux-engine mf|ffmpeg\n"
+        "  --screenshot FILE    save a PNG/JPG of the source and exit\n"
+        "  --list-encoders      codec x vendor encoders available on this machine\n"
+        "  --test-toast FILE.png / --test-toast-visible FILE.png  show a magenta toast (excluded from capture, or not),\n"
+        "                       screenshot the screen to FILE.png and count magenta pixels; with --out also record 2 s\n"
+        "  --render-ui FILE.png  paint the window to a PNG/BMP (docs/CI)\n"
+        "  --ui-state idle|source|settings|recording|recordings|replaytoast|savedtoast|micpop|ctxmenu  [--ui-theme dark|light]\n"
         "  --help               show this help\n\n"
         "Exit codes: 0 success, 1 recording failed, 2 invalid arguments.\n";
     auto bad = [&](const std::string& m) { emit("error: " + m + "\n\n" + usage, stderr); return 2; };
 
     double secs = -1;
-    std::wstring renderPath, uiState = L"idle"; int renderDpi = 96;
+    std::wstring renderPath, uiState = L"idle", uiTheme; int renderDpi = 96;
+    bool containerGiven = false, replayOnly = false, testToast = false, toastVisible = false;
+    int replaySecs = 0; double saveReplayAt = -1;
+    std::wstring replayOut, remuxIn, remuxOut, remuxEngine, shotPath, toastShot;
     double pauseAt = -1, resumeAt = -1;
     RecordOptions o;
     Settings s;
     loadFile(U(settingsPath()), s);
     o.fps = s.fps; o.quality = s.quality; o.encoder = s.encoder; o.container = s.container; o.captureCursor = s.captureCursor;
     o.scale = s.scale; o.gpuIndex = s.gpuIndex; o.bitrateCap = s.bitrateCap;
+    o.codec = s.codec; o.autoRemux = false;  // CLI: keep exactly the requested container unless --auto-remux on
     o.systemAudio = false;  // CLI: audio only when asked for
     o.channels = s.channels;
     o.systemId = W(s.systemDevice);
@@ -2406,6 +3730,13 @@ int runCli(int argc, wchar_t** argv) {
         if (a == L"--test-tone") { o.testTone = true; continue; }
         if (a == L"--test-mic") { o.testMic = true; continue; }
         if (a == L"--warmup") { cliWarmup = true; continue; }
+        if (a == L"--separate-tracks") { o.separateTracks = true; continue; }
+        if (a == L"--replay-only") { replayOnly = true; continue; }
+        if (a == L"--list-encoders") {
+            std::string o2;
+            for (auto& c : probeCodecSupport(nullptr)) o2 += U(c.codec) + "\t" + U(c.vendor) + "\t" + (c.hardware ? "hardware" : "software") + "\n";
+            emit(o2, stdout); return 0;
+        }
         if (a == L"--list-sources") {
             std::string o2;
             for (auto& d : listDisplays()) { char b[200]; snprintf(b, sizeof b, "monitor:%d\t%s\t%ldx%ld%s\n", d.index, U(d.device).c_str(), d.rect.right - d.rect.left, d.rect.bottom - d.rect.top, d.primary ? "\tprimary" : ""); o2 += b; }
@@ -2425,10 +3756,37 @@ int runCli(int argc, wchar_t** argv) {
         if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality"
             && a != L"--out" && a != L"--log" && a != L"--scale" && a != L"--gpu" && a != L"--bitrate-cap"
             && a != L"--test-hang-finalize" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--render-pattern" && a != L"--window"
-            && a != L"--source" && a != L"--noise-suppression" && a != L"--noise-gate" && a != L"--mic-volume" && a != L"--channels")
+            && a != L"--source" && a != L"--noise-suppression" && a != L"--noise-gate" && a != L"--mic-volume" && a != L"--channels"
+            && a != L"--codec" && a != L"--auto-remux" && a != L"--replay" && a != L"--save-replay-at" && a != L"--replay-out" && a != L"--remux"
+            && a != L"--remux-engine" && a != L"--screenshot" && a != L"--test-toast" && a != L"--test-toast-visible" && a != L"--ui-theme")
             return bad("unknown option " + U(a));
         if (!value(v)) return bad(U(a) + " needs a value");
-        if (a == L"--window") {
+        if (a == L"--codec") {
+            if (!fromString(v, o.codec)) return bad("--codec must be auto, h264, hevc or av1");
+        } else if (a == L"--auto-remux") {
+            if (v != "on" && v != "off") return bad("--auto-remux must be on or off");
+            o.autoRemux = v == "on";
+        } else if (a == L"--replay") {
+            char* end = nullptr; long d = strtol(v.c_str(), &end, 10);
+            if (v.empty() || !end || *end || d < 5 || d > 900) return bad("--replay must be 5..900 seconds");
+            replaySecs = (int)d;
+        } else if (a == L"--save-replay-at") {
+            char* end = nullptr; double d = strtod(v.c_str(), &end);
+            if (v.empty() || !end || *end || !(d > 0) || d > 86400) return bad("--save-replay-at must be seconds > 0");
+            saveReplayAt = d;
+        } else if (a == L"--replay-out") { replayOut = W(v);
+        } else if (a == L"--remux") {
+            if (i + 1 >= argc) return bad("--remux needs IN and OUT");
+            remuxIn = W(v); remuxOut = argv[++i];
+        } else if (a == L"--remux-engine") {
+            if (v != "mf" && v != "ffmpeg") return bad("--remux-engine must be mf or ffmpeg");
+            remuxEngine = W(v);
+        } else if (a == L"--screenshot") { shotPath = W(v);
+        } else if (a == L"--test-toast" || a == L"--test-toast-visible") { testToast = true; toastVisible = a == L"--test-toast-visible"; toastShot = W(v);
+        } else if (a == L"--ui-theme") {
+            if (v != "dark" && v != "light") return bad("--ui-theme must be dark or light");
+            uiTheme = W(v);
+        } else if (a == L"--window") {
             o.window = findCaptureWindow(W(v));
             if (!o.window) return bad("no capturable window matches '" + v + "' (see --list-windows)");
             o.allDisplays = false; o.monitor = nullptr;
@@ -2468,6 +3826,7 @@ int runCli(int argc, wchar_t** argv) {
             if (!fromString(v, o.encoder)) return bad("unknown --encoder '" + v + "'");
         } else if (a == L"--container") {
             if (!fromString(v, o.container)) return bad("unknown --container '" + v + "'");
+            containerGiven = true;
         } else if (a == L"--quality") {
             if (!fromString(v, o.quality)) return bad("unknown --quality '" + v + "'");
         } else if (a == L"--scale") {
@@ -2497,7 +3856,9 @@ int runCli(int argc, wchar_t** argv) {
             if (v.empty()) return bad("--render-ui needs a .bmp path");
             renderPath = W(v);
         } else if (a == L"--ui-state") {
-            if (v != "idle" && v != "dropdown" && v != "source" && v != "settings" && v != "recording" && v != "micpop") return bad("--ui-state must be idle, source, settings, recording or micpop");
+            if (v != "idle" && v != "dropdown" && v != "source" && v != "settings" && v != "recording" && v != "micpop" && v != "recordings" &&
+                v != "replaytoast" && v != "savedtoast" && v != "ctxmenu")
+                return bad("--ui-state must be idle, source, settings, recording, recordings, replaytoast, savedtoast, micpop or ctxmenu");
             uiState = W(v);
         } else if (a == L"--dpi") {
             char* end = nullptr; long d = strtol(v.c_str(), &end, 10);
@@ -2546,9 +3907,66 @@ int runCli(int argc, wchar_t** argv) {
         gp::GdiplusStartupInput gsi; ULONG_PTR gpTok = 0;
         gp::GdiplusStartup(&gpTok, &gsi, nullptr);
         loadIcons();
-        int rc = renderUi(renderPath, uiState, renderDpi);
+        int rc = renderUi(renderPath, uiState, renderDpi, uiTheme);
         emit(rc == 0 ? "ok=1 render-ui\n" : "ok=0 render-ui\n", stdout);
         return rc == 0 ? 0 : 1;
+    }
+    if (!remuxIn.empty()) {
+        std::wstring err;
+        ULONGLONG t0 = GetTickCount64();
+        bool ok = remuxFile(remuxIn, remuxOut, err, remuxEngine, 120000);
+        char b[160]; snprintf(b, sizeof b, "ok=%d remux_ms=%llu engine=%s\n", ok ? 1 : 0, GetTickCount64() - t0, remuxEngine.empty() ? "auto" : U(remuxEngine).c_str());
+        emit(std::string(b) + "file=" + U(remuxOut) + "\nmessage=" + U(err) + "\n", stdout);
+        return ok ? 0 : 1;
+    }
+    if (!shotPath.empty()) {
+        std::wstring err; int w = 0, h = 0;
+        bool jpg = shotPath.size() > 4 && (_wcsicmp(shotPath.c_str() + shotPath.size() - 4, L".jpg") == 0 || _wcsicmp(shotPath.c_str() + shotPath.size() - 5, L".jpeg") == 0);
+        bool ok = saveScreenshot(o.window, o.monitor, o.allDisplays || (!o.window && !o.monitor), shotPath, jpg, err, &w, &h);
+        char b[160]; snprintf(b, sizeof b, "ok=%d screenshot=%dx%d format=%s\n", ok ? 1 : 0, w, h, jpg ? "jpg" : "png");
+        emit(std::string(b) + "file=" + U(shotPath) + "\nmessage=" + U(err) + "\n", stdout);
+        return ok ? 0 : 1;
+    }
+    if (testToast) {  // CI: is a toast window kept out of what we capture?
+        g.inst = GetModuleHandleW(nullptr);
+        gp::GdiplusStartupInput gsi; ULONG_PTR gpTok = 0;
+        gp::GdiplusStartup(&gpTok, &gsi, nullptr);
+        Toast* t = showToast(TK_TEST, L"", L"", L"", false, toastVisible);
+        auto pump = [](DWORD ms) { ULONGLONG end = GetTickCount64() + ms; while (GetTickCount64() < end) { MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m); Sleep(10); } };
+        pump(700);
+        std::string out = std::string("toast_window=") + (t ? "1" : "0") + " excluded=" + (t && t->excluded ? "1" : "0") + "\n";
+        if (t) { RECT wr{}; GetWindowRect(t->hwnd, &wr); char b[96]; snprintf(b, sizeof b, "toast_rect=%ld,%ld,%ld,%ld\n", wr.left, wr.top, wr.right, wr.bottom); out += b; }
+        std::wstring err; int w = 0, h = 0;
+        bool ok = saveScreenshot(nullptr, nullptr, true, toastShot, false, err, &w, &h);
+        long long magenta = -1;
+        if (ok) {
+            gp::Bitmap* b = gp::Bitmap::FromFile(toastShot.c_str());
+            if (b && b->GetLastStatus() == gp::Ok) {
+                magenta = 0;
+                gp::BitmapData bd; gp::Rect lr(0, 0, (INT)b->GetWidth(), (INT)b->GetHeight());
+                if (b->LockBits(&lr, gp::ImageLockModeRead, PixelFormat32bppARGB, &bd) == gp::Ok) {
+                    for (UINT y = 0; y < bd.Height; ++y) {
+                        const uint32_t* row = (const uint32_t*)((BYTE*)bd.Scan0 + (size_t)y * bd.Stride);
+                        for (UINT x = 0; x < bd.Width; ++x) { uint32_t p = row[x]; if (((p >> 16) & 255) > 230 && ((p >> 8) & 255) < 30 && (p & 255) > 230) ++magenta; }
+                    }
+                    b->UnlockBits(&bd);
+                }
+            }
+            delete b;
+        }
+        char b2[160]; snprintf(b2, sizeof b2, "screenshot_ok=%d %dx%d magenta_px=%lld\n", ok ? 1 : 0, w, h, magenta);
+        out += b2;
+        if (!o.outputPath.empty()) {  // also record 2 s through the real capture path with the toast up
+            Recorder r; o.allDisplays = true; o.window = nullptr; o.monitor = nullptr;
+            o.container = Container::MP4;
+            r.start(o);
+            while (r.running() && !r.started()) pump(5);
+            pump(2000);
+            r.stop(); r.waitUntilIdle(15000);
+            out += std::string("record_ok=") + (r.result().ok ? "1" : "0") + " capture=" + U(r.result().captureUsed) + "\nfile=" + U(r.result().file) + "\n";
+        }
+        emit(out, stdout);
+        return 0;
     }
     if (secs < 0) return bad("--record SECONDS is required");
     if (o.outputPath.empty()) {
@@ -2560,6 +3978,10 @@ int runCli(int argc, wchar_t** argv) {
         DWORD n = GetFullPathNameW(o.outputPath.c_str(), MAX_PATH * 4, full, nullptr);
         if (!n || n >= MAX_PATH * 4) return bad("invalid --out path");
         o.outputPath = full;
+        if (!containerGiven) {  // the saved default is MKV now: --out x.mp4 means MP4
+            std::wstring ext = lowerW(o.outputPath.substr(o.outputPath.find_last_of(L'.') == std::wstring::npos ? o.outputPath.size() : o.outputPath.find_last_of(L'.')));
+            if (ext == L".mp4") o.container = Container::MP4; else if (ext == L".mkv") o.container = Container::MKV; else if (ext == L".mov") o.container = Container::MOV;
+        }
         size_t slash = o.outputPath.find_last_of(L"\\/");
         if (slash == std::wstring::npos || slash + 1 == o.outputPath.size()) return bad("--out must name a file");
         std::wstring dir = o.outputPath.substr(0, slash);
@@ -2582,6 +4004,10 @@ int runCli(int argc, wchar_t** argv) {
     }
     Recorder r;
     { LARGE_INTEGER q; QueryPerformanceCounter(&q); o.pressQpc = q.QuadPart; }
+    std::shared_ptr<ReplayRing> ring;
+    if (replaySecs > 0 || replayOnly || saveReplayAt > 0) { ring = std::make_shared<ReplayRing>(replaySecs > 0 ? replaySecs : 30); o.ring = ring; o.bufferOnly = replayOnly; }
+    if (replayOut.empty()) replayOut = o.outputPath.substr(0, o.outputPath.find_last_of(L'.')) + L"-replay.mp4";
+    std::string replayInfo;
     r.start(o);
     // The duration counts from the first captured frame, so the file is as long as requested.
     while (r.running() && !r.started()) Sleep(5);
@@ -2593,6 +4019,13 @@ int runCli(int argc, wchar_t** argv) {
     while (r.isActive() && GetTickCount64() - t0 < ms) {
         ULONGLONG el = GetTickCount64() - t0;
         if (pauseAt >= 0 && !pausedOnce && el >= (ULONGLONG)(pauseAt * 1000)) { if (r.pause()) { pauseStart = GetTickCount64(); } pausedOnce = true; }
+        if (ring && saveReplayAt > 0 && replayInfo.empty() && el >= (ULONGLONG)(saveReplayAt * 1000)) {
+            double got = 0; std::wstring err;
+            ULONGLONG ts = GetTickCount64();
+            bool ok = ring->save(replayOut, got, err);
+            char b[256]; snprintf(b, sizeof b, "replay_ok=%d replay_seconds=%.2f replay_buffered=%.2f replay_ram=%zu replay_save_ms=%llu\n", ok ? 1 : 0, got, ring->bufferedSeconds(), ring->bytes(), GetTickCount64() - ts);
+            replayInfo = std::string(b) + "replay_file=" + U(replayOut) + "\nreplay_message=" + U(err) + "\n";
+        }
         if (resumeAt >= 0 && pausedOnce && !resumedOnce && el >= (ULONGLONG)(resumeAt * 1000)) {
             if (r.resume() && pauseStart) pausedWall = GetTickCount64() - pauseStart;
             resumedOnce = true;
@@ -2607,7 +4040,8 @@ int runCli(int argc, wchar_t** argv) {
     r.waitUntilIdle(2000);
     for (int i = 0; i < 100 && abandonedFinalizeLive() > 0; ++i) Sleep(50);
     const RecordResult res = r.result();
-    std::string extra = warmInfo + "state=" + std::string(toString(r.state())) + "\n";
+    std::string extra = warmInfo + replayInfo + "state=" + std::string(toString(r.state())) + "\n";
+    extra += "codec=" + U(res.codec) + " audio_tracks=" + std::to_string(res.audioTracks) + "\n";
     if (pausedOnce) { char b[96]; snprintf(b, sizeof b, "paused_ms=%llu pauses=%llu\n", pausedWall, res.pauses); extra += b; }
     if (res.abandoned) {  // same process: MF is poisoned, a second session must be refused
         bool again = r.start(o);
@@ -2622,6 +4056,7 @@ int runCli(int argc, wchar_t** argv) {
              U(res.file).c_str(), U(res.message).c_str());
     emit(std::string(summary) + extra + "encoder_log:\n" + U(res.encoderLog), stdout);
     cr::appLog(L"=== CLI recording ===\n" + W(std::string(summary) + extra) + res.encoderLog);
+    if (replayOnly) return replayInfo.find("replay_ok=1") != std::string::npos ? 0 : 1;
     return res.ok ? 0 : 1;
 }
 
@@ -2637,6 +4072,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     for (int i = 1; i + 1 < argc; ++i) if (wcscmp(argv[i], L"--settings-file") == 0) g_settingsOverride = argv[i + 1];
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-settings") == 0) g_selftest = true;
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-record") == 0) g_selftest = g_selftestRecord = true;
+    for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--selftest-hotkeys") == 0) g_selftest = g_selftestHotkeys = true;
     for (int i = 1; i < argc; ++i)
         // Any option other than --minimized goes to the console CLI, which validates it (never opens the window).
 if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i], L"/?") == 0)) {
@@ -2665,11 +4101,14 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
                    L" from " + g.settingsFile + L": " + settingsSummary(g.s));
     }
     g.s.fps = normalizeFps(g.s.fps);
+    applyTheme();
+    if (g_selftestHotkeys) { g.s.replayEnabled = true; g.s.replaySeconds = 10; g_hkTestHook = [](int e) { g_hkEvents.push_back(e); }; }
     gp::GdiplusStartupInput gsi; ULONG_PTR gpTok = 0;
     gp::GdiplusStartup(&gpTok, &gsi, nullptr);
     loadIcons();
     loadUiIcons();
     enumGpus();
+    probeEncoders();
     g.mics = listMicrophones();  // so a saved microphone shows (and is used) right away
     g.outs = listOutputDevices();
     g.micMuted = g.s.micMuted;
@@ -2678,7 +4117,7 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     startPttThread();
 
     WNDCLASSEXW wc{sizeof wc};
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hIcon = g.icoBig;
@@ -2701,8 +4140,7 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     int w = S(BASE_W), h = S(BASE_H);
     RECT wa = mi.rcWork;
     SetWindowPos(g.hwnd, nullptr, wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(g.hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
+    applyTheme();  // DWM dark/light frame
     int corner = 2; /* DWMWCP_ROUND */
     DwmSetWindowAttribute(g.hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner, sizeof corner);
     MARGINS m{0, 0, 1, 0};
@@ -2718,14 +4156,19 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     g.status = L"Ready";
     ShowWindow(g.hwnd, (minimized || g.s.startMinimized) ? SW_SHOWMINNOACTIVE : g.s.maximized ? SW_MAXIMIZE : SW_SHOW);
     if (g_selftestRecord) PostMessageW(g.hwnd, WM_APP + 5, 0, 0);  // CI cold start: press Record as soon as the loop runs
-    if (g_selftest && !g_selftestRecord) SetTimer(g.hwnd, TIMER_SELFTEST, 4000, nullptr);
+    if (g_selftest && !g_selftestRecord && !g_selftestHotkeys) SetTimer(g.hwnd, TIMER_SELFTEST, 4000, nullptr);
+    if (g_selftestHotkeys) SetTimer(g.hwnd, TIMER_HKTEST, 250, nullptr);
     resolveSource();  // before the preview starts, so it opens on the saved source
     g.gprev.start(g.hwnd, previewRectNow(), g.s.captureCursor);
     if (!IsWindowVisible(g.hwnd)) g.gprev.setVisible(false);
     restartMeter();
+    startWatcher();
+    if (!g.warm.running()) startReplayBuffer();  // otherwise when the warm-up finishes
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    g.replay.stop();
+    if (!g.replay.waitUntilIdle(3000)) g.replay.abort();
     g.rec.stop();
     if (!g.rec.waitUntilIdle(3000)) g.rec.abort();
     g.rec.waitUntilIdle(1000);
