@@ -53,7 +53,14 @@ jobs:
           name: cast-recorder-windows
           path: art
       - name: Install ffmpeg (for ffprobe and MKV remux)
-        run: choco install ffmpeg -y --no-progress
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile $zip
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\ff"
+          $bin = (Get-ChildItem "$env:RUNNER_TEMP\ff" -Recurse -Filter ffprobe.exe | Select-Object -First 1).DirectoryName
+          Add-Content $env:GITHUB_PATH $bin
+          & "$bin\ffprobe.exe" -version | Select-Object -First 1
       - name: Record 4 s with the software encoder
         shell: pwsh
         run: |
@@ -61,8 +68,8 @@ jobs:
           foreach ($c in @('mp4','mkv')) {
             $out = "$env:RUNNER_TEMP\smoke-${{ matrix.fps }}.$c"
             # The runner has a desktop session but no GPU; --allow-synthetic falls back to a test pattern only if screen capture is unavailable.
-            $p = Start-Process $exe.FullName -ArgumentList "--record 4 --fps ${{ matrix.fps }} --encoder software --quality medium --container $c --allow-synthetic --out `"$out`"" -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:RUNNER_TEMP\rec-$c.txt"
-            Get-Content "$env:RUNNER_TEMP\rec-$c.txt"
+            $p = Start-Process $exe.FullName -ArgumentList "--record 4 --fps ${{ matrix.fps }} --encoder software --quality medium --container $c --allow-synthetic --out `"$out`" --log `"$env:RUNNER_TEMP\rec-$c.txt`"" -Wait -PassThru
+            if (Test-Path "$env:RUNNER_TEMP\rec-$c.txt") { Get-Content "$env:RUNNER_TEMP\rec-$c.txt" }
             if ($p.ExitCode -ne 0) { throw "recorder exit code $($p.ExitCode)" }
             if (-not (Test-Path $out)) { throw "$out was not created" }
             $rate = (ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate,r_frame_rate,codec_name,nb_frames -of default=nw=1 $out)
