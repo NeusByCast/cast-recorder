@@ -756,7 +756,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     enableDpiAwareness();
     for (int i = 1; i < argc; ++i)
-        if (wcscmp(argv[i], L"--record") == 0 || wcscmp(argv[i], L"--help") == 0 || wcscmp(argv[i], L"-h") == 0 || wcscmp(argv[i], L"/?") == 0) {
+        // Any option other than --minimized goes to the console CLI, which validates it (never opens the window).
+        if (wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i], L"/?") == 0)) {
             int rc = runCli(argc, argv);
             CoUninitialize();
             return rc;
