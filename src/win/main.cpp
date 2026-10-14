@@ -1288,7 +1288,28 @@ int runCli(int argc, wchar_t** argv) {
         ih.biSize = sizeof ih; ih.biWidth = pw; ih.biHeight = -(LONG)ph; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;
         fh.bfType = 0x4D42; fh.bfOffBits = sizeof fh + sizeof ih; fh.bfSize = fh.bfOffBits + pw * ph * 4;
         FILE* f = _wfopen(patternPath.c_str(), L"wb");
-        bool ok = f && fwrite(&fh, sizeof fh, 1, f) == 1 && fwrite(&ih, sizeof ih, 1, f) == 1 && fwrite(px.data(), 4, px.size(), f) == px.size();
+        bool ok = f != nullptr;
+        if (ok && patternPath.size() > 4 && _wcsicmp(patternPath.c_str() + patternPath.size() - 4, L".yuv") == 0) {
+            // Ideal I420 reference: exact float BT.709 limited range, 2x2 box chroma (independent of our converter).
+            std::vector<uint8_t> yuv((size_t)pw * ph * 3 / 2);
+            auto ch = [&](unsigned x, unsigned y, int k) { return (double)((px[(size_t)y * pw + x] >> (16 - 8 * k)) & 255); };  // k 0=R 1=G 2=B
+            auto c8 = [](double v) { v = v < 0 ? 0 : v > 255 ? 255 : v; return (uint8_t)(v + 0.5); };
+            for (unsigned y = 0; y < ph; ++y)
+                for (unsigned x = 0; x < pw; ++x)
+                    yuv[(size_t)y * pw + x] = c8(16 + (0.2126 * ch(x, y, 0) + 0.7152 * ch(x, y, 1) + 0.0722 * ch(x, y, 2)) * 219 / 255);
+            uint8_t* U = yuv.data() + (size_t)pw * ph; uint8_t* V = U + (size_t)pw * ph / 4;
+            for (unsigned y = 0; y < ph / 2; ++y)
+                for (unsigned x = 0; x < pw / 2; ++x) {
+                    double r = 0, g2 = 0, b = 0;
+                    for (int k = 0; k < 4; ++k) { unsigned xx = 2 * x + (k & 1), yy = 2 * y + (k >> 1); r += ch(xx, yy, 0); g2 += ch(xx, yy, 1); b += ch(xx, yy, 2); }
+                    r /= 4; g2 /= 4; b /= 4;
+                    double yy = 0.2126 * r + 0.7152 * g2 + 0.0722 * b;
+                    U[(size_t)y * (pw / 2) + x] = c8(128 + (b - yy) / 1.8556 * 224 / 255);
+                    V[(size_t)y * (pw / 2) + x] = c8(128 + (r - yy) / 1.5748 * 224 / 255);
+                }
+            ok = fwrite(yuv.data(), 1, yuv.size(), f) == yuv.size();
+        } else
+            ok = ok && fwrite(&fh, sizeof fh, 1, f) == 1 && fwrite(&ih, sizeof ih, 1, f) == 1 && fwrite(px.data(), 4, px.size(), f) == px.size();
         if (f) fclose(f);
         emit(ok ? "ok=1 render-pattern\n" : "ok=0 render-pattern\n", stdout);
         return ok ? 0 : 1;
