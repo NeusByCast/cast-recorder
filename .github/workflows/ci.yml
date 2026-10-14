@@ -238,6 +238,88 @@ jobs:
             if (-not (Select-String -Path $applog -Pattern $pat -Quiet)) { throw "CastRecorder.log lacks '$pat'" }
           }
           Copy-Item $applog rec\CastRecorder.log
+      - name: Cold start (fresh process, no warm-up) x3, GUI cold start, audio stats
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory rec -Force | Out-Null
+          $fps = ${{ matrix.fps }}
+          foreach ($k in 1..3) {
+            $log = "$PWD\rec\cold-$fps-$k.txt"
+            Start-Process $exe -ArgumentList "--record 2 --fps $fps --encoder software --allow-synthetic --test-tone --out `"$PWD\rec\cold-$fps-$k.mp4`" --log `"$log`"" -Wait
+            if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { Get-Content $log; throw "cold recording $k failed" }
+            $ms = [double](Select-String -Path $log -Pattern '^start_ms=([\d.]+)').Matches[0].Groups[1].Value
+            $lat = (Select-String -Path $log -Pattern '^latency=(.*)').Matches[0].Groups[1].Value
+            "CLI cold start #$k : $ms ms  [$lat]"
+            if ($ms -gt 300) { throw "cold press-to-first-frame $ms ms > 300 ms" }
+            if (-not (Select-String -Path $log -Pattern 'audio stats: produced=[1-9]' -Quiet)) { throw "audio stats line empty" }
+          }
+          if ($fps -eq 60) {
+            # GUI: launch, press Record as soon as the message loop runs (warm-up still in flight), stop at 2 s, X
+            $sf = "$env:RUNNER_TEMP\cold-gui.json"
+            New-Item -ItemType Directory "$PWD\rec\gui" -Force | Out-Null
+            @{version=2; fps=60; encoder="software"; outputDir="$PWD\rec\gui"; systemAudio=$false} | ConvertTo-Json | Set-Content $sf
+            $p = Start-Process $exe -ArgumentList "--selftest-record --settings-file `"$sf`"" -PassThru
+            if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "GUI cold-start test hung" }
+            $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
+            $m = Select-String -Path $applog -Pattern 'start_ms=(\d+); latency=\[([^\]]*)' | Select-Object -Last 1
+            if (-not $m) { Get-Content $applog | Select-Object -Last 40; throw "no GUI recording in CastRecorder.log" }
+            $gms = [double]$m.Matches[0].Groups[1].Value
+            "GUI cold start (Record right after launch): $gms ms  [$($m.Matches[0].Groups[2].Value)]"
+            $f = Get-ChildItem "$PWD\rec\gui" -Filter *.mp4 | Select-Object -First 1
+            if (-not $f) { throw "GUI cold-start recording not saved" }
+            & ffmpeg -v error -i $f.FullName -f null - 2>&1 | Tee-Object -Variable fe
+            if ($LASTEXITCODE -ne 0 -or $fe) { throw "GUI recording does not decode cleanly" }
+            if ($gms -gt 300) { throw "GUI cold press-to-first-frame $gms ms > 300 ms" }
+          }
+      - name: Window capture (WGC CreateForWindow), incl. the window closing mid-recording
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory rec -Force | Out-Null
+          $np = Start-Process notepad -PassThru; Start-Sleep 3
+          Start-Process $exe -ArgumentList "--list-windows --log `"$PWD\rec\windows.txt`"" -Wait
+          Get-Content "$PWD\rec\windows.txt"
+          $log = "$PWD\rec\window.txt"; $out = "$PWD\rec\window.mp4"
+          Start-Process $exe -ArgumentList "--window notepad --record 2 --encoder software --out `"$out`" --log `"$log`"" -Wait
+          Get-Content $log | Select-Object -First 8
+          if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { throw "window recording failed" }
+          if (-not (Select-String -Path $log -Pattern 'capture=Windows Graphics Capture \(window\)' -Quiet)) { throw "not a window capture" }
+          & ffmpeg -v error -i $out -f null - 2>&1 | Tee-Object -Variable fe
+          if ($LASTEXITCODE -ne 0 -or $fe) { throw "window recording does not decode" }
+          # close the window 2 s into a 6 s recording: must end early, keep a playable file
+          $log2 = "$PWD\rec\window-closed.txt"; $out2 = "$PWD\rec\window-closed.mp4"
+          $p = Start-Process $exe -ArgumentList "--window notepad --record 6 --encoder software --out `"$out2`" --log `"$log2`"" -PassThru
+          Start-Sleep 3; Stop-Process -Id $np.Id -Force
+          if (-not $p.WaitForExit(20000)) { $p.Kill(); throw "recording did not end after the window closed" }
+          Get-Content $log2 | Select-Object -First 4
+          if (-not (Select-String -Path $log2 -Pattern 'window_closed=1' -Quiet)) { throw "window close not detected" }
+          if (-not (Select-String -Path $log2 -Pattern '^ok=1' -Quiet)) { throw "file not kept after window closed" }
+          $d = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $out2)
+          "duration after close: $d s"
+          if ($d -ge 5.5) { throw "recording did not stop at window close ($d s)" }
+      - name: Persistence through %APPDATA% (non-default values, Cyrillic path, close via WM_CLOSE)
+        if: matrix.fps == 15
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $d = "$env:APPDATA\Cast Recorder"; New-Item -Force -ItemType Directory $d | Out-Null
+          $od = "$env:RUNNER_TEMP\Записи"
+          @{version=2; fps=60; quality="low"; encoder="software"; scale="720p"; container="mov"; systemAudio=$false;
+            micEnabled=$true; micDevice=""; hotkeyToggleRecord="Ctrl+Alt+F1"; hotkeyPause="Ctrl+Alt+F2"; hotkeyMicMute="Ctrl+Alt+F3";
+            outputDir=$od; maximized=$true; pauseTones=$true} | ConvertTo-Json | Set-Content -Encoding utf8 "$d\settings.json"
+          $p = Start-Process $exe -PassThru; Start-Sleep 5
+          [void]$p.CloseMainWindow()
+          if (-not $p.WaitForExit(20000)) { $p.Kill(); throw "app did not exit on WM_CLOSE" }
+          $s = Get-Content "$d\settings.json" -Raw -Encoding utf8 | ConvertFrom-Json
+          $s | Format-List
+          if ($s.fps -ne 60 -or $s.quality -ne 'low' -or $s.container -ne 'mov' -or $s.scale -ne '720p' -or $s.hotkeyToggleRecord -ne 'Ctrl+Alt+F1' -or
+              $s.hotkeyPause -ne 'Ctrl+Alt+F2' -or $s.hotkeyMicMute -ne 'Ctrl+Alt+F3' -or -not $s.maximized -or $s.systemAudio -or -not $s.micEnabled -or
+              $s.outputDir -ne $od -or -not $s.pauseTones) { throw "persistence lost" }
+          $applog = "$d\CastRecorder.log"
+          if (Select-String -Path $applog -Pattern ([regex]::Escape($env:USERNAME + '\')) -Quiet) { throw "user name not redacted in CastRecorder.log" }
+          Copy-Item $applog rec\CastRecorder-15.log -ErrorAction SilentlyContinue
       - name: ffmpeg hijack probe (a fake ffmpeg.exe in the working folder must not run)
         if: matrix.fps == 30
         shell: pwsh
