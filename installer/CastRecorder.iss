@@ -1,6 +1,6 @@
-; Inno Setup 6 script. Build: iscc /DAppVersion=1.0.0 /DBinDir=..\build\Release installer\CastRecorder.iss
+; Inno Setup 6 script. Build: iscc /DAppVersion=1.0.1 /DBinDir=..\build\Release installer\CastRecorder.iss
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.0.1"
 #endif
 #ifndef BinDir
   #define BinDir "..\build\Release"
@@ -51,5 +51,18 @@ Filename: "{app}\CastRecorder.exe"; Description: "Launch Cast Recorder"; Flags: 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/C taskkill /IM CastRecorder.exe /F"; Flags: runhidden; RunOnceId: "KillApp"
 
-[UninstallDelete]
-Type: filesandordirs; Name: "{userappdata}\Cast Recorder"
+[Code]
+// Settings live in %APPDATA%\Cast Recorder. Ask before deleting them; the default is to keep them.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Dir: String;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    Dir := ExpandConstant('{userappdata}\Cast Recorder');
+    if DirExists(Dir) then
+      if SuppressibleMsgBox('Also delete your Cast Recorder settings?' + #13#10 + Dir + #13#10#13#10 +
+                            'Your recordings are not affected.', mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
+        DelTree(Dir, True, True, True);
+  end;
+end;

@@ -98,11 +98,14 @@ bool parse(const std::string& text, Hotkey& out, std::string* err) {
     Hotkey hk;
     std::string t = trim(text);
     if (t.empty()) { out = Hotkey{}; return true; }  // empty = unassigned
-    // Split on '+', but a trailing "+" (e.g. "Ctrl++") means the '=' / Num + key; handle "Num +".
+    if (t.size() > 256) return fail("Hotkey text too long");
+    // Split on '+'. A '+' right after a separator at the end ("Ctrl++") is the plus key (VK_OEM_PLUS, the
+    // '=' / '+' key), and "Num +" is the numpad plus.
     std::vector<std::string> parts;
     std::string cur;
     for (size_t i = 0; i < t.size(); ++i) {
         if (t[i] == '+' && !trim(cur).empty() && !ieq(trim(cur), "num")) { parts.push_back(trim(cur)); cur.clear(); }
+        else if (t[i] == '+' && trim(cur).empty() && !parts.empty() && i + 1 == t.size()) cur = "Plus";
         else cur += t[i];
     }
     if (!trim(cur).empty()) parts.push_back(trim(cur));

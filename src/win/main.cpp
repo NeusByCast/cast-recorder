@@ -17,6 +17,7 @@
 #include "../core/settings.h"
 #include "recorder.h"
 #include "resource.h"
+#include "version.h"
 
 using namespace cr;
 
@@ -649,32 +650,91 @@ int runCli(int argc, wchar_t** argv) {
         freopen("CONOUT$", "w", stderr);
     }
     std::wstring logPath;
-    double secs = 5;
+    // Find --log first so validation errors can be written there too (CI reads the log file).
+    for (int i = 1; i + 1 < argc; ++i) if (wcscmp(argv[i], L"--log") == 0) logPath = argv[i + 1];
+    auto emit = [&](const std::string& text, FILE* stream) {
+        fputs(text.c_str(), stream);
+        fflush(stream);
+        if (!logPath.empty()) if (FILE* f = _wfopen(logPath.c_str(), L"wb")) { fputs(text.c_str(), f); fclose(f); }
+    };
+    const char* usage =
+        "Cast Recorder " CR_VERSION_STR "\n"
+        "Usage: CastRecorder.exe [--minimized]\n"
+        "       CastRecorder.exe --record SECONDS [options]\n\n"
+        "  --record SECONDS     record headless for 0 < SECONDS <= 86400, then exit\n"
+        "  --fps 15|30|60       frame rate (default: saved setting)\n"
+        "  --quality low|medium|high|ultra\n"
+        "  --encoder auto|nvenc|amf|qsv|software\n"
+        "  --container mp4|mkv|mov\n"
+        "  --out FILE           output file (its folder is created if needed)\n"
+        "  --log FILE           also write the result summary to FILE\n"
+        "  --allow-synthetic    use a test pattern if screen capture is unavailable (CI)\n"
+        "  --help               show this help\n\n"
+        "Exit codes: 0 success, 1 recording failed, 2 invalid arguments.\n";
+    auto bad = [&](const std::string& m) { emit("error: " + m + "\n\n" + usage, stderr); return 2; };
+
+    double secs = -1;
     RecordOptions o;
     Settings s;
     loadFile(U(settingsPath()), s);
     o.fps = s.fps; o.quality = s.quality; o.encoder = s.encoder; o.container = s.container; o.captureCursor = s.captureCursor;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
-        auto next = [&]() -> std::string { return i + 1 < argc ? U(argv[++i]) : std::string(); };
-        if (a == L"--record") secs = atof(next().c_str());
-        else if (a == L"--fps") o.fps = atoi(next().c_str());
-        else if (a == L"--encoder") fromString(next(), o.encoder);
-        else if (a == L"--container") fromString(next(), o.container);
-        else if (a == L"--quality") fromString(next(), o.quality);
-        else if (a == L"--out") o.outputPath = W(next());
-        else if (a == L"--allow-synthetic") o.allowSynthetic = true;
-        else if (a == L"--log") logPath = W(next());
+        if (a == L"--help" || a == L"-h" || a == L"/?") { emit(usage, stdout); return 0; }
+        auto value = [&](std::string& out) -> bool {
+            if (i + 1 >= argc) return false;
+            out = U(argv[++i]);
+            return true;
+        };
+        std::string v;
+        if (a == L"--allow-synthetic") { o.allowSynthetic = true; continue; }
+        if (a == L"--minimized") continue;
+        if (a != L"--record" && a != L"--fps" && a != L"--encoder" && a != L"--container" && a != L"--quality" && a != L"--out" && a != L"--log")
+            return bad("unknown option " + U(a));
+        if (!value(v)) return bad(U(a) + " needs a value");
+        if (a == L"--record") {
+            char* end = nullptr;
+            double d = strtod(v.c_str(), &end);
+            if (v.empty() || !end || *end || !(d > 0) || d > 86400) return bad("--record must be a number of seconds between 0 and 86400");
+            secs = d;
+        } else if (a == L"--fps") {
+            if (v != "15" && v != "30" && v != "60") return bad("--fps must be 15, 30 or 60");
+            o.fps = atoi(v.c_str());
+        } else if (a == L"--encoder") {
+            if (!fromString(v, o.encoder)) return bad("unknown --encoder '" + v + "'");
+        } else if (a == L"--container") {
+            if (!fromString(v, o.container)) return bad("unknown --container '" + v + "'");
+        } else if (a == L"--quality") {
+            if (!fromString(v, o.quality)) return bad("unknown --quality '" + v + "'");
+        } else if (a == L"--out") {
+            if (v.empty()) return bad("--out needs a file name");
+            o.outputPath = W(v);
+        }
     }
+    if (secs < 0) return bad("--record SECONDS is required");
     if (o.outputPath.empty()) {
         std::wstring d = s.outputDir.empty() ? defaultOutputDir() : W(s.outputDir);
         SHCreateDirectoryExW(nullptr, d.c_str(), nullptr);
         o.outputPath = d + L"\\cli-test" + W(extension(o.container));
+    } else {
+        wchar_t full[MAX_PATH * 4];
+        DWORD n = GetFullPathNameW(o.outputPath.c_str(), MAX_PATH * 4, full, nullptr);
+        if (!n || n >= MAX_PATH * 4) return bad("invalid --out path");
+        o.outputPath = full;
+        size_t slash = o.outputPath.find_last_of(L"\\/");
+        if (slash == std::wstring::npos || slash + 1 == o.outputPath.size()) return bad("--out must name a file");
+        std::wstring dir = o.outputPath.substr(0, slash);
+        if (dir.size() > 2 || (dir.size() == 2 && dir[1] != L':')) SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        DWORD at = GetFileAttributesW((dir.size() == 2 ? dir + L"\\" : dir).c_str());
+        if (at == INVALID_FILE_ATTRIBUTES || !(at & FILE_ATTRIBUTE_DIRECTORY)) return bad("--out folder doesn't exist and can't be created");
     }
     Recorder r;
     r.start(o);
-    DWORD end = GetTickCount() + (DWORD)(secs * 1000);
-    while (r.running() && GetTickCount() < end) Sleep(20);
+    // The duration counts from the first captured frame, so the file is as long as requested.
+    while (r.running() && !r.started()) Sleep(5);
+    const ULONGLONG ms = (ULONGLONG)(secs * 1000.0);
+    const ULONGLONG end = GetTickCount64() + ms;
+    while (r.running() && GetTickCount64() < end) Sleep(5);
     r.stop();
     r.join();
     const RecordResult& res = r.result();
@@ -682,23 +742,25 @@ int runCli(int argc, wchar_t** argv) {
     snprintf(summary, sizeof summary, "ok=%d frames=%llu duplicated=%llu late=%llu\ncapture=%s\nencoder=%s\nfile=%s\nmessage=%s\n",
              res.ok ? 1 : 0, res.frames, res.duplicated, res.late, U(res.captureUsed).c_str(), U(res.encoderUsed).c_str(),
              U(res.file).c_str(), U(res.message).c_str());
-    fputs(summary, stdout);
-    fflush(stdout);
-    if (!logPath.empty()) {
-        if (FILE* f = _wfopen(logPath.c_str(), L"wb")) { fputs(summary, f); fclose(f); }
-    }
+    emit(summary, stdout);
     return res.ok ? 0 : 1;
 }
 
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    // Only load DLLs from System32 (no current-directory/app-folder DLL planting).
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     enableDpiAwareness();
     for (int i = 1; i < argc; ++i)
-        if (wcscmp(argv[i], L"--record") == 0) { int rc = runCli(argc, argv); CoUninitialize(); return rc; }
+        if (wcscmp(argv[i], L"--record") == 0 || wcscmp(argv[i], L"--help") == 0 || wcscmp(argv[i], L"-h") == 0 || wcscmp(argv[i], L"/?") == 0) {
+            int rc = runCli(argc, argv);
+            CoUninitialize();
+            return rc;
+        }
     bool minimized = false;
     for (int i = 1; i < argc; ++i) if (wcscmp(argv[i], L"--minimized") == 0) minimized = true;
 

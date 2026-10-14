@@ -36,6 +36,7 @@ public:
     void stop();                         // asynchronous request
     void join();
     bool running() const { return running_; }
+    bool started() const { return started_; }  // first frame captured and the clock is running (or failed)
     double elapsedSeconds() const;
     const RecordResult& result() const { return result_; }  // valid after join / DONE message
 
@@ -44,7 +45,7 @@ private:
     RecordOptions opt_;
     RecordResult result_;
     std::thread th_;
-    std::atomic<bool> running_{false}, stop_{false};
+    std::atomic<bool> running_{false}, stop_{false}, started_{false};
     std::atomic<long long> startQpc_{0};
 };
 

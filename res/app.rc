@@ -1,11 +1,12 @@
 #include <winres.h>
 #include "../src/win/resource.h"
+#include "../src/win/version.h"
 // Icon comes from res/icon.ico (see scripts/update-icon.*).
 IDI_APP ICON "icon.ico"
 1 24 "app.manifest"
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION CR_VERSION_MAJOR,CR_VERSION_MINOR,CR_VERSION_PATCH,0
+ PRODUCTVERSION CR_VERSION_MAJOR,CR_VERSION_MINOR,CR_VERSION_PATCH,0
  FILEOS 0x40004L
  FILETYPE 0x1L
 BEGIN
@@ -15,9 +16,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "NeusByCast"
       VALUE "FileDescription", "Cast Recorder"
-      VALUE "FileVersion", "1.0.0"
+      VALUE "FileVersion", CR_VERSION_STR
       VALUE "ProductName", "Cast Recorder"
-      VALUE "ProductVersion", "1.0.0"
+      VALUE "ProductVersion", CR_VERSION_STR
       VALUE "OriginalFilename", "CastRecorder.exe"
     END
   END

@@ -252,13 +252,17 @@ std::wstring exeDir() {
 }
 
 bool remux(const std::wstring& ffmpeg, const std::wstring& in, const std::wstring& out) {
+    // The absolute path goes in lpApplicationName so CreateProcess can't resolve a different ffmpeg.exe.
     std::wstring cmd = L"\"" + ffmpeg + L"\" -hide_banner -loglevel error -y -i \"" + in + L"\" -c copy \"" + out + L"\"";
     STARTUPINFOW si{sizeof si};
     PROCESS_INFORMATION pi{};
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
     buf.push_back(0);
-    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
-    WaitForSingleObject(pi.hProcess, 120000);
+    if (!CreateProcessW(ffmpeg.c_str(), buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
+    if (WaitForSingleObject(pi.hProcess, 120000) == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread);
@@ -271,8 +275,28 @@ bool remux(const std::wstring& ffmpeg, const std::wstring& in, const std::wstrin
 std::wstring findFfmpeg() {
     std::wstring local = exeDir() + L"\\ffmpeg.exe";
     if (GetFileAttributesW(local.c_str()) != INVALID_FILE_ATTRIBUTES) return local;
-    wchar_t p[MAX_PATH];
-    if (SearchPathW(nullptr, L"ffmpeg.exe", nullptr, MAX_PATH, p, nullptr)) return p;
+    // Walk PATH ourselves (SearchPathW checks the current directory first). Only absolute entries
+    // (drive-letter or UNC) are used; empty, ".", and relative entries are skipped.
+    std::vector<wchar_t> env(32768);
+    DWORD n = GetEnvironmentVariableW(L"PATH", env.data(), (DWORD)env.size());
+    if (!n || n >= env.size()) return {};
+    std::wstring path(env.data(), n);
+    size_t pos = 0;
+    while (pos <= path.size()) {
+        size_t sep = path.find(L';', pos);
+        if (sep == std::wstring::npos) sep = path.size();
+        std::wstring dir = path.substr(pos, sep - pos);
+        pos = sep + 1;
+        while (!dir.empty() && (dir.front() == L' ' || dir.front() == L'"')) dir.erase(0, 1);
+        while (!dir.empty() && (dir.back() == L' ' || dir.back() == L'"')) dir.pop_back();
+        bool drive = dir.size() >= 3 && iswalpha(dir[0]) && dir[1] == L':' && (dir[2] == L'\\' || dir[2] == L'/');
+        bool unc = dir.size() >= 3 && dir[0] == L'\\' && dir[1] == L'\\';
+        if (!drive && !unc) continue;
+        if (dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
+        std::wstring cand = dir + L"ffmpeg.exe";
+        DWORD a = GetFileAttributesW(cand.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) return cand;
+    }
     return {};
 }
 
@@ -296,6 +320,7 @@ bool Recorder::start(const RecordOptions& o) {
     opt_.fps = normalizeFps(o.fps);
     result_ = RecordResult{};
     stop_ = false;
+    started_ = false;
     running_ = true;
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
@@ -306,7 +331,7 @@ bool Recorder::start(const RecordOptions& o) {
 void Recorder::stop() { stop_ = true; }
 void Recorder::join() { if (th_.joinable()) th_.join(); }
 double Recorder::elapsedSeconds() const {
-    if (!running_) return 0;
+    if (!running_ || !started_) return 0;
     LARGE_INTEGER q, f;
     QueryPerformanceCounter(&q);
     QueryPerformanceFrequency(&f);
@@ -434,15 +459,24 @@ void Recorder::run() {
         // ---- paced loop ----
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-        LARGE_INTEGER freq, t0;
+        LARGE_INTEGER freq, t0{};
         QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&t0);
-        startQpc_ = t0.QuadPart;
         const LONGLONG dur = 10000000LL / opt_.fps;  // 100 ns units
         long long next = 0;  // frame index
         bool haveFrame = false;
+        // Pre-warm: wait (up to 3 s) for the first captured frame, then start the clock on it, so frame 0
+        // is at t=0 and the file is as long as the recording actually ran.
+        for (int warm = 0; warm < 60 && !stop_ && !haveFrame; ++warm) {
+            bool got = false;
+            if (!src->acquire(ctx.Get(), latest.Get(), 50, got)) { r.message = L"Capture failed"; break; }
+            haveFrame = got;
+        }
+        if (!haveFrame && r.message.empty()) r.message = L"No frame captured within 3 s";
+        QueryPerformanceCounter(&t0);
+        startQpc_ = t0.QuadPart;
+        started_ = true;
         HRESULT whr = S_OK;
-        while (!stop_) {
+        while (!stop_ && haveFrame && r.message.empty()) {
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             long long due = (now.QuadPart - t0.QuadPart) * opt_.fps / freq.QuadPart;  // frames that should exist by now
@@ -462,11 +496,6 @@ void Recorder::run() {
                 continue;
             }
             if (due > next + 1) { r.late += (unsigned long long)(due - next - 1); next = due - 1; }  // fell behind: skip ticks
-            if (!haveFrame) {  // nothing captured yet (static screen at start): do a short blocking acquire
-                bool got = false;
-                if (!src->acquire(ctx.Get(), latest.Get(), 0, got)) { r.message = L"Capture failed"; break; }
-                if (got) haveFrame = true; else { ++next; continue; }
-            }
             if (cursorByGdi) drawCursor(latest.Get(), origin);
             ID3D11Texture2D* t = ring[next % RING].Get();
             ctx->CopySubresourceRegion(t, 0, 0, 0, 0, latest.Get(), 0, &box);
@@ -508,10 +537,15 @@ void Recorder::run() {
             std::wstring ff = findFfmpeg();
             if (!ff.empty() && remux(ff, tmp, opt_.outputPath)) { DeleteFileW(tmp.c_str()); r.file = opt_.outputPath; }
             else {
-                std::wstring mp4 = opt_.outputPath.substr(0, opt_.outputPath.find_last_of(L'.')) + L".mp4";
-                MoveFileExW(tmp.c_str(), mp4.c_str(), MOVEFILE_REPLACE_EXISTING);
-                r.file = mp4;
-                r.message = L"ffmpeg.exe not found, saved as MP4";
+                DeleteFileW(opt_.outputPath.c_str());  // partial output from a failed remux
+                // Replace only the file name's extension, never a dot in a directory name.
+                std::wstring mp4 = opt_.outputPath;
+                size_t slash = mp4.find_last_of(L"\\/"), dot = mp4.find_last_of(L'.');
+                if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash)) mp4.resize(dot);
+                mp4 += L".mp4";
+                if (MoveFileExW(tmp.c_str(), mp4.c_str(), MOVEFILE_REPLACE_EXISTING)) r.file = mp4;
+                else r.file = tmp;  // keep the recording rather than lose it
+                r.message = ff.empty() ? L"ffmpeg.exe not found, saved as MP4" : L"ffmpeg remux failed, saved as MP4";
             }
         }
         r.ok = r.message.empty() || r.message.rfind(L"ffmpeg", 0) == 0;
@@ -519,6 +553,7 @@ void Recorder::run() {
 
     MFShutdown();
     if (SUCCEEDED(hrCo)) CoUninitialize();
+    started_ = true;  // unblock waiters even on failure
     running_ = false;
     if (opt_.notify) PostMessageW(opt_.notify, WM_APP_RECORDER_DONE, 0, 0);
 }

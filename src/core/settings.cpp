@@ -100,9 +100,24 @@ struct Parser {
         if (j[i] != '"') return fail("expected string");
         ++i;
         while (i < j.size()) {
-            char c = j[i++];
+            unsigned char c = (unsigned char)j[i++];
             if (c == '"') return true;
-            if (c != '\\') { o += c; continue; }
+            if (c < 0x20) return fail("control character in string");
+            if (c >= 0x80) {  // validate one UTF-8 sequence (no overlongs, no surrogates, <= U+10FFFF)
+                int n = (c >= 0xC2 && c <= 0xDF) ? 1 : (c >= 0xE0 && c <= 0xEF) ? 2 : (c >= 0xF0 && c <= 0xF4) ? 3 : -1;
+                if (n < 0 || i + n > j.size()) return fail("invalid UTF-8");
+                unsigned char c1 = (unsigned char)j[i];
+                if ((c == 0xE0 && c1 < 0xA0) || (c == 0xED && c1 > 0x9F) || (c == 0xF0 && c1 < 0x90) || (c == 0xF4 && c1 > 0x8F))
+                    return fail("invalid UTF-8");
+                o += (char)c;
+                for (int k = 0; k < n; ++k) {
+                    unsigned char cc = (unsigned char)j[i++];
+                    if ((cc & 0xC0) != 0x80) return fail("invalid UTF-8");
+                    o += (char)cc;
+                }
+                continue;
+            }
+            if (c != '\\') { o += (char)c; continue; }
             if (i >= j.size()) break;
             char e = j[i++];
             switch (e) {
@@ -111,8 +126,12 @@ struct Parser {
                 case 'r': o += '\r'; break; case 't': o += '\t'; break;
                 case 'u': {
                     unsigned cp = 0; if (!hex4(cp)) return false;
-                    if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < j.size() && j[i] == '\\' && j[i + 1] == 'u') {
+                    if (cp == 0) return fail("\\u0000 not allowed");
+                    if (cp >= 0xDC00 && cp <= 0xDFFF) return fail("lone low surrogate");
+                    if (cp >= 0xD800 && cp < 0xDC00) {
+                        if (!(i + 1 < j.size() && j[i] == '\\' && j[i + 1] == 'u')) return fail("lone high surrogate");
                         i += 2; unsigned lo = 0; if (!hex4(lo)) return false;
+                        if (lo < 0xDC00 || lo > 0xDFFF) return fail("lone high surrogate");
                         cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                     }
                     utf8(o, cp); break;
@@ -151,8 +170,18 @@ struct Parser {
         if (j.compare(i, 5, "false") == 0) { i += 5; v.t = Value::Bool; v.b = false; return true; }
         if (j.compare(i, 4, "null") == 0) { i += 4; v.t = Value::Null; return true; }
         if (c == '-' || (c >= '0' && c <= '9')) {
-            size_t st = i; ++i;
-            while (i < j.size() && (std::isdigit((unsigned char)j[i]) || j[i] == '.' || j[i] == 'e' || j[i] == 'E' || j[i] == '+' || j[i] == '-')) ++i;
+            // RFC 8259 number: -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
+            size_t st = i;
+            auto digits = [&] { size_t a = i; while (i < j.size() && std::isdigit((unsigned char)j[i])) ++i; return i > a; };
+            if (j[i] == '-') ++i;
+            if (i < j.size() && j[i] == '0') ++i;
+            else if (!digits()) return fail("invalid number");
+            if (i < j.size() && j[i] == '.') { ++i; if (!digits()) return fail("invalid number"); }
+            if (i < j.size() && (j[i] == 'e' || j[i] == 'E')) {
+                ++i;
+                if (i < j.size() && (j[i] == '+' || j[i] == '-')) ++i;
+                if (!digits()) return fail("invalid number");
+            }
             v.t = Value::Num; v.n = std::strtod(j.substr(st, i - st).c_str(), nullptr); return true;
         }
         if (c == '{' || c == '[') { v.t = Value::Other; return skipValue(); }
@@ -207,7 +236,9 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     auto str = [&](const char* k, std::string& dst) { auto it = m.find(k); if (it != m.end() && it->second.t == Value::Str) { dst = it->second.s; return true; } return false; };
     auto boo = [&](const char* k, bool& dst) { auto it = m.find(k); if (it != m.end() && it->second.t == Value::Bool) dst = it->second.b; };
     auto it = m.find("fps");
-    if (it != m.end() && it->second.t == Value::Num && std::isfinite(it->second.n)) s.fps = normalizeFps((int)it->second.n);
+    // Range-check before converting so huge or negative values can't overflow the int cast.
+    if (it != m.end() && it->second.t == Value::Num && std::isfinite(it->second.n) && it->second.n >= 1 && it->second.n <= 1000)
+        s.fps = normalizeFps((int)it->second.n);
     std::string v;
     if (str("quality", v)) fromString(v, s.quality);
     if (str("encoder", v)) fromString(v, s.encoder);
@@ -216,6 +247,8 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
     Hotkey hk;
     if (str("hotkeyToggleRecord", v) && parse(v, hk) && validate(hk).severity != Severity::Error) s.toggleRecord = hk;
     if (str("hotkeyOpenFolder", v) && parse(v, hk) && validate(hk).severity != Severity::Error) s.openFolder = hk;
+    // Two actions can't share one combo: keep Start/stop and clear the duplicate.
+    if (!s.openFolder.empty() && s.openFolder == s.toggleRecord) s.openFolder = Hotkey{};
     boo("captureCursor", s.captureCursor);
     boo("startMinimized", s.startMinimized);
     out = s;

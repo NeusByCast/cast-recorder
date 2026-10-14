@@ -9,14 +9,16 @@ A lightweight Windows screen recorder built for gaming: GPU capture, hardware H.
 - **GPU capture**: Windows Graphics Capture (Windows 10 1903+), with DXGI Desktop Duplication as the fallback. Frames stay on the GPU on the hardware path.
 - **Hardware encoding** through Media Foundation: NVIDIA NVENC, AMD AMF or Intel QuickSync, with the Microsoft H.264 software encoder as the fallback. *Auto* picks the GPU's encoder.
 - **15, 30 or 60 FPS** at a constant frame rate, plus Low, Medium, High and Ultra quality presets (bitrate scales with resolution × FPS and is capped at 150 Mbit/s).
-- **Containers**: MP4 natively. MKV and MOV are written by remuxing the MP4 losslessly with `ffmpeg.exe` (`-c copy`) if one sits next to the app or on PATH. Otherwise the recording is kept as MP4 and the app tells you so.
+- **Containers**: MP4 natively. MKV and MOV are written by remuxing the MP4 losslessly with `ffmpeg.exe` (`-c copy`) if one sits next to the app or in an absolute PATH folder. The current folder and relative PATH entries are never searched, and ffmpeg is started by its full path. Otherwise the recording is kept as MP4 and the app tells you so.
 - **Hotkeys you press, not pick**: click the field and press any combination, such as `Alt+V`, `Ctrl+Shift+F9`, `Win+PrtSc` or `Ctrl+Num 5`. The combo shows as you type it. You get a warning for reserved shortcuts (Alt+Tab, Win+L, Win+G and so on), for keys that would block typing, for clashes between the two actions, and when another app already owns the combo (`RegisterHotKey` failed). Esc cancels and Backspace clears. Actions: **Start/stop recording** and **Open recordings folder**.
 - **Save folder** defaults to `Videos\Cast Recorder` (`SHGetKnownFolderPath(FOLDERID_Videos)`). You can change it with the native folder picker or reset it to the default.
 - **Borderless dark UI**: custom title bar you can drag, minimize and close (close sends the app to the tray), per-monitor DPI v2, DWM shadow and rounded corners on Windows 11.
 - **Tray icon** that shows a red dot while recording. Its menu has start/stop, open folder, settings and exit.
 - **Settings** save automatically as JSON in `%APPDATA%\Cast Recorder\settings.json`, written atomically.
-- **Installer** (Inno Setup) creates the Start menu entry **Cast Recorder**, so it shows up in Windows search. It also offers an optional desktop shortcut and an optional start-with-Windows (tray) entry, and includes an uninstaller.
+- **Installer** (Inno Setup) creates the Start menu entry **Cast Recorder**, so it shows up in Windows search. It also offers an optional desktop shortcut and an optional start-with-Windows (tray) entry, and includes an uninstaller that asks before deleting your settings (default: keep).
 - Single instance: launching it again brings the window up.
+- Hardening: DLLs load from System32 only (`SetDefaultDllDirectories`, `/DEPENDENTLOADFLAG`), Control Flow Guard, ASLR/DEP. The settings parser is strict (invalid numbers, control characters, invalid UTF-8, lone surrogates and `\u0000` are rejected).
+- Recording starts its clock at the first captured frame, so a 4 s recording is 4 s long.
 
 ## Why native C++ (Win32 + D3D11 + Media Foundation)
 
@@ -31,7 +33,7 @@ A lightweight Windows screen recorder built for gaming: GPU capture, hardware H.
 CastRecorder.exe --record 4 --fps 60 --encoder software --container mkv --quality high --out C:\tmp\test.mkv [--allow-synthetic]
 CastRecorder.exe --minimized      # start in the tray
 ```
-`--record` runs headless, prints the capture method, encoder, frame counts and file, and exits with 0 on success. `--log file` also writes that summary to a file. `--allow-synthetic` falls back to a generated test pattern if screen capture is unavailable (CI only).
+Run `CastRecorder.exe --help` for all options. Invalid values (for example `--fps 25`, `--record 0`, an unknown container or encoder, or an `--out` folder that can't be created) exit with code 2. `--record` runs headless, prints the capture method, encoder, frame counts and file, and exits with 0 on success. `--log file` also writes that summary to a file. `--allow-synthetic` falls back to a generated test pattern if screen capture is unavailable (CI only).
 
 ## Build
 
@@ -56,7 +58,7 @@ cmake -S . -B build-mingw -DCMAKE_TOOLCHAIN_FILE=cmake-mingw.cmake -DCMAKE_BUILD
 
 ## CI
 
-- `ci.yml`: unit tests on Ubuntu, then on `windows-latest` an MSVC Release build, unit tests and the Inno Setup installer, all uploaded as artifacts. A smoke job records 4 s at 15/30/60 FPS to MP4 and MKV with the software encoder, then checks with `ffprobe` that the file exists, is H.264, lasts at least 2.5 s and has the requested average FPS.
+- `ci.yml`: unit tests and Nbc's 55 QA edge-case tests on Ubuntu, then on `windows-latest` an MSVC Release build, unit tests and the Inno Setup installer, all uploaded as artifacts. A smoke job records 4 s at 15/30/60 FPS to MP4 and MKV with the software encoder, then checks with `ffprobe` that the file exists, is H.264, lasts 4 s ± 0.5 s and has the requested average FPS. It also checks CLI argument validation (exit code 2) and runs an ffmpeg-hijack probe (a fake `ffmpeg.exe` in the working folder must be ignored). The recordings are uploaded as artifacts.
 - `release.yml`: on a `v*` tag, builds, tests and attaches the installer and a portable exe to the GitHub Release.
 
 ## Known limits
