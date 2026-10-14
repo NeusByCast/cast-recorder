@@ -3,6 +3,7 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <vector>
 #include "../core/settings.h"
 #include "../core/fsm.h"
 #include "../core/handoff.h"
@@ -33,6 +34,9 @@ struct RecordResult {
     std::wstring file;
     std::wstring encoderUsed;
     std::wstring captureUsed;
+    std::wstring encoderLog;         // per-step HRESULTs: enumeration, probe, MFT setup, drain
+    std::vector<std::wstring> encoderFallbacks;  // hardware encoders that failed the probe / setup
+    bool encoderStalled = false;
     std::wstring pathLog;            // adapter / encoder / zero-copy / drops for diagnostics
     unsigned long long frames = 0, duplicated = 0, late = 0, dropped = 0, pauses = 0, convertFailures = 0;
 };

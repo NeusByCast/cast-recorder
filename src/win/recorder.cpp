@@ -15,10 +15,12 @@
 #include <mfreadwrite.h>
 #include <shlwapi.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <vector>
 #include "capture_wgc.h"
+#include "hwenc.h"
 #include "../core/nv12.h"
 // Last: instantiate the CODECAPI_* GUIDs in this TU only.
 #include <initguid.h>
@@ -326,6 +328,23 @@ struct Writer {
 
         hr = sw->BeginWriting();
         if (FAILED(hr)) { err = hrMsg(L"BeginWriting", hr); return false; }
+        return true;
+    }
+    // Mux-only sink writer for samples already encoded by our own hardware MFT (no transforms inside MF).
+    bool openPassthrough(const std::wstring& path, IMFMediaType* encOut, std::wstring& err) {
+        ComPtr<IMFAttributes> a;
+        MFCreateAttributes(&a, 3);
+        a->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, FALSE);
+        a->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+        a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+        gpu = true;
+        HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, a.Get(), &sw);
+        if (FAILED(hr)) { err = hrMsg(L"MFCreateSinkWriterFromURL(passthrough)", hr); return false; }
+        hr = sw->AddStream(encOut, &stream);
+        if (SUCCEEDED(hr)) hr = sw->SetInputMediaType(stream, encOut, nullptr);
+        if (FAILED(hr)) { err = hrMsg(L"Passthrough stream", hr); return false; }
+        hr = sw->BeginWriting();
+        if (FAILED(hr)) { err = hrMsg(L"BeginWriting(passthrough)", hr); return false; }
         return true;
     }
     HRESULT write(IMFMediaBuffer* buf, LONGLONG t, LONGLONG d) {
@@ -640,43 +659,67 @@ void Recorder::run() {
         scaledSize(opt_.scale, src->w, src->h, W, H);
 
         // ---- encoder selection ----
-        auto vendors = hardwareVendors();
-        bool wantHw = opt_.encoder != Encoder::Software && videoSupport;
-        std::wstring hwVendor;
-        if (wantHw) {
-            const wchar_t* want = vendorId(opt_.encoder);
-            for (auto& v : vendors)
-                if (!want || v.find(want) != std::wstring::npos) { hwVendor = v; break; }
-            if (hwVendor.empty()) wantHw = false;
-            else if (want && adapterVendor && adapterVendor != vendorPci(opt_.encoder)) wantHw = false;  // encoder must live on capture GPU
-        }
+        // Hardware: only encoders registered for THIS device's adapter (MFT_ENUM_ADAPTER_LUID), each one
+        // pre-flight probed with a short real encode; a failing/stalling one is skipped (leaked, not waited on).
+        // Order: requested vendor first (if any), then the other HW encoders on this adapter, then software.
         const std::wstring tmp = opt_.container == Container::MP4 ? opt_.outputPath : opt_.outputPath + L".part.mp4";
-        // Zero-copy: GPU video processor BGRA->NV12 (+scale) feeding the HW MFT through the DXGI manager.
         GpuConvert conv;
-        bool zeroCopy = wantHw && conv.init(dev.Get(), src->w, src->h, W, H);
+        bool zeroCopy = false;
+        std::unique_ptr<HwEncoder> hw;
         Writer wr;
         bool opened = false;
-        if (wantHw) {
-            opened = wr.open(tmp, dev.Get(), W, H, opt_, true, zeroCopy, err);
-            if (!opened && zeroCopy) { wr = Writer{}; DeleteFileW(tmp.c_str()); zeroCopy = false; opened = wr.open(tmp, dev.Get(), W, H, opt_, true, false, err); }
-            if (opened) r.encoderUsed = std::wstring(vendorLabel(hwVendor)) + L" (hardware)";
-            else { wr = Writer{}; DeleteFileW(tmp.c_str()); zeroCopy = false; }
+        std::wstring& elog = r.encoderLog;
+        if (opt_.encoder != Encoder::Software && videoSupport) {
+            auto encs = hwEncodersForDevice(dev.Get(), elog);
+            const UINT want = vendorPci(opt_.encoder);
+            std::stable_sort(encs.begin(), encs.end(), [want](const HwEncoderInfo& a, const HwEncoderInfo& b) {
+                return (want && a.pciVendor == want) > (want && b.pciVendor == want);
+            });
+            if (!encs.empty() && conv.init(dev.Get(), src->w, src->h, W, H)) {
+                for (auto& e : encs) {
+                    elog += L"probe " + e.name + L"\n";
+                    if (!probeHwEncoder(dev.Get(), e, W, H, opt_.fps, 2500, elog)) { r.encoderFallbacks.push_back(e.name); continue; }
+                    auto enc = std::make_unique<HwEncoder>();
+                    unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
+                    if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog)) {
+                        hw = std::move(enc); zeroCopy = true; opened = true;
+                        r.encoderUsed = std::wstring(vendorLabel(e.vendor)) + L" (hardware)";
+                        break;
+                    }
+                    enc->release();
+                    r.encoderFallbacks.push_back(e.name);
+                }
+            } else if (!encs.empty()) elog += L"GPU NV12 conversion unavailable: hardware path skipped\n";
         }
         if (!opened) {
-            zeroCopy = false;
+            conv = GpuConvert{};
             opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
             r.encoderUsed = L"Software (Media Foundation H.264)";
-            if (opt_.encoder != Encoder::Software && opt_.encoder != Encoder::Auto) r.encoderUsed += L", requested encoder unavailable";
+            if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
         }
         if (!opened) { wr = Writer{}; DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
         const bool scaling = W != (src->w & ~1u) || H != (src->h & ~1u);
         if (!zeroCopy && scaling) {  // CPU / RGB path can't scale: encode native instead
-            // (re-open at native size keeps output correct; zero-copy path is the fast one)
             wr = Writer{}; DeleteFileW(tmp.c_str());
             W = src->w & ~1u; H = src->h & ~1u;
-            opened = wr.open(tmp, dev.Get(), W, H, opt_, wantHw && r.encoderUsed.find(L"hardware") != std::wstring::npos, false, err);
+            opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
             if (!opened) { wr = Writer{}; DeleteFileW(tmp.c_str()); r.message = L"Encoder: " + err; return; }
         }
+        // Encoded-sample sink for the hardware path: the MP4 writer is opened on the first output so it gets the
+        // encoder's final output type (sequence header).
+        HRESULT muxHr = S_OK;
+        auto muxOut = [&](IMFSample* es) -> HRESULT {
+            if (!wr.sw) {
+                ComPtr<IMFMediaType> ot = hw->currentOutputType();
+                std::wstring e2;
+                if (!wr.openPassthrough(tmp, ot.Get(), e2)) { wr = Writer{}; muxHr = E_FAIL; err = e2; return E_FAIL; }
+            }
+            HRESULT h2 = wr.sw->WriteSample(wr.stream, es);
+            if (FAILED(h2)) muxHr = h2;
+            return h2;
+        };
+        LONGLONG lastOutTick = 0;
+        unsigned long long lastOutCount = 0;
 
         // ---- textures ----
         D3D11_TEXTURE2D_DESC td{};
@@ -702,7 +745,7 @@ void Recorder::run() {
         if (zeroCopy) {
             if (FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return; }
         }
-        if (!wr.gpu) {
+        if (!zeroCopy) {
             D3D11_TEXTURE2D_DESC sd = ed; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             if (FAILED(dev->CreateTexture2D(&sd, nullptr, &staging))) { r.message = L"CreateTexture2D(staging) failed"; return; }
         }
@@ -804,10 +847,8 @@ void Recorder::run() {
                     }
                 }
                 if (FAILED(whr)) { r.message = hrMsg(L"CPU fallback", whr); break; }
-            } else if (wr.gpu) {
-                ctx->CopySubresourceRegion(t, 0, 0, 0, 0, latest.Get(), 0, &box);
-                whr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), t, 0, FALSE, &buf);
-                if (SUCCEEDED(whr)) { ComPtr<IMF2DBuffer> b2; if (SUCCEEDED(buf.As(&b2))) { DWORD len = 0; b2->GetContiguousLength(&len); buf->SetCurrentLength(len); } }
+            } else if (zeroCopy) {
+                // (GPU path handled above)
             } else {
                 ctx->CopySubresourceRegion(t, 0, 0, 0, 0, latest.Get(), 0, &box);
                 ctx->CopyResource(staging.Get(), t);
@@ -824,9 +865,20 @@ void Recorder::run() {
                     ctx->Unmap(staging.Get(), 0);
                 }
             }
-            if (SUCCEEDED(whr) && buf) whr = wr.write(buf.Get(), next * dur, dur);
+            bool counted = buf != nullptr;
+            if (SUCCEEDED(whr) && buf && hw) {
+                ComPtr<IMFSample> smp;
+                whr = MFCreateSample(&smp);
+                if (SUCCEEDED(whr)) { smp->AddBuffer(buf.Get()); smp->SetSampleTime(next * dur); smp->SetSampleDuration(dur); whr = hw->encode(smp.Get(), muxOut); }
+                if (whr == S_FALSE) { whr = S_OK; counted = false; ++r.dropped; }  // encoder backpressure: drop, never block
+                if (FAILED(muxHr)) whr = muxHr;
+                // Runtime stall guard: no encoded output for 2 s while we keep feeding -> end cleanly (no hang).
+                LARGE_INTEGER nw; QueryPerformanceCounter(&nw);
+                if (hw->outputs != lastOutCount || !lastOutTick) { lastOutCount = hw->outputs; lastOutTick = nw.QuadPart; }
+                else if (nw.QuadPart - lastOutTick > 2 * freq.QuadPart) { r.message = L"Hardware encoder stopped responding - recording ended early"; r.encoderStalled = true; break; }
+            } else if (SUCCEEDED(whr) && buf) whr = wr.write(buf.Get(), next * dur, dur);
             if (FAILED(whr)) { r.message = hrMsg(L"WriteSample", whr); break; }
-            if (buf) ++r.frames;
+            if (counted) ++r.frames;
             ++next;
             bool got = false;
             if (!src->acquire(ctx.Get(), latest.Get(), 0, got)) { r.message = L"Capture failed"; break; }
@@ -834,6 +886,12 @@ void Recorder::run() {
         }
         if (timer) CloseHandle(timer);
         fsm_.beginFinish();
+        if (hw) {
+            if (!hw->drain(muxOut, 1500)) { elog += L"drain: timed out, encoder leaked\n"; hw->leak(); }
+            else hw->release();
+            hw.reset();
+            if (!wr.sw) r.frames = 0;  // nothing ever came out of the encoder
+        }
 
         {   // diagnostics: effective path
             wchar_t b[512];
@@ -852,7 +910,7 @@ void Recorder::run() {
                 std::thread closer([raw, closed] { delete raw; closed->store(true); });
                 for (int i = 0; i < 40 && !closed->load(); ++i) Sleep(50);  // ~2 s
                 if (closed->load()) closer.join();
-                else { abandon_.abandon(); abandonedMf = true; closer.detach(); }
+                else closer.detach();  // capture objects only (not MF): leak them, don't poison the encoder
             }
         }
 

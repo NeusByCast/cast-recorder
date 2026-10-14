@@ -35,7 +35,7 @@ target_link_libraries(cr_handoff PRIVATE Threads::Threads)
 add_test(NAME handoff COMMAND cr_handoff WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 if(WIN32)
-  add_executable(CastRecorder WIN32 src/win/main.cpp src/win/recorder.cpp src/win/capture_wgc.cpp res/app.rc)
+  add_executable(CastRecorder WIN32 src/win/main.cpp src/win/recorder.cpp src/win/hwenc.cpp src/win/preview.cpp src/win/capture_wgc.cpp res/app.rc)
   target_compile_definitions(CastRecorder PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_link_libraries(CastRecorder PRIVATE cr_core d3d11 dxgi mfplat mfreadwrite mfuuid ole32 shell32 shlwapi uuid dwmapi user32 gdi32 winmm)
   if(MSVC)

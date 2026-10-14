@@ -17,6 +17,7 @@
 #include "../core/hotkey.h"
 #include "../core/settings.h"
 #include "recorder.h"
+#include "preview.h"
 #include "resource.h"
 #include "version.h"
 #include "click_wav.h"
@@ -117,6 +118,7 @@ struct App {
     HBITMAP prevBmp{};
     int prevW = 0, prevH = 0;
     bool prevLive = false;
+    GpuPreview gprev;           // GPU swapchain preview (child window); GDI thumbnail is the fallback
     bool trayAdded = false, quitting = false;
     UINT taskbarCreated = 0;
 } g;
@@ -241,7 +243,7 @@ void playClick() {
 // Cheap GDI thumbnail of the primary monitor into a small DIB. Runs at ~2 fps idle and is frozen while
 // recording so it never competes with the capture/encode path or a game for GPU time.
 void updatePreview() {
-    if (g.rec.running()) return;
+    if (g.rec.running() || g.gprev.live()) return;
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     if (sw <= 0 || sh <= 0) return;
     int tw = S(400), th = tw * 9 / 16;
@@ -268,6 +270,20 @@ void updatePreview() {
 }
 
 // ---------- recording ----------
+// Per-recording diagnostics: <output folder>\CastRecorder.log (appended): path, encoder probe/setup HRESULTs.
+void writeSessionLog(const RecordResult& r) {
+    std::wstring path = outputDir() + L"\\CastRecorder.log";
+    FILE* f = _wfopen(path.c_str(), L"ab");
+    if (!f) return;
+    wchar_t ts[64]; time_t t = time(nullptr); tm lt{}; localtime_s(&lt, &t); wcsftime(ts, 64, L"%Y-%m-%d %H:%M:%S", &lt);
+    std::wstring txt = std::wstring(L"=== ") + ts + L" ===\r\nok=" + (r.ok ? L"1" : L"0") + L" frames=" + std::to_wstring(r.frames) +
+                       L" dropped=" + std::to_wstring(r.dropped) + L"\r\ncapture=" + r.captureUsed + L"\r\nencoder=" + r.encoderUsed +
+                       L"\r\npath=" + r.pathLog + L"\r\nmessage=" + r.message + L"\r\n" + r.encoderLog + L"\r\n";
+    std::string u = U(txt);
+    fwrite(u.data(), 1, u.size(), f);
+    fclose(f);
+}
+
 void forceQuit() {
     g.quitting = true;
     g.rec.stop();
@@ -301,6 +317,7 @@ void startRecording() {
     o.outputPath = dir + L"\\" + name + W(extension(g.s.container));
     registerAll();
     if (!g.rec.start(o)) { setStatus(L"Already recording", C_WARN); return; }
+    g.gprev.setRecording(true);
     playClick();
     SetTimer(g.hwnd, TIMER_TICK, 250, nullptr);
     setStatus(L"Recording\u2026", C_ACCENT_B);
@@ -504,6 +521,17 @@ void paintTitle(HDC dc, const Layout& L) {
     addRegion(rmin, H_MIN);
     addRegion(rclose, H_CLOSE);
 }
+
+RECT previewSurf(const Layout& L) {
+    RECT in{L.preview.left + S(8), L.preview.top + S(8), L.preview.right - S(8), L.preview.bottom - S(8)};
+    int iw = in.right - in.left, ih = in.bottom - in.top;
+    int sw = iw, sh = iw * 9 / 16;
+    if (sh > ih) { sh = ih; sw = ih * 16 / 9; }
+    RECT surf{in.left + (iw - sw) / 2, in.top + (ih - sh) / 2, 0, 0};
+    surf.right = surf.left + sw; surf.bottom = surf.top + sh;
+    return surf;
+}
+RECT previewRectNow() { RECT c{}; GetClientRect(g.hwnd, &c); return previewSurf(layout(c)); }
 
 void paintPreview(HDC dc, const Layout& L) {
     bool rec = g.rec.running(), paused = g.rec.isPaused();
@@ -846,12 +874,23 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         RECT* r = (RECT*)lp;
         SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
         updatePreview();
+        g.gprev.setRect(previewRectNow());
         return 0;
     }
     case WM_SHOWWINDOW:
         if (wp) { updatePreview(); SetTimer(h, TIMER_PREVIEW, 500, nullptr); }
         else KillTimer(h, TIMER_PREVIEW);  // hidden to tray: no preview work at all
+        g.gprev.setVisible(wp != 0);
         break;
+    case WM_SIZE:
+        g.gprev.setRect(previewRectNow());
+        g.gprev.setVisible(wp != SIZE_MINIMIZED && IsWindowVisible(h));
+        break;
+    case WM_APP + 41:  // GPU preview went live (1) or failed (0)
+        if (wp) g.gprev.setVisible(IsWindowVisible(h) && !IsIconic(h));
+        else { if (g.gprev.hwnd()) ShowWindow(g.gprev.hwnd(), SW_HIDE); updatePreview(); }
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -963,12 +1002,15 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         g.rec.waitUntilIdle(100);
         KillTimer(h, TIMER_TICK);
         const RecordResult& r = g.rec.result();
+        g.gprev.setRecording(false);
+        writeSessionLog(r);
         if (r.ok) {
             size_t k = r.file.find_last_of(L'\\');
             std::wstring msg2 = L"Saved " + (k == std::wstring::npos ? r.file : r.file.substr(k + 1)) + L"  \u00b7  " + r.encoderUsed;
             if (!r.message.empty()) msg2 += L"  \u00b7  " + r.message;
             if (r.cpuFallback) msg2 += L"  \u00b7  GPU conversion failed, finished on CPU";
             if (r.dropped) msg2 += L"  \u00b7  " + std::to_wstring(r.dropped) + L" dropped";
+            if (!r.encoderFallbacks.empty()) msg2 += L"  \u00b7  " + r.encoderFallbacks.front() + L" failed its test encode, fell back";
             setStatus(msg2, C_OK);
         } else if (r.abandoned) setStatus(L"Encoder got stuck, file discarded. Restart Cast Recorder to record again.", C_WARN);
         else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, C_WARN);
@@ -990,6 +1032,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ShowWindow(h, SW_HIDE);
         return 0;
     case WM_DESTROY:
+        g.gprev.stop();
         unregisterAll();
         if (g.trayAdded) { NOTIFYICONDATAW n{sizeof n}; n.hWnd = h; n.uID = 1; Shell_NotifyIconW(NIM_DELETE, &n); }
         PostQuitMessage(0);
@@ -1229,7 +1272,7 @@ int runCli(int argc, wchar_t** argv) {
              res.ok ? 1 : 0, res.frames, res.duplicated, res.late, res.dropped, res.abandoned ? 1 : 0,
              U(res.captureUsed).c_str(), U(res.encoderUsed).c_str(), U(res.pathLog).c_str(),
              U(res.file).c_str(), U(res.message).c_str());
-    emit(std::string(summary) + extra, stdout);
+    emit(std::string(summary) + extra + "encoder_log:\n" + U(res.encoderLog), stdout);
     return res.ok ? 0 : 1;
 }
 
@@ -1305,6 +1348,8 @@ if (wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' || wcscmp(argv[i
     }
     g.status = L"Settings save automatically \u00b7 closing keeps Cast Recorder in the tray";
     if (!minimized && !g.s.startMinimized) ShowWindow(g.hwnd, SW_SHOW);
+    g.gprev.start(g.hwnd, previewRectNow(), g.s.captureCursor);
+    if (!IsWindowVisible(g.hwnd)) g.gprev.setVisible(false);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
