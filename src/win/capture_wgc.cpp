@@ -1,6 +1,7 @@
 #ifdef CR_HAVE_WGC
 #include "capture_wgc.h"
 #include <dxgi.h>
+#include <algorithm>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/Windows.Foundation.h>
@@ -78,7 +79,7 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
         auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         winrt::com_ptr<ID3D11Texture2D> tex;
         winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(tex.put())));
-        D3D11_BOX box{0, 0, 0, (UINT)min(cs.Width, (int)p_->w), (UINT)min(cs.Height, (int)p_->h), 1};
+        D3D11_BOX box{0, 0, 0, (UINT)std::min(cs.Width, (int)p_->w), (UINT)std::min(cs.Height, (int)p_->h), 1};
         ctx->CopySubresourceRegion(dst, 0, 0, 0, 0, tex.get(), 0, &box);
         frame.Close();
         gotNew = true;

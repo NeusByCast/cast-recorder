@@ -147,11 +147,11 @@ HICON makeRecIcon(HICON base, int size) {
 }
 
 void loadIcons() {
-    int big = GetSystemMetrics(SM_CXICON), small = GetSystemMetrics(SM_CXSMICON);
+    int big = GetSystemMetrics(SM_CXICON), smallSz = GetSystemMetrics(SM_CXSMICON);
     g.icoBig = (HICON)LoadImageW(g.inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, big, big, 0);
-    g.icoSmall = (HICON)LoadImageW(g.inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, small, small, 0);
+    g.icoSmall = (HICON)LoadImageW(g.inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, smallSz, smallSz, 0);
     g.icoTray = g.icoSmall;
-    g.icoTrayRec = makeRecIcon(g.icoSmall, small);
+    g.icoTrayRec = makeRecIcon(g.icoSmall, smallSz);
 }
 
 // ---------- tray ----------
