@@ -846,7 +846,7 @@ void Recorder::run() {
             if (!src) { r.message = L"Window capture unavailable: " + capErr; return; }
         }
 #ifdef CR_HAVE_WGC
-        if (!src && !opt_.forcePattern && opt_.allDisplays) {
+        if (!src && !opt_.forcePattern && opt_.allDisplays && listDisplays().size() > 1) {
             auto w = std::make_unique<WgcAllDisplays>();
             if (w->init(dev.Get(), opt_.captureCursor, capErr)) src = std::move(w);
             else r.encoderLog += L"all displays: " + capErr + L" (falling back to one monitor)\n";
