@@ -370,7 +370,7 @@ jobs:
         run: |
           $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
           $v = "$PWD\rec\v1"; New-Item -ItemType Directory $v -Force | Out-Null
-          function Run($a, $log) { $p = Start-Process $exe -ArgumentList "$a --log `"$log`"" -Wait -PassThru; Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 14; return $p.ExitCode }
+          function Run($a, $log) { $p = Start-Process $exe -ArgumentList "$a --log `"$log`"" -Wait -PassThru; Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 14 | Out-Host; return $p.ExitCode }
           function Dur($f) { [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $f) }
           function Clean($f) { $d = & ffmpeg -hide_banner -v error -xerror -i $f -map 0 -f null - 2>&1; if ($LASTEXITCODE -ne 0 -or $d) { $d; throw "$f does not decode cleanly" } }
           # --- encoders (HEVC/AV1 shown only when present)
