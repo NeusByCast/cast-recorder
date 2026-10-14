@@ -218,6 +218,7 @@ jobs:
           $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
           $sf = "$env:RUNNER_TEMP\selftest-settings.json"
           Remove-Item $sf -ErrorAction SilentlyContinue
+          $npS = Start-Process notepad -PassThru; Start-Sleep 3
           $p = Start-Process $exe -ArgumentList "--selftest-settings --settings-file `"$sf`"" -PassThru
           if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "UI did not exit after clicking X" }
           if (-not (Test-Path $sf)) { throw "settings file not written" }
@@ -231,6 +232,15 @@ jobs:
           if ($j.micEnabled -ne $true) { throw "micEnabled not persisted" }
           if ($j.hotkeyMicMute -ne 'Ctrl+Alt+F12') { throw "mic hotkey not persisted: $($j.hotkeyMicMute)" }
           if ($j.maximized -ne $true) { throw "maximized not persisted" }
+          Stop-Process -Id $npS.Id -Force -ErrorAction SilentlyContinue
+          if ($j.sourceKind -ne 'window') { throw "source kind not persisted: $($j.sourceKind)" }
+          if ($j.sourceExe -notmatch '(?i)notepad') { throw "source exe not persisted: $($j.sourceExe)" }
+          if ($j.micVolume -ne 150) { throw "micVolume not persisted" }
+          if ($j.noiseSuppression -ne $true) { throw "noiseSuppression not persisted" }
+          if ($j.noiseGateDb -ne -50) { throw "noiseGateDb not persisted" }
+          if ($j.monitoring -ne $true) { throw "monitoring not persisted" }
+          if ($j.pushToTalk -ne $true) { throw "pushToTalk not persisted" }
+          if ($j.channels -ne 2) { throw "channels not persisted" }
           $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
           if (-not (Test-Path $applog)) { throw "CastRecorder.log missing" }
           Get-Content $applog | Select-Object -Last 40
@@ -299,6 +309,49 @@ jobs:
           $d = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $out2)
           "duration after close: $d s"
           if ($d -ge 5.5) { throw "recording did not stop at window close ($d s)" }
+      - name: v2 source selection (all / monitor / window), NS+gate recording, UI renders
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory rec\v2 -Force | Out-Null
+          $np = Start-Process notepad -PassThru; Start-Sleep 3
+          Start-Process $exe -ArgumentList "--list-sources --log `"$PWD\rec\v2\sources.txt`"" -Wait
+          Get-Content "$PWD\rec\v2\sources.txt"
+          foreach ($src in 'all','monitor:1','window:notepad') {
+            $n = $src -replace '[:]','-'
+            $log = "$PWD\rec\v2\src-$n.txt"; $out = "$PWD\rec\v2\src-$n.mp4"
+            Start-Process $exe -ArgumentList "--source $src --record 2 --encoder software --allow-synthetic --out `"$out`" --log `"$log`"" -Wait
+            Get-Content $log | Select-Object -First 6
+            if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { throw "source $src recording failed" }
+            if ($src -like 'window:*' -and -not (Select-String -Path $log -Pattern 'capture=.*\(window\)' -Quiet)) { throw "source $src was not a window capture" }
+            & ffmpeg -v error -i $out -f null - 2>&1 | Tee-Object -Variable fe
+            if ($LASTEXITCODE -ne 0 -or $fe) { throw "source $src recording does not decode" }
+          }
+          Stop-Process -Id $np.Id -Force -ErrorAction SilentlyContinue
+          $log = "$PWD\rec\v2\ns.txt"; $out = "$PWD\rec\v2\ns.mp4"
+          Start-Process $exe -ArgumentList "--record 3 --test-mic --noise-suppression on --noise-gate -42 --channels 1 --encoder software --allow-synthetic --out `"$out`" --log `"$log`"" -Wait
+          Get-Content $log
+          if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { throw "NS+gate recording failed" }
+          $m = (Select-String -Path $log -Pattern 'testmic: noise_in_db=(-?[\d.]+) noise_out_db=(-?[\d.]+|-inf)').Matches
+          if (-not $m) { throw "no testmic stats" }
+          $in = [double]$m[0].Groups[1].Value; $o = $m[0].Groups[2].Value
+          $od = if ($o -eq '-inf') { -200.0 } else { [double]$o }
+          "noise in=$in dB out=$od dB"
+          if ($od -gt $in - 10) { throw "noise not reduced by >= 10 dB" }
+          & ffmpeg -v error -i $out -f null - 2>&1 | Tee-Object -Variable fe
+          if ($LASTEXITCODE -ne 0 -or $fe) { throw "NS+gate recording does not decode cleanly" }
+          $ch = ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 $out
+          if ([int]$ch -ne 1) { throw "expected mono audio, got $ch channels" }
+          foreach ($st in 'idle','source','settings','recording','micpop') {
+            Start-Process $exe -ArgumentList "--render-ui `"$PWD\rec\v2\ui-v2-$st.png`" --ui-state $st --log `"$PWD\rec\v2\ui-$st.txt`"" -Wait
+            if (-not (Test-Path "$PWD\rec\v2\ui-v2-$st.png")) { throw "ui-v2-$st.png missing" }
+          }
+      - uses: actions/upload-artifact@v4
+        if: matrix.fps == 30
+        with:
+          name: ui-v2-screenshots
+          path: rec/v2/ui-v2-*.png
       - name: Persistence through %APPDATA% (non-default values, Cyrillic path, close via WM_CLOSE)
         if: matrix.fps == 15
         shell: pwsh
