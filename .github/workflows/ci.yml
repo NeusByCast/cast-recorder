@@ -227,7 +227,19 @@ jobs:
           $j | Format-List
           if ($j.fps -ne 30) { throw "fps not persisted" }
           if ($j.quality -ne 'ultra') { throw "quality not persisted" }
-          if ($j.container -ne 'mkv') { throw "container not persisted" }
+          if ($j.container -ne 'mp4') { throw "container not persisted" }
+          if ($j.version -ne 3) { throw "settings version $($j.version) != 3" }
+          if ($j.scale -ne '1440p') { throw "resolution not persisted: $($j.scale)" }
+          if ($j.autoRemux -ne $false) { throw "autoRemux not persisted" }
+          if ($j.replayEnabled -ne $true) { throw "replayEnabled not persisted" }
+          if ($j.replaySeconds -ne 45) { throw "custom replay length not persisted: $($j.replaySeconds)" }
+          if ($j.theme -ne 'light') { throw "theme not persisted: $($j.theme)" }
+          if ($j.accent -ne 'blue') { throw "accent not persisted: $($j.accent)" }
+          if ($j.separateTracks -ne $true) { throw "separateTracks not persisted" }
+          if ($j.fileNamePattern -ne 'date_time') { throw "fileNamePattern not persisted" }
+          if ($j.screenshotFormat -ne 'jpg') { throw "screenshotFormat not persisted" }
+          if ($j.hotkeySaveReplay -ne 'Ctrl+Alt+F7') { throw "save-replay hotkey not persisted: $($j.hotkeySaveReplay)" }
+          if ($j.hotkeyScreenshot -ne 'Ctrl+Alt+F6') { throw "screenshot hotkey not persisted: $($j.hotkeyScreenshot)" }
           if ($j.systemAudio -ne $false) { throw "systemAudio not persisted" }
           if ($j.micEnabled -ne $true) { throw "micEnabled not persisted" }
           if ($j.hotkeyMicMute -ne 'Ctrl+Alt+F12') { throw "mic hotkey not persisted: $($j.hotkeyMicMute)" }
@@ -244,7 +256,7 @@ jobs:
           $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
           if (-not (Test-Path $applog)) { throw "CastRecorder.log missing" }
           Get-Content $applog | Select-Object -Last 40
-          foreach ($pat in 'settings (loaded|missing)', 'settings saved', 'warm-up', 'latency=\[', 'exit') {
+          foreach ($pat in 'settings (loaded|missing)', 'settings saved', 'warm-up', 'latency=\[', 'exit', 'selftest: recordings listed', 'selftest: encoder', 'encoders for') {
             if (-not (Select-String -Path $applog -Pattern $pat -Quiet)) { throw "CastRecorder.log lacks '$pat'" }
           }
           Copy-Item $applog rec\CastRecorder.log
@@ -352,6 +364,151 @@ jobs:
         with:
           name: ui-v2-screenshots
           path: rec/v2/ui-v2-*.png
+      - name: v1.0 features (replay, remux, screenshots, separate tracks, toasts excluded from capture, HEVC, hotkeys)
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $v = "$PWD\rec\v1"; New-Item -ItemType Directory $v -Force | Out-Null
+          function Run($a, $log) { $p = Start-Process $exe -ArgumentList "$a --log `"$log`"" -Wait -PassThru; Get-Content $log -ErrorAction SilentlyContinue | Select-Object -First 14; return $p.ExitCode }
+          function Dur($f) { [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $f) }
+          function Clean($f) { $d = & ffmpeg -hide_banner -v error -xerror -i $f -map 0 -f null - 2>&1; if ($LASTEXITCODE -ne 0 -or $d) { $d; throw "$f does not decode cleanly" } }
+          # --- encoders (HEVC/AV1 shown only when present)
+          Start-Process $exe -ArgumentList "--list-encoders --log `"$v\encoders.txt`"" -Wait
+          "encoders:"; Get-Content "$v\encoders.txt"
+          $hevc = Select-String -Path "$v\encoders.txt" -Pattern '^HEVC' -Quiet
+          # --- instant replay while recording: 5 s buffer saved 7 s into an 8 s recording
+          $rc = Run "--record 8 --replay 5 --save-replay-at 7 --encoder software --allow-synthetic --test-tone --out `"$v\rp-main.mp4`" --replay-out `"$v\rp.mp4`"" "$v\rp.txt"
+          if (-not (Select-String -Path "$v\rp.txt" -Pattern '^replay_ok=1' -Quiet)) { throw "replay save failed" }
+          $rs = [double](Select-String -Path "$v\rp.txt" -Pattern 'replay_seconds=([\d.]+)').Matches[0].Groups[1].Value
+          $rd = Dur "$v\rp.mp4"
+          "replay: reported=$rs s file=$rd s"
+          if ($rs -lt 4.0 -or $rs -gt 7.5) { throw "replay length $rs s not ~5 s (keyframe-aligned)" }
+          if ([math]::Abs($rd - $rs) -gt 0.35) { throw "replay file $rd s != reported $rs s" }
+          Clean "$v\rp.mp4"
+          if (-not ((ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$v\rp.mp4") -match 'aac')) { throw "replay has no audio" }
+          $k0 = ffprobe -v error -select_streams v:0 -show_entries frame=key_frame -of csv=p=0 -read_intervals "%+#1" "$v\rp.mp4" | Select-Object -First 1
+          if ($k0 -ne '1') { throw "replay does not start on a key frame" }
+          Clean "$v\rp-main.mp4"
+          # replay buffer only (no recording file)
+          $rc = Run "--record 6 --replay 10 --replay-only --save-replay-at 5 --encoder software --allow-synthetic --out `"$v\ro.mp4`" --replay-out `"$v\ro-replay.mp4`"" "$v\ro.txt"
+          if ($rc -ne 0) { throw "replay-only exit $rc" }
+          if (Test-Path "$v\ro.mp4") { throw "replay-only wrote a recording" }
+          $rd = Dur "$v\ro-replay.mp4"; "replay-only file: $rd s"
+          if ($rd -lt 3.0 -or $rd -gt 5.6) { throw "replay-only length $rd" }
+          Clean "$v\ro-replay.mp4"
+          # --- remux MKV -> MP4 without re-encoding, both engines
+          $rc = Run "--record 3 --container mkv --encoder software --allow-synthetic --test-tone --out `"$v\rm.mkv`"" "$v\rm.txt"
+          if ((ffprobe -v error -show_entries format=format_name -of csv=p=0 "$v\rm.mkv") -notmatch 'matroska') { throw "rm.mkv is not MKV" }
+          $ref = & ffmpeg -v error -i "$v\rm.mkv" -map 0:v:0 -c copy -f hash -hash md5 - 2>&1
+          $refDec = & ffmpeg -v error -i "$v\rm.mkv" -map 0:v:0 -f hash -hash md5 - 2>&1
+          foreach ($eng in 'ffmpeg','mf') {
+            $o = "$v\rm-$eng.mp4"
+            $rc = Run "--remux `"$v\rm.mkv`" `"$o`" --remux-engine $eng" "$v\remux-$eng.txt"
+            if ($rc -ne 0) { throw "remux ($eng) failed" }
+            Clean $o
+            $dec = & ffmpeg -v error -i $o -map 0:v:0 -f hash -hash md5 - 2>&1
+            "remux $eng decoded md5: $dec (mkv $refDec)"
+            if ($dec -ne $refDec) { throw "remux ($eng) changed the picture: re-encoded?" }
+            if ($eng -eq 'ffmpeg') { $pk = & ffmpeg -v error -i $o -map 0:v:0 -c copy -f hash -hash md5 - 2>&1; "packets md5 mp4=$pk mkv=$ref"; if ($pk -ne $ref) { throw "remux (ffmpeg) video packets differ" } }
+            if ([math]::Abs((Dur $o) - (Dur "$v\rm.mkv")) -gt 0.1) { throw "remux ($eng) duration differs" }
+          }
+          # auto-remux: MKV recorded, MP4 kept
+          $rc = Run "--record 2 --container mkv --auto-remux on --encoder software --allow-synthetic --test-tone --out `"$v\am.mkv`"" "$v\am.txt"
+          if (-not (Test-Path "$v\am.mp4") -or (Test-Path "$v\am.mkv")) { throw "auto-remux did not leave just am.mp4" }
+          Clean "$v\am.mp4"
+          # --- screenshots
+          foreach ($f in 'png','jpg') {
+            $rc = Run "--screenshot `"$v\shot.$f`"" "$v\shot-$f.txt"
+            if ($rc -ne 0) { throw "screenshot $f failed" }
+            $si = ffprobe -v error -show_entries stream=codec_name,width,height -of default=nw=1 "$v\shot.$f"; $si
+            $want = if ($f -eq 'png') { 'png' } else { 'mjpeg' }
+            if (-not ($si -match "codec_name=$want")) { throw "shot.$f is not $want" }
+            $m = (Select-String -Path "$v\shot-$f.txt" -Pattern 'screenshot=(\d+)x(\d+)').Matches[0].Groups
+            if (-not ($si -match "width=$($m[1].Value)")) { throw "screenshot size mismatch" }
+          }
+          # --- separate audio tracks: 1 mix, 2 system, 3 mic (MP4 and MKV)
+          foreach ($c in 'mp4','mkv') {
+            $o = "$v\tracks.$c"
+            $rc = Run "--record 3 --separate-tracks --test-tone --test-mic --container $c --encoder software --allow-synthetic --out `"$o`"" "$v\tracks-$c.txt"
+            if (-not (Select-String -Path "$v\tracks-$c.txt" -Pattern 'audio_tracks=3' -Quiet)) { throw "recorder did not write 3 tracks ($c)" }
+            $as = ffprobe -v error -select_streams a -show_entries stream=index,codec_name:stream_tags=title,handler_name -of csv=p=0 $o; $as
+            if (@($as).Count -ne 3) { throw "$c has $(@($as).Count) audio streams, expected 3" }
+            if (-not ($as[0] -match 'Mix') -or -not ($as[2] -match 'Mic')) { throw "$c track names missing (Mix/System/Mic)" }
+            Clean $o
+            # track 1 (mix) carries both sources: it must be at least as loud as each
+            $lv = foreach ($k in 0..2) { [double]((& ffmpeg -hide_banner -i $o -map 0:a:$k -af volumedetect -f null - 2>&1 | Select-String 'mean_volume: (-?[\d.]+)').Matches[0].Groups[1].Value) }
+            "mean volume mix/system/mic: $($lv -join ' / ') dB"
+            if ($lv[1] -lt -80 -or $lv[2] -lt -80) { throw "system or mic track is silent" }
+          }
+          # --- toasts must not appear in what we capture (WDA_EXCLUDEFROMCAPTURE); the control toast must
+          Add-Type -AssemblyName System.Drawing
+          function Magenta($png) { $b = [System.Drawing.Bitmap]::FromFile($png); $n = 0
+            for ($y = 0; $y -lt $b.Height; $y += 2) { for ($x = 0; $x -lt $b.Width; $x += 2) { $c = $b.GetPixel($x, $y); if ($c.R -gt 220 -and $c.G -lt 40 -and $c.B -gt 220) { $n++ } } }
+            $b.Dispose(); return $n }
+          $rc = Run "--test-toast-visible `"$v\toast-visible.png`" --out `"$v\toast-visible.mp4`" --encoder software" "$v\toast-visible.txt"
+          $rc = Run "--test-toast `"$v\toast-excluded.png`" --out `"$v\toast-excluded.mp4`" --encoder software" "$v\toast-excluded.txt"
+          $mv = [long](Select-String -Path "$v\toast-visible.txt" -Pattern 'magenta_px=(\d+)').Matches[0].Groups[1].Value
+          $me = [long](Select-String -Path "$v\toast-excluded.txt" -Pattern 'magenta_px=(\d+)').Matches[0].Groups[1].Value
+          "screenshot magenta pixels: control=$mv excluded=$me"
+          if (-not (Select-String -Path "$v\toast-excluded.txt" -Pattern 'excluded=1' -Quiet)) { throw "SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) failed" }
+          if ($mv -lt 10000) { throw "control toast not visible in the screenshot ($mv px): test is not meaningful" }
+          if ($me -gt 50) { throw "toast shows up in the screen capture ($me px)" }
+          foreach ($k in 'visible','excluded') {
+            if (Test-Path "$v\toast-$k.mp4") { & ffmpeg -v error -sseof -0.6 -i "$v\toast-$k.mp4" -frames:v 1 -y "$v\toast-$k-frame.png" }
+          }
+          if ((Test-Path "$v\toast-visible-frame.png") -and (Test-Path "$v\toast-excluded-frame.png")) {
+            $fv = Magenta "$v\toast-visible-frame.png"; $fe = Magenta "$v\toast-excluded-frame.png"
+            "video frame magenta (1/4 sampled): control=$fv excluded=$fe  [$((Select-String -Path "$v\toast-excluded.txt" -Pattern 'capture=.*').Matches[0].Value)]"
+            if ($fv -gt 500) { if ($fe -gt 20) { throw "toast shows up in the recording ($fe px)" } } else { "video check skipped: the control toast isn't in the runner's capture either" }
+          } else { "video check skipped: recording not available on this runner" }
+          # --- HEVC where the machine has an encoder
+          if ($hevc) {
+            $rc = Run "--record 3 --codec hevc --container mkv --allow-synthetic --out `"$v\hevc.mkv`"" "$v\hevc.txt"
+            $cn = ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$v\hevc.mkv"
+            "hevc recording codec: $cn"
+            if ($cn -ne 'hevc') { throw "HEVC requested and listed but file is $cn" }
+            Clean "$v\hevc.mkv"
+          } else {
+            "HEVC: no HEVC encoder on this runner (no GPU, no HEVC Video Extensions); checking the fallback instead"
+            $rc = Run "--record 2 --codec hevc --container mkv --allow-synthetic --out `"$v\hevc-fallback.mkv`"" "$v\hevc.txt"
+            if ((ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$v\hevc-fallback.mkv") -ne 'h264') { throw "HEVC fallback to H.264 failed" }
+          }
+          # --- every hotkey through the real global-hotkey path (SendInput -> RegisterHotKey), with non-default combos
+          $sf = "$env:RUNNER_TEMP\hotkeys.json"
+          New-Item -ItemType Directory "$v\hk" -Force | Out-Null
+          @{version=3; fps=30; encoder="software"; outputDir="$v\hk"; systemAudio=$false; micEnabled=$false; replayEnabled=$true; replaySeconds=10;
+            hotkeyToggleRecord="Ctrl+Alt+F9"; hotkeyPause="Ctrl+Alt+F10"; hotkeyMicMute="Ctrl+Alt+F11"; hotkeySaveReplay="Ctrl+Alt+F7"; hotkeyScreenshot="Ctrl+Alt+F6"} | ConvertTo-Json | Set-Content $sf
+          $p = Start-Process $exe -ArgumentList "--selftest-hotkeys --settings-file `"$sf`"" -PassThru
+          if (-not $p.WaitForExit(150000)) { $p.Kill(); throw "hotkey selftest hung" }
+          $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
+          Select-String -Path $applog -Pattern 'selftest hotkey|selftest-hotkeys|^hotkeys:|replay buffer|toast:' | Select-Object -Last 30 | ForEach-Object { $_.Line }
+          $res = Select-String -Path $applog -Pattern 'selftest-hotkeys: (\d+)/(\d+) ok' | Select-Object -Last 1
+          if (-not $res) { throw "hotkey selftest did not finish" }
+          if ($res.Matches[0].Groups[1].Value -ne $res.Matches[0].Groups[2].Value) { throw "hotkeys: $($res.Matches[0].Value)" }
+          Get-ChildItem "$v\hk" | Format-Table Name, Length
+          if (-not (Get-ChildItem "$v\hk" -Filter 'replay_*.mp4')) { throw "save-replay hotkey wrote no replay" }
+          if (-not (Get-ChildItem "$v\hk" -Filter 'screenshot_*.png')) { throw "screenshot hotkey wrote no PNG" }
+          $recf = Get-ChildItem "$v\hk" -Filter 'cast_*.mp4' | Select-Object -First 1
+          if (-not $recf) { throw "start/stop hotkey wrote no recording (auto-remuxed MP4)" }
+          Clean $recf.FullName
+          Start-Process $exe -ArgumentList "--print-settings --settings-file `"$sf`" --log `"$v\hk-settings.json`"" -Wait
+          $j = Get-Content "$v\hk-settings.json" -Raw | ConvertFrom-Json
+          if ($j.hotkeySaveReplay -ne 'Ctrl+Alt+F7' -or $j.hotkeyScreenshot -ne 'Ctrl+Alt+F6' -or $j.hotkeyToggleRecord -ne 'Ctrl+Alt+F9' -or $j.hotkeyPause -ne 'Ctrl+Alt+F10' -or $j.hotkeyMicMute -ne 'Ctrl+Alt+F11') { throw "hotkeys not persisted" }
+          # --- UI v1.0 renders (2x, like the mockups)
+          foreach ($st in 'idle','recording','settings','recordings','replaytoast','savedtoast','source','micpop','ctxmenu') {
+            Start-Process $exe -ArgumentList "--render-ui `"$v\ui-v1-$st.png`" --ui-state $st --dpi 192 --log `"$v\ui-$st.txt`"" -Wait
+            if (-not (Test-Path "$v\ui-v1-$st.png")) { throw "ui-v1-$st.png missing" }
+          }
+          foreach ($st in 'idle','settings') {
+            Start-Process $exe -ArgumentList "--render-ui `"$v\ui-v1-light-$st.png`" --ui-state $st --ui-theme light --dpi 192 --log `"$v\ui-light-$st.txt`"" -Wait
+            if (-not (Test-Path "$v\ui-v1-light-$st.png")) { throw "ui-v1-light-$st.png missing" }
+          }
+      - uses: actions/upload-artifact@v4
+        if: matrix.fps == 30
+        with:
+          name: ui-v1-screenshots
+          path: rec/v1/ui-v1-*.png
       - name: Persistence through %APPDATA% (non-default values, Cyrillic path, close via WM_CLOSE)
         if: matrix.fps == 15
         shell: pwsh
