@@ -1,0 +1,35 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --parallel
+          ctest --test-dir build -C Release --output-on-failure
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$v /DBinDir=..\build\Release installer\CastRecorder.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build\Release\CastRecorder.exe dist\CastRecorder-portable.exe
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem dist\*.exe | ForEach-Object { $_.FullName }
+          gh release view "${{ github.ref_name }}" 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release upload "${{ github.ref_name }}" $files --clobber }
+          else { gh release create "${{ github.ref_name }}" $files --title "Cast Recorder ${{ github.ref_name }}" --notes-file RELEASE_NOTES.md --latest }
