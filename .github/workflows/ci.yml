@@ -198,6 +198,46 @@ jobs:
           "quality: SSIM=$ssim PSNR-Y=$psnr dB"
           if ($ssim -lt 0.98) { throw "SSIM $ssim < 0.98 (warping / artifacts / starved bitrate)" }
           if ($psnr -lt 40) { throw "PSNR-Y $psnr dB < 40" }
+      - name: Start latency (press -> first frame) after the startup warm-up
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          New-Item -ItemType Directory rec -Force | Out-Null
+          $fps = ${{ matrix.fps }}
+          $out = "$PWD\rec\latency-$fps.mp4"; $log = "$PWD\rec\latency-$fps.txt"
+          Start-Process $exe -ArgumentList "--warmup --record 2 --fps $fps --encoder software --allow-synthetic --test-tone --out `"$out`" --log `"$log`"" -Wait
+          Get-Content $log | Select-Object -First 8
+          if (-not (Select-String -Path $log -Pattern '^ok=1' -Quiet)) { throw "latency recording failed" }
+          $ms = [double](Select-String -Path $log -Pattern '^start_ms=([\d.]+)').Matches[0].Groups[1].Value
+          "start latency: $ms ms"
+          if ($ms -gt 500) { throw "press-to-first-frame $ms ms > 500 ms" }
+      - name: Settings persist across restart (real UI clicks, exit via X)
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $sf = "$env:RUNNER_TEMP\selftest-settings.json"
+          Remove-Item $sf -ErrorAction SilentlyContinue
+          $p = Start-Process $exe -ArgumentList "--selftest-settings --settings-file `"$sf`"" -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "UI did not exit after clicking X" }
+          if (-not (Test-Path $sf)) { throw "settings file not written" }
+          Start-Process $exe -ArgumentList "--print-settings --settings-file `"$sf`" --log `"$env:RUNNER_TEMP\printed.json`"" -Wait
+          $j = Get-Content "$env:RUNNER_TEMP\printed.json" -Raw | ConvertFrom-Json
+          $j | Format-List
+          if ($j.fps -ne 30) { throw "fps not persisted" }
+          if ($j.quality -ne 'ultra') { throw "quality not persisted" }
+          if ($j.container -ne 'mkv') { throw "container not persisted" }
+          if ($j.systemAudio -ne $false) { throw "systemAudio not persisted" }
+          if ($j.micEnabled -ne $true) { throw "micEnabled not persisted" }
+          if ($j.hotkeyMicMute -ne 'Ctrl+Alt+F12') { throw "mic hotkey not persisted: $($j.hotkeyMicMute)" }
+          if ($j.maximized -ne $true) { throw "maximized not persisted" }
+          $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
+          if (-not (Test-Path $applog)) { throw "CastRecorder.log missing" }
+          Get-Content $applog | Select-Object -Last 40
+          foreach ($pat in 'settings (loaded|missing)', 'settings saved', 'warm-up', 'latency=\[', 'exit') {
+            if (-not (Select-String -Path $applog -Pattern $pat -Quiet)) { throw "CastRecorder.log lacks '$pat'" }
+          }
+          Copy-Item $applog rec\CastRecorder.log
       - name: ffmpeg hijack probe (a fake ffmpeg.exe in the working folder must not run)
         if: matrix.fps == 30
         shell: pwsh
