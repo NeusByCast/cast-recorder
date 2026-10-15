@@ -623,8 +623,8 @@ jobs:
             $f = "$d\picker-$n.mp4"
             if (-not (Test-Path $f)) { throw "$f missing" }
             $wh = (ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 $f) -split ','
-            $w = [int]$wh[0]; $h = [int]$wh[1]; "$n window -> encoded ${w}x${h}"
-            if ($w -lt 128 -or $h -lt 128 -or ($w % 2) -or ($h % 2)) { throw "$n: ${w}x${h} is not even and >= 128" }
+            $w = [int]$wh[0]; $h = [int]$wh[1]; "${n} window -> encoded ${w}x${h}"
+            if ($w -lt 128 -or $h -lt 128 -or ($w % 2) -or ($h % 2)) { throw "${n}: ${w}x${h} is not even and >= 128" }
             $dec = & ffmpeg -hide_banner -v error -xerror -i $f -map 0 -f null - 2>&1
             if ($LASTEXITCODE -ne 0 -or $dec) { $dec; throw "$f does not decode cleanly" }
             if ($n -eq 'minimized' -and ($w -lt 560 -or $h -lt 400)) { throw "minimized-at-start window encoded at ${w}x${h}, not near its restored 641x481" }
