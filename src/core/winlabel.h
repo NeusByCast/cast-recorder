@@ -78,23 +78,49 @@ inline std::wstring stripAppSuffix(const std::wstring& title, const std::wstring
     std::wstring t;
     for (wchar_t c : title) if (c != 0x200B && c != 0x200E && c != 0x200F) t += c;
     std::wstring stem = lowerW(exeStem(exe));
-    std::wstring cands[] = {lowerW(appName), stem, L"google chrome", L"microsoft edge", L"mozilla firefox", L"brave", L"opera",
-                            L"vivaldi", L"visual studio code"};
+    const bool edge = stem == L"msedge";
+    // longest first: "Mozilla Firefox Private Browsing" before "Mozilla Firefox"
+    std::wstring cands[] = {L"mozilla firefox private browsing", L"firefox private browsing", lowerW(appName), stem, L"google chrome",
+                            L"microsoft edge", L"mozilla firefox", L"brave", L"opera", L"vivaldi", L"visual studio code"};
     std::wstring lt = lowerW(t);
+    const wchar_t* seps[] = {L" - ", L" \u2013 ", L" \u2014 "};
     for (auto& c : cands) {
         if (c.empty()) continue;
         bool hit = false;
-        for (const wchar_t* sep : {L" - ", L" \u2013 ", L" \u2014 "}) {
+        for (const wchar_t* sep : seps) {
             std::wstring suf = sep + c;
             if (lt.size() > suf.size() && lt.compare(lt.size() - suf.size(), suf.size(), suf) == 0) { t.resize(t.size() - suf.size()); hit = true; break; }
+            // Chrome / Brave with a custom profile: "Inbox - Google Chrome - John" (app name, then the profile last)
+            std::wstring mid = suf + sep;
+            size_t m = lt.rfind(mid);
+            if (m != std::wstring::npos && m > 0) {
+                std::wstring tail = lt.substr(m + mid.size());
+                bool plain = !tail.empty() && tail.size() <= 40;
+                for (const wchar_t* s2 : seps) if (tail.find(s2) != std::wstring::npos) plain = false;
+                if (plain) { t.resize(m); hit = true; break; }
+            }
         }
         if (!hit) continue;
-        // Edge/Chrome profile segment right before the app name ("... - Personal - Microsoft Edge")
+        // Profile segment right before the app name ("... - Personal - Microsoft Edge"). Edge always puts the
+        // profile there (custom names too: "Inbox - John (Acme) - Microsoft Edge"); others only the known ones.
         size_t k = t.rfind(L" - ");
         if (k != std::wstring::npos) {
             std::wstring seg = lowerW(t.substr(k + 3));
+            bool prof = edge && seg.size() <= 40 && k > 0;
             for (const wchar_t* pf : {L"personal", L"work", L"school", L"guest", L"inprivate", L"incognito", L"private"})
-                if (seg == pf) { t.resize(k); break; }
+                if (seg == pf) prof = true;
+            if (prof) t.resize(k);
+        }
+        // Edge: "Page and 3 more pages"
+        if (edge) {
+            std::wstring l2 = lowerW(t);
+            size_t a2 = l2.rfind(L" and ");
+            if (a2 != std::wstring::npos) {
+                size_t i = a2 + 5, d0 = i;
+                while (i < l2.size() && iswdigit(l2[i])) ++i;
+                std::wstring rest = l2.substr(i);
+                if (i > d0 && (rest == L" more page" || rest == L" more pages")) t.resize(a2);
+            }
         }
         break;
     }

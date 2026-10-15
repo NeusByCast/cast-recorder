@@ -191,6 +191,7 @@ private:
 };
 
 std::wstring describeHardwareEncoders();
+void resetEncoderDecisions();  // drop cached "no hardware encoder" verdicts (encoder / GPU setting changed)
 // Static CI test pattern (also written by --render-pattern as the PSNR/SSIM reference).
 void testPattern(std::vector<uint32_t>& px, unsigned w, unsigned h);
 std::wstring findFfmpeg();

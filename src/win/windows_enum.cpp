@@ -112,14 +112,14 @@ std::vector<CaptureWindow> listCaptureWindows() {
     std::map<DWORD, std::pair<std::wstring, std::wstring>> names;
     EnumCtx c{&raw, &names};
     EnumWindows(enumProc, (LPARAM)&c);
-    // Fold exact duplicates (same app + same title: keep the larger), then group by app in first-seen z-order.
-    auto area = [](const CaptureWindow& w) { return (long long)(w.rect.right - w.rect.left) * (w.rect.bottom - w.rect.top); };
+    // Same app + same title (two windows on the same page): keep both and number the later ones "(2)", "(3)", ...
+    // so each stays selectable. Then group by app in first-seen z-order.
     std::vector<CaptureWindow> u;
     for (auto& w : raw) {
-        bool dup = false;
-        for (auto& x : u)
-            if (lower(x.exe) == lower(w.exe) && x.title == w.title) { if (area(w) > area(x)) x = w; dup = true; break; }
-        if (!dup) u.push_back(w);
+        int same = 0;
+        for (auto& x : u) if (lower(x.exe) == lower(w.exe) && x.title == w.title) ++same;
+        u.push_back(w);
+        if (same) u.back().page = (w.page.empty() ? std::wstring(L"window") : w.page) + L" (" + std::to_wstring(same + 1) + L")";
     }
     std::vector<CaptureWindow> v;
     std::vector<bool> used(u.size(), false);

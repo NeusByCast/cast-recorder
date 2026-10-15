@@ -241,6 +241,14 @@ static void testWindowPicker() {
     CHECK(stripAppSuffix(L"News - Personal - Microsoft\u200B Edge", L"msedge.exe", L"Edge") == L"News");
     CHECK(stripAppSuffix(L"Doc \u2014 Mozilla Firefox", L"firefox.exe", L"Firefox") == L"Doc");
     CHECK(stripAppSuffix(L"Brave", L"brave.exe", L"Brave") == L"");
+    // custom profile names (QA v16 bug 5)
+    CHECK(stripAppSuffix(L"Inbox - Google Chrome - John", L"chrome.exe", L"Chrome") == L"Inbox");
+    CHECK(stripAppSuffix(L"Inbox - Gmail - Google Chrome - Work Profile", L"chrome.exe", L"Chrome") == L"Inbox - Gmail");
+    CHECK(stripAppSuffix(L"Inbox - John (Acme) - Microsoft​ Edge", L"msedge.exe", L"Edge") == L"Inbox");
+    CHECK(stripAppSuffix(L"Docs and 3 more pages - Work - Microsoft​ Edge", L"msedge.exe", L"Edge") == L"Docs");
+    CHECK(stripAppSuffix(L"Video - Brave - Alice", L"brave.exe", L"Brave") == L"Video");
+    CHECK(stripAppSuffix(L"Doc — Mozilla Firefox Private Browsing", L"firefox.exe", L"Firefox") == L"Doc");
+    CHECK(stripAppSuffix(L"Doc — Firefox Private Browsing", L"firefox.exe", L"Firefox") == L"Doc");
     CHECK(stripAppSuffix(L"notes.txt - Notepad", L"notepad.exe", L"Notepad") == L"notes.txt");
     CHECK(windowLabel(L"Brave", L"Cast Recorder v1.0 release") == L"Brave \u00B7 Cast Recorder v1.0 release");
     CHECK(windowLabel(L"Brave", L"") == L"Brave");

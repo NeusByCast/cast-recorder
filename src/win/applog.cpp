@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cwctype>
 #include <vector>
+#include <algorithm>
 
 namespace cr {
 namespace {
@@ -58,7 +59,29 @@ struct XLock {
     ~XLock() { if (h) { ReleaseMutex(h); CloseHandle(h); } }
 };
 // %USERPROFILE%\... -> %USERPROFILE%\... (case-insensitive), so shared logs don't carry the user name.
+static std::mutex g_secM;
+static std::vector<std::wstring> g_secrets;  // newest last, at most 16
+}  // namespace
+void addLogSecret(const std::wstring& v) {
+    if (v.size() < 2) return;
+    std::lock_guard<std::mutex> g(g_secM);
+    for (auto& x : g_secrets) if (x == v) return;
+    g_secrets.push_back(v);
+    if (g_secrets.size() > 16) g_secrets.erase(g_secrets.begin());
+}
+namespace {
+std::wstring redactSecrets(std::wstring s) {
+    std::vector<std::wstring> sec;
+    { std::lock_guard<std::mutex> g(g_secM); sec = g_secrets; }
+    std::sort(sec.begin(), sec.end(), [](const std::wstring& a, const std::wstring& b) { return a.size() > b.size(); });  // longest first
+    for (auto& v : sec) {
+        std::wstring rep = L"(" + std::to_wstring(v.size()) + L" chars)";
+        for (size_t p = s.find(v); p != std::wstring::npos; p = s.find(v, p + rep.size())) s.replace(p, v.size(), rep);
+    }
+    return s;
+}
 std::wstring redact(std::wstring s) {
+    s = redactSecrets(std::move(s));
     wchar_t up[MAX_PATH]; DWORD n = GetEnvironmentVariableW(L"USERPROFILE", up, MAX_PATH);
     if (!n || n >= MAX_PATH) return s;
     std::wstring u(up, n), lo = s, ul = u;

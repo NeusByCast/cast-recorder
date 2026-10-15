@@ -706,6 +706,7 @@ static std::atomic<bool> g_writerWarm{false};
 static std::mutex g_probeM;
 static std::map<std::wstring, int> g_probe;  // 1 ok, 0 failed, 2 being probed (by the warm-up)
 static std::condition_variable g_probeCv;
+static std::map<std::wstring, ULONGLONG> g_probeFailAt;  // a FAIL is retried after 60 s (transient: dGPU waking up, driver busy)
 static std::wstring probeKey(ID3D11Device* dev, const HwEncoderInfo& e) {
     ComPtr<IDXGIDevice> d; ComPtr<IDXGIAdapter> a; DXGI_ADAPTER_DESC ad{};
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d))) && SUCCEEDED(d->GetAdapter(&a))) a->GetDesc(&ad);
@@ -723,6 +724,10 @@ static bool cachedProbe(ID3D11Device* dev, const HwEncoderInfo& e, int fps, std:
         std::unique_lock<std::mutex> g(g_probeM);
         g_probeCv.wait_for(g, std::chrono::seconds(8), [&] { auto it = g_probe.find(key); return it == g_probe.end() || it->second != 2; });
         auto it = g_probe.find(key);
+        if (it != g_probe.end() && it->second == 0) {
+            auto f = g_probeFailAt.find(key);
+            if (f != g_probeFailAt.end() && GetTickCount64() - f->second >= 60000) { g_probe.erase(it); g_probeFailAt.erase(f); it = g_probe.end(); }
+        }
         if (it != g_probe.end() && it->second != 2) cached = it->second;
         else g_probe[key] = 2;
     }
@@ -730,7 +735,7 @@ static bool cachedProbe(ID3D11Device* dev, const HwEncoderInfo& e, int fps, std:
     if (cached == 0) { elog += L"probe " + e.name + L": cached FAIL (this run), skipped\n"; return false; }
     if (cached == 1) { elog += L"probe " + e.name + L": cached OK\n"; return true; }
     bool okp = probeHwEncoder(dev, e, kProbeW, kProbeH, fps, 4500, elog);
-    { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp ? 1 : 0; }
+    { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp ? 1 : 0; if (!okp) g_probeFailAt[key] = GetTickCount64(); }
     g_probeCv.notify_all();
     return okp;
 }
@@ -738,14 +743,33 @@ static bool cachedProbe(ID3D11Device* dev, const HwEncoderInfo& e, int fps, std:
 // Auto GPU on hybrid laptops: the adapter that drives the panel (often the iGPU) may have no working hardware
 // encoder. Probe it first; if none of its encoders work, try the other hardware adapters (dGPU) and record on the
 // first one that does - Windows Graphics Capture copies the frames across adapters. Decided once per process.
+// A decision that found a working encoder is kept for the process (per vendor / codec / display adapter); a
+// "no hardware encoder" decision expires after kAutoFailTtlMs (a dGPU may have been asleep) and is dropped when the
+// encoder or GPU setting changes (resetEncoderDecisions), so switching back to Auto re-probes without a restart.
+struct AutoAdDecision { bool found = false, other = false; LUID luid{}; std::wstring log; ULONGLONG at = 0; };
 static std::mutex g_autoAdM;
-static bool g_autoAdDone = false;
-static LUID g_autoAdLuid{};
-static bool g_autoAdOther = false;
-static std::wstring g_autoAdLog;
-static bool pickEncodeAdapter(IDXGIFactory1* fac, IDXGIAdapter1* display, UINT wantVendor, int fps, LUID& out, std::wstring& log) {
+static std::map<std::wstring, AutoAdDecision> g_autoAd;
+static constexpr ULONGLONG kAutoFailTtlMs = 60000;
+void resetEncoderDecisions() {
+    { std::lock_guard<std::mutex> lk(g_autoAdM); for (auto it = g_autoAd.begin(); it != g_autoAd.end();) it = it->second.found ? std::next(it) : g_autoAd.erase(it); }
+    { std::lock_guard<std::mutex> g(g_probeM); for (auto it = g_probe.begin(); it != g_probe.end();) it = it->second == 0 ? g_probe.erase(it) : std::next(it); g_probeFailAt.clear(); }
+}
+static bool pickEncodeAdapter(IDXGIFactory1* fac, IDXGIAdapter1* display, UINT wantVendor, const GUID& codec, int fps, LUID& out, std::wstring& log) {
     std::lock_guard<std::mutex> lk(g_autoAdM);
-    if (g_autoAdDone) { out = g_autoAdLuid; log += g_autoAdLog; return g_autoAdOther; }
+    DXGI_ADAPTER_DESC1 dk{}; if (display) display->GetDesc1(&dk);
+    wchar_t kb[96];
+    swprintf(kb, 96, L"%04X/%ls/%08lX:%08lX", wantVendor, codecName(codec), (unsigned long)dk.AdapterLuid.HighPart, (unsigned long)dk.AdapterLuid.LowPart);
+    const std::wstring dkey = kb;
+    auto hit = g_autoAd.find(dkey);
+    if (hit != g_autoAd.end()) {
+        if (hit->second.found || GetTickCount64() - hit->second.at < kAutoFailTtlMs) {
+            out = hit->second.luid; log += hit->second.log;
+            log += hit->second.found ? L"auto GPU: (decision reused)\n" : L"auto GPU: (recent failure reused, re-probed after 60 s or a setting change)\n";
+            return hit->second.found && hit->second.other;
+        }
+        log += L"auto GPU: earlier 'no hardware encoder' decision expired, probing again\n";
+        g_autoAd.erase(hit);
+    }
     std::wstring lg;
     DXGI_ADAPTER_DESC1 dd{}; if (display) display->GetDesc1(&dd);
     std::vector<ComPtr<IDXGIAdapter1>> order;
@@ -770,16 +794,17 @@ static bool pickEncodeAdapter(IDXGIFactory1* fac, IDXGIAdapter1* display, UINT w
         if (FAILED(hr)) { wchar_t b[96]; swprintf(b, 96, L"auto GPU:   no video device (0x%08lX)\n", (unsigned long)hr); lg += b; continue; }
         ComPtr<ID3D10Multithread> mt;
         if (SUCCEEDED(pdev.As(&mt))) mt->SetMultithreadProtected(TRUE);
-        auto encs = hwEncodersForDevice(pdev.Get(), lg, MFVideoFormat_H264);
+        auto encs = hwEncodersForDevice(pdev.Get(), lg, codec);
         for (auto& e : encs) {
             if (wantVendor && e.pciVendor != wantVendor) continue;
             if (cachedProbe(pdev.Get(), e, fps, lg)) { found = true; other = !(k == 0 && display); out = d.AdapterLuid; break; }
         }
-        if (!found) lg += L"auto GPU:   no working hardware H.264 encoder on this adapter\n";
+        if (!found) lg += std::wstring(L"auto GPU:   no working hardware ") + codecName(codec) + L" encoder on this adapter\n";
     }
     if (found && other) lg += L"auto GPU: encoding on the other adapter (cross-adapter capture)\n";
     if (!found) lg += L"auto GPU: no working hardware encoder on any adapter\n";
-    g_autoAdDone = true; g_autoAdLuid = out; g_autoAdOther = found && other; g_autoAdLog = lg;
+    AutoAdDecision dcs; dcs.found = found; dcs.other = found && other; dcs.luid = out; dcs.log = lg; dcs.at = GetTickCount64();
+    g_autoAd[dkey] = dcs;
     log += lg;
     return found && other;
 }
@@ -992,7 +1017,9 @@ void Recorder::run() {
         // Auto GPU + hardware wanted: if the display adapter has no working encoder, move to one that has.
         if (opt_.gpuIndex < 0 && opt_.encoder != Encoder::Software && !opt_.forcePattern) {
             LUID pick{};
-            if (pickEncodeAdapter(fac.Get(), adapter.Get(), vendorPci(opt_.encoder), opt_.fps, pick, r.encoderLog)) {
+            if (pickEncodeAdapter(fac.Get(), adapter.Get(), vendorPci(opt_.encoder),
+                                  opt_.codec == Codec::HEVC ? MFVideoFormat_HEVC : opt_.codec == Codec::AV1 ? MFVideoFormat_AV1 : MFVideoFormat_H264,
+                                  opt_.fps, pick, r.encoderLog)) {
                 ComPtr<IDXGIAdapter1> a2;
                 for (UINT i = 0; fac->EnumAdapters1(i, &a2) != DXGI_ERROR_NOT_FOUND; ++i, a2.Reset()) {
                     DXGI_ADAPTER_DESC1 d{}; a2->GetDesc1(&d);
@@ -1974,7 +2001,7 @@ struct ReplayRing::Impl {
     static constexpr size_t kBlock = (size_t)4 << 20;
     std::vector<std::shared_ptr<Block>> blocks;  // pool (ring order); use_count()==1 -> free
     std::shared_ptr<Block> cur;
-    size_t blocksAllocated = 0, blocksReused = 0;
+    size_t blocksAllocated = 0, blocksReused = 0, blocksReleased = 0;
     Slice alloc(size_t len) {
         if (cur) cur->used = std::min(cur->cap, (cur->used + 15) & ~(size_t)15);  // 16-byte aligned slices (PCM is read as int16)
         if (cur && cur->cap - cur->used >= len) { Slice sl{cur, (uint32_t)cur->used, (uint32_t)len}; cur->used += len; return sl; }
@@ -1988,11 +2015,12 @@ struct ReplayRing::Impl {
         cur = nb;
         Slice sl{cur, 0, (uint32_t)len}; cur->used = len; return sl;
     }
-    // Free blocks beyond what the cap allows (after a shrink) are released.
+    // Free blocks beyond what the ring needs now are released: after a cap shrink, and after a slow save pinned
+    // old blocks (the pool grew meanwhile) - otherwise RAM would stay at up to ~2x the held size until restart.
     void releaseSpare() {
-        size_t keep = maxBytes / kBlock + 2;
+        size_t keep = std::min(maxBytes, bytes) / kBlock + 3;
         for (size_t i = 0; i < blocks.size() && blocks.size() > keep;)
-            if (blocks[i].use_count() == 1 && blocks[i] != cur) blocks.erase(blocks.begin() + (ptrdiff_t)i); else ++i;
+            if (blocks[i].use_count() == 1 && blocks[i] != cur) { blocks.erase(blocks.begin() + (ptrdiff_t)i); ++blocksReleased; } else ++i;
     }
     struct V { Slice s; LONGLONG t = 0, d = 0; bool key = false; size_t bytes = 0; };
     std::deque<V> v;
@@ -2097,8 +2125,8 @@ void ReplayRing::detach() { std::lock_guard<std::mutex> g(p_->m); p_->attached =
 std::wstring ReplayRing::stats() const {
     std::lock_guard<std::mutex> g(p_->m);
     wchar_t b[200];
-    swprintf(b, 200, L"replay ring: %zu packets, %zu audio chunks, %.1f MB held, arena %zu x 4 MB blocks (%zu allocated, %zu reused)",
-             p_->v.size(), p_->a.size(), p_->bytes / 1048576.0, p_->blocks.size(), p_->blocksAllocated, p_->blocksReused);
+    swprintf(b, 200, L"replay ring: %zu packets, %zu audio chunks, %.1f MB held, arena %zu x 4 MB blocks (%zu allocated, %zu reused, %zu released)",
+             p_->v.size(), p_->a.size(), p_->bytes / 1048576.0, p_->blocks.size(), p_->blocksAllocated, p_->blocksReused, p_->blocksReleased);
     return b;
 }
 
@@ -2126,6 +2154,7 @@ void ReplayRing::addVideo(IMFSample* s) {
                 p_->bytes += len;
                 if (t + p_->offset + d > p_->lastEnd) p_->lastEnd = t + p_->offset + d;
                 p_->trim();
+                if (clean && p_->blocks.size() > p_->bytes / Impl::kBlock + 3) p_->releaseSpare();  // once per GOP at most
             } catch (const std::bad_alloc&) { p_->oom(); }
         }
     }
@@ -2151,8 +2180,12 @@ void ReplayRing::addAudio(long long t, const std::vector<short>* const pcm[3]) {
 }
 
 bool ReplayRing::save(const std::wstring& path, double& savedSeconds, std::wstring& err) {
-    try { return saveImpl(path, savedSeconds, err); }
-    catch (const std::bad_alloc&) { savedSeconds = 0; err = L"Out of memory while saving the replay"; DeleteFileW(path.c_str()); return false; }
+    bool ok = false;
+    try { ok = saveImpl(path, savedSeconds, err); }
+    catch (const std::bad_alloc&) { savedSeconds = 0; err = L"Out of memory while saving the replay"; DeleteFileW(path.c_str()); ok = false; }
+    // the snapshot's slices are gone now: give back blocks the ring grew while the save held old ones
+    { std::lock_guard<std::mutex> g(p_->m); p_->releaseSpare(); }
+    return ok;
 }
 bool ReplayRing::saveImpl(const std::wstring& path, double& savedSeconds, std::wstring& err) {
     savedSeconds = 0;

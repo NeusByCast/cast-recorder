@@ -520,7 +520,8 @@ void stopRecording() {
     if (!g.rec.isActive()) return;
     playTone(IDR_SND_STOP);
     g.rec.stop();
-    notice(TK_STOPPED, L"Recording stopped", L"", L"");
+    // no "stopped" toast: the "Recording saved" / "Recording failed" one follows a moment later (one toast per stop)
+    cr::appLog(L"toast: \"Recording stopped\" folded into the saved/failed notice");
     setStatus(L"Finishing file\u2026", C_TEXT2);
     trayUpdate(NIM_MODIFY);
 }
@@ -1121,7 +1122,7 @@ void applyReplaySeconds(int v) {
 }
 // Encoder-relevant change: the replay buffer (when on) restarts on the new config, otherwise the warm-up re-probes.
 void scheduleReplayRestart();
-void encoderSettingsChanged() { if (g.s.replayEnabled && !g.rec.running()) scheduleReplayRestart(); else startWarmup(); }
+void encoderSettingsChanged() { cr::resetEncoderDecisions(); if (g.s.replayEnabled && !g.rec.running()) scheduleReplayRestart(); else startWarmup(); }
 void ddSet(int id, int i) {
     if (id == H_CTXMENU) { ctxAction(0, i); return; }
     switch (id) {
@@ -1453,6 +1454,9 @@ std::wstring nextFileName(const std::wstring& dir) {
         }
     }
     std::wstring base = W(fileNameFor(g.s.fileNamePattern, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, U(sourceNameForFile()), counter));
+    // source_date_time: the source part may be a window title -> the log shows it as "(N chars)" (saved / remux / recycle lines)
+    if (g.s.fileNamePattern == "source_date_time" && base.size() > 22 && g.target.kind == CaptureTarget::Window && !g_srcTitle.empty())
+        cr::addLogSecret(base.substr(0, base.size() - 20));
     std::wstring name = base;
     for (int k = 2; anyExists(dir + L"\\" + name) && k < 1000; ++k) name = base + L" (" + std::to_wstring(k) + L")";
     return name;
@@ -2666,7 +2670,7 @@ void composeCard(uint32_t* dst, int pw, int ph, int mPx, float s, float cwL, flo
     gp::Pen pen(st.border, 1.f); g.DrawPath(&pen, &bp);
 }
 // Vsync-timed animation clock: a helper thread waits on DwmFlush (the compositor's frame) and posts one
-// WM_APP_VSYNC at a time while something animates; frames are paced to ~60 Hz on high-refresh panels.
+// WM_APP_VSYNC at a time while something animates; paced to every Nth frame of the panel's refresh rate.
 constexpr UINT WM_APP_VSYNC = WM_APP + 77;
 std::atomic<bool> g_vsyncWant{false}, g_vsyncPosted{false};
 HANDLE g_vsyncEv = nullptr;
@@ -2677,13 +2681,23 @@ void vsyncKick() {
         started = true;
         g_vsyncEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         std::thread([] {
-            LARGE_INTEGER f, last{}; QueryPerformanceFrequency(&f);
+            // Every Nth compositor frame, N = floor(refresh / 60): an even cadence at the panel's own rhythm
+            // (60/75 Hz -> every frame, 120/144/165 Hz -> every 2nd = 60/72/82 fps, 240 Hz -> every 4th).
+            UINT n = 0, div = 1; ULONGLONG rateAt = 0;
             for (;;) {
-                if (!g_vsyncWant.load()) { WaitForSingleObject(g_vsyncEv, INFINITE); continue; }
-                if (FAILED(DwmFlush())) Sleep(8);  // composition off / remote session: plain timing
-                LARGE_INTEGER now; QueryPerformanceCounter(&now);
-                if (last.QuadPart && (now.QuadPart - last.QuadPart) * 1000 < f.QuadPart * 14) continue;  // <= ~60 Hz
-                last = now;
+                if (!g_vsyncWant.load()) { WaitForSingleObject(g_vsyncEv, INFINITE); n = 0; continue; }
+                ULONGLONG t = GetTickCount64();
+                if (t - rateAt > 1000) {  // the refresh rate can change (monitor switch, VRR / power plan)
+                    rateAt = t;
+                    DWM_TIMING_INFO ti{}; ti.cbSize = sizeof ti;
+                    double hz = 0;
+                    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.rateRefresh.uiDenominator)
+                        hz = (double)ti.rateRefresh.uiNumerator / ti.rateRefresh.uiDenominator;
+                    if (hz < 1) { DEVMODEW dm{}; dm.dmSize = sizeof dm; if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) hz = dm.dmDisplayFrequency; }
+                    div = hz >= 1 ? std::max(1u, (UINT)((hz + 1.0) / 60.0)) : 1;
+                }
+                if (FAILED(DwmFlush())) { Sleep(16); n = 0; }  // composition off / remote session: plain ~60 Hz timing
+                else if (++n % div) continue;
                 if (!g_vsyncPosted.exchange(true)) PostMessageW(g.hwnd, WM_APP_VSYNC, 0, 0);
             }
         }).detach();
@@ -3829,6 +3843,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             setStatus(L"Window closed  \u00b7  saved " + fname, toRef(T_WARN));
             g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; setSrcWindow(L"", L"", L"");
             g.gprev.setTarget(g.target);
+            notice(TK_SAVED, L"Recording saved", L"Window closed \u00b7 " + fname, r.file);
         } else if (r.ok) {
             std::wstring msg2 = L"Saved " + fname + L"  \u00b7  " + r.encoderUsed;
             if (!r.message.empty()) msg2 += L"  \u00b7  " + r.message;
@@ -3841,12 +3856,19 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             unsigned long long sz = GetFileAttributesExW(r.file.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
             std::wstring sub = fname + L" \u00b7 " + sizeText(sz);
             notice(TK_SAVED, L"Recording saved", sub, r.file);
-        } else if (r.abandoned) setStatus(r.file.empty() ? L"Encoder got stuck. Restart Cast Recorder to record again." : L"Encoder got stuck - kept " + fname + L". Restart Cast Recorder to record again.", toRef(T_WARN));
-        else if (!r.file.empty()) setStatus(L"Saved " + fname + L" (" + r.message + L")", toRef(T_WARN));
-        else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, toRef(T_WARN));
-        else {
+        } else if (r.abandoned) {
+            setStatus(r.file.empty() ? L"Encoder got stuck. Restart Cast Recorder to record again." : L"Encoder got stuck - kept " + fname + L". Restart Cast Recorder to record again.", toRef(T_WARN));
+            notice(TK_ERROR, L"Encoder got stuck", r.file.empty() ? L"Restart Cast Recorder" : L"Kept " + fname, r.file);
+        } else if (!r.file.empty()) {
+            setStatus(L"Saved " + fname + L" (" + r.message + L")", toRef(T_WARN));
+            notice(TK_SAVED, L"Recording saved", fname, r.file);
+        } else if (r.timedOut) {
+            setStatus(L"Stopped (timed out): " + r.message, toRef(T_WARN));
+            notice(TK_ERROR, L"Recording stopped", L"Timed out", L"");
+        } else {
             setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), toRef(T_ERR));
             if (!r.message.empty()) notice(TK_ERROR, L"Recording failed", r.message, L"");
+            else notice(TK_STOPPED, L"Recording stopped", L"", L"");
         }
         g_recBytes = 0;
         if (g_hkTestHook) g_hkTestHook(r.ok ? 101 : 201);
@@ -4465,12 +4487,16 @@ int runCli(int argc, wchar_t** argv) {
         ShowWindow(minW, SW_SHOWMINNOACTIVE);
         // a real but tiny captioned window (Windows clamps it to its minimum track size, ~146x39)
         HWND tinyW = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Tiny", WS_CAPTION | WS_SYSMENU | WS_VISIBLE, 500, 500, 146, 21, nullptr, nullptr, g.inst, nullptr);
+        // a second window of the same app on the same page: both must stay selectable ("... (2)")
+        HWND dupW = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Main - Brave", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 160, 160, 701, 501, nullptr, nullptr, g.inst, nullptr);
+        // odd-sized window, later grown mid-recording (scaled to fit, never cropped)
+        HWND oddW = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Odd", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 60, 60, 603, 403, nullptr, nullptr, g.inst, nullptr);
         pump(800);
         includeOwnWindowsForTest(true);
         auto ws = listCaptureWindows();
         std::string out;
         bool ok = true;
-        struct Case { const char* name; HWND h; bool expect; } cases[] = {{"main", mainW, true}, {"popup", popup, false}, {"hover", hover, false}, {"owned", owned, false}, {"minimized", minW, true}};
+        struct Case { const char* name; HWND h; bool expect; } cases[] = {{"main", mainW, true}, {"popup", popup, false}, {"hover", hover, false}, {"owned", owned, false}, {"minimized", minW, true}, {"duplicate", dupW, true}};
         for (auto& c : cases) {
             const CaptureWindow* f = nullptr;
             for (auto& w : ws) if (w.hwnd == c.h) f = &w;
@@ -4479,6 +4505,7 @@ int runCli(int argc, wchar_t** argv) {
             out += b;
             if ((f != nullptr) != c.expect) ok = false;
             if (f && c.h == mainW) out += "label=" + U(f->label()) + "\napp=" + U(f->app) + "\npage=" + U(f->page) + "\n";
+            if (f && c.h == dupW) out += "label_duplicate=" + U(f->label()) + "\n";
         }
         // a saved source whose title now matches only the popup must come back as the app's real window
         HWND r = resolveSavedWindow(windowExe(mainW), L"CR Picker Popup");
@@ -4486,7 +4513,7 @@ int runCli(int argc, wchar_t** argv) {
         if (r != mainW) ok = false;
         includeOwnWindowsForTest(false);
         // capture: the 146x21 popup and a window minimized at start must give an even, >= 128 px encode
-        for (auto& c : {std::make_pair("tiny", tinyW), std::make_pair("minimized", minW)}) {
+        for (auto& c : {std::make_pair("tiny", tinyW), std::make_pair("minimized", minW), std::make_pair("odd", oddW), std::make_pair("grow", oddW)}) {
             Recorder rec; RecordOptions ro = o;
             ro.window = c.second; ro.monitor = nullptr; ro.allDisplays = false;
             ro.encoder = Encoder::Software; ro.container = Container::MP4; ro.systemAudio = false; ro.mic = false; ro.testTone = false;
@@ -4495,6 +4522,7 @@ int runCli(int argc, wchar_t** argv) {
             ULONGLONG until = GetTickCount64() + 5000;
             while (rec.running() && !rec.started() && GetTickCount64() < until) pump(5);
             if (std::string(c.first) == "minimized") { pump(1200); ShowWindow(minW, SW_RESTORE); pump(1200); }  // restored mid-recording
+            else if (std::string(c.first) == "grow") { pump(1000); SetWindowPos(oddW, nullptr, 0, 0, 1001, 761, SWP_NOMOVE | SWP_NOZORDER); pump(1500); }
             else pump(2000);
             rec.stop(); rec.waitUntilIdle(15000);
             const RecordResult& rr = rec.result();
@@ -4502,10 +4530,17 @@ int runCli(int argc, wchar_t** argv) {
             size_t k = el.find("window capture output ");
             if (k != std::string::npos) size = el.substr(k + 22, el.find('\n', k) - (k + 22));
             out += std::string("capture_") + c.first + " ok=" + (rr.ok ? "1" : "0") + " output=" + size + " file=" + U(rr.file) + " message=" + U(rr.message) + "\n";
+            for (size_t q = 0; q < el.size();) {  // capture events (resized / restored / scaling) for the CI log
+                size_t e = el.find('\n', q); if (e == std::string::npos) e = el.size();
+                std::string line = el.substr(q, e - q);
+                if (line.find("resized") != std::string::npos || line.find("restored") != std::string::npos || line.find("scaling") != std::string::npos || line.find("minimized") != std::string::npos)
+                    out += std::string("  ") + c.first + " event: " + line + "\n";
+                q = e + 1;
+            }
             if (!rr.ok) ok = false;
         }
         out += std::string("picker_ok=") + (ok ? "1" : "0") + "\n";
-        DestroyWindow(tinyW); DestroyWindow(owned); DestroyWindow(hover); DestroyWindow(popup); DestroyWindow(minW); DestroyWindow(mainW);
+        DestroyWindow(oddW); DestroyWindow(dupW); DestroyWindow(tinyW); DestroyWindow(owned); DestroyWindow(hover); DestroyWindow(popup); DestroyWindow(minW); DestroyWindow(mainW);
         emit(out, stdout);
         return ok ? 0 : 1;
     }

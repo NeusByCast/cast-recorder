@@ -17,7 +17,7 @@ struct CaptureWindow {
     std::wstring label() const;  // "Brave · Cast Recorder v1.0 release"
 };
 // Real top-level app windows only (alt-tab rules: no tool windows, owned popups, hover cards, tooltips, media
-// popups, cloaked or tiny windows), one entry per app window (exact duplicates folded), grouped by app in z-order.
+// popups, cloaked or tiny windows), one entry per app window (same-title windows numbered "(2)", "(3)"), grouped by app in z-order.
 std::vector<CaptureWindow> listCaptureWindows();
 void includeOwnWindowsForTest(bool on);  // CI picker test: its test windows live in this process
 // Why a window is not offered (nullptr = offered). For logs and the CI picker test.

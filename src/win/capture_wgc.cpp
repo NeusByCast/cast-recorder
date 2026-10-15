@@ -43,6 +43,15 @@ struct WgcCapture::Impl {
     winrt::com_ptr<ID3D11VideoProcessorOutputView> vov;
     ID3D11Texture2D* vovFor = nullptr;
     bool vpBroken = false;
+    UINT vpCw = 0, vpCh = 0;  // content size the current VP rects were set for (scaleIn is a reusable bucket)
+    // no video processor (Basic Render / WARP / some VMs and RDP): downscale by 2^k with GenerateMips, centred
+    winrt::com_ptr<ID3D11Texture2D> mipTex;
+    winrt::com_ptr<ID3D11ShaderResourceView> mipSrv;
+    UINT mipW = 0, mipH = 0, mipLevels = 0;
+    bool mipBroken = false;
+    bool mipScale(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, UINT cw, UINT ch, ID3D11Texture2D* dst, bool clear);
+    UINT layoutW = 0, layoutH = 0; int layoutMode = -1;  // last placement in the output (to clear the bars once)
+    bool clearDst(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst);
     bool scaleTo(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, UINT cw, UINT ch, ID3D11Texture2D* dst);
     void applyInterval();
     winrt::com_ptr<ID3D11RenderTargetView> rtv;
@@ -118,7 +127,8 @@ bool WgcCapture::startWindow(ID3D11Device* dev, HWND hwnd, bool cursor, std::wst
                 // The placement includes the invisible resize borders (left/right/bottom) that WGC doesn't capture.
                 if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_THICKFRAME) {
                     UINT dpi = GetDpiForWindow(hwnd); if (!dpi) dpi = 96;
-                    LONG b = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    // invisible resize border = SIZEFRAME + PADDEDBORDER minus the 1 px visible edge (7 px at 100 % on Windows 10/11)
+                    LONG b = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) - 1;
                     if (nw > 3 * b && nh > 3 * b) { nw -= 2 * b; nh -= b; }
                 }
                 ow = (UINT)std::max<LONG>(0, nw); oh = (UINT)std::max<LONG>(0, nh);
@@ -153,16 +163,17 @@ bool WgcCapture::Impl::scaleTo(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, U
         if (!vdev) { vdev = dev.try_as<ID3D11VideoDevice>(); winrt::com_ptr<ID3D11DeviceContext> c; c.copy_from(ctx); vctx = c.try_as<ID3D11VideoContext>(); }
         if (!vdev || !vctx) { vpBroken = true; return false; }
         D3D11_TEXTURE2D_DESC od{}; dst->GetDesc(&od);
-        if (!scaleIn || scaleInW != cw || scaleInH != ch) {
-            scaleIn = nullptr; vp = nullptr; ven = nullptr; viv = nullptr; vov = nullptr; vovFor = nullptr;
+        if (!scaleIn || cw > scaleInW || ch > scaleInH) {  // grow in 256 px steps: no VP rebuild per pixel while drag-resizing
+            scaleIn = nullptr; vp = nullptr; ven = nullptr; viv = nullptr; vov = nullptr; vovFor = nullptr; vpCw = vpCh = 0;
+            UINT bw = std::min<UINT>((cw + 255) & ~255u, 16384), bh = std::min<UINT>((ch + 255) & ~255u, 16384);
             D3D11_TEXTURE2D_DESC td{};
-            td.Width = cw; td.Height = ch; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.Width = bw; td.Height = bh; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
             if (FAILED(dev->CreateTexture2D(&td, nullptr, scaleIn.put()))) { vpBroken = true; return false; }
-            scaleInW = cw; scaleInH = ch;
+            scaleInW = bw; scaleInH = bh;
             D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
             cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-            cd.InputWidth = cw; cd.InputHeight = ch; cd.OutputWidth = w; cd.OutputHeight = h;
+            cd.InputWidth = bw; cd.InputHeight = bh; cd.OutputWidth = w; cd.OutputHeight = h;
             cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
             if (FAILED(vdev->CreateVideoProcessorEnumerator(&cd, ven.put())) || FAILED(vdev->CreateVideoProcessor(ven.get(), 0, vp.put()))) { vpBroken = true; return false; }
             D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{}; ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
@@ -171,6 +182,11 @@ bool WgcCapture::Impl::scaleTo(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, U
             vctx->VideoProcessorSetStreamFrameFormat(vp.get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
             D3D11_VIDEO_COLOR bg{}; bg.RGBA.A = 1;
             vctx->VideoProcessorSetOutputBackgroundColor(vp.get(), FALSE, &bg);
+            RECT full{0, 0, (LONG)w, (LONG)h};
+            vctx->VideoProcessorSetOutputTargetRect(vp.get(), TRUE, &full);
+        }
+        if (vpCw != cw || vpCh != ch) {
+            vpCw = cw; vpCh = ch;
             double sa = (double)cw / ch, ta = (double)w / h;
             RECT d{0, 0, (LONG)w, (LONG)h};
             if (sa > ta) { LONG h2 = (LONG)(w / sa + 0.5) & ~1L; d.top = ((LONG)h - h2) / 2; d.bottom = d.top + h2; }
@@ -178,8 +194,6 @@ bool WgcCapture::Impl::scaleTo(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, U
             RECT s0{0, 0, (LONG)cw, (LONG)ch};
             vctx->VideoProcessorSetStreamSourceRect(vp.get(), 0, TRUE, &s0);
             vctx->VideoProcessorSetStreamDestRect(vp.get(), 0, TRUE, &d);
-            RECT full{0, 0, (LONG)w, (LONG)h};
-            vctx->VideoProcessorSetOutputTargetRect(vp.get(), TRUE, &full);
         }
         if (vovFor != dst) {
             vov = nullptr;
@@ -194,6 +208,39 @@ bool WgcCapture::Impl::scaleTo(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, U
         (void)od;
         return true;
     } catch (...) { vpBroken = true; return false; }
+}
+
+bool WgcCapture::Impl::clearDst(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst) {
+    if (!rtv || rtvFor != dst) { rtv = nullptr; dev->CreateRenderTargetView(dst, nullptr, rtv.put()); rtvFor = dst; }
+    if (!rtv) return false;
+    const float black[4] = {0, 0, 0, 1};
+    ctx->ClearRenderTargetView(rtv.get(), black);
+    return true;
+}
+bool WgcCapture::Impl::mipScale(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, UINT cw, UINT ch, ID3D11Texture2D* dst, bool clear) {
+    if (mipBroken) return false;
+    if (!mipTex || mipW != cw || mipH != ch) {
+        mipTex = nullptr; mipSrv = nullptr;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = cw; td.Height = ch; td.MipLevels = 0; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, mipTex.put())) || FAILED(dev->CreateShaderResourceView(mipTex.get(), nullptr, mipSrv.put()))) {
+            mipBroken = true; event(L"window scaling unavailable (no video processor, no mipmaps): cropping"); return false;
+        }
+        mipTex->GetDesc(&td);
+        mipW = cw; mipH = ch; mipLevels = td.MipLevels;
+    }
+    UINT k = 0;
+    while (k + 1 < mipLevels && ((cw >> k) > w || (ch >> k) > h)) ++k;
+    UINT sw = std::min(std::max(cw >> k, 1u), w), sh = std::min(std::max(ch >> k, 1u), h);
+    D3D11_BOX box{0, 0, 0, cw, ch, 1};
+    ctx->CopySubresourceRegion(mipTex.get(), 0, 0, 0, 0, src, 0, &box);
+    ctx->GenerateMips(mipSrv.get());
+    if (clear) clearDst(ctx, dst);
+    D3D11_BOX mb{0, 0, 0, sw, sh, 1};
+    ctx->CopySubresourceRegion(dst, 0, (w - sw) / 2, (h - sh) / 2, 0, mipTex.get(), D3D11CalcSubresource(k, 0, mipLevels), &mb);
+    return true;
 }
 
 bool WgcCapture::closed() const { return p_->isClosed.load() || (p_->hwnd && !IsWindow(p_->hwnd)); }
@@ -249,9 +296,7 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
         if (p_->hwnd && p_->wasIconic) {
             if (frame) frame.Close();
             if (!p_->anyFrame) {  // minimized at start: begin on black at the restored size; content follows on restore
-                if (!p_->rtv || p_->rtvFor != dst) { p_->rtv = nullptr; p_->dev->CreateRenderTargetView(dst, nullptr, p_->rtv.put()); p_->rtvFor = dst; }
-                const float black[4] = {0, 0, 0, 1};
-                if (p_->rtv) { ctx->ClearRenderTargetView(p_->rtv.get(), black); p_->anyFrame = true; gotNew = true; }
+                if (p_->clearDst(ctx, dst)) { p_->anyFrame = true; gotNew = true; }
             }
             return true;  // minimized: only the caption is rendered; hold the last frame
         }
@@ -273,15 +318,32 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
         D3D11_TEXTURE2D_DESC sd{}; tex->GetDesc(&sd);
         D3D11_TEXTURE2D_DESC dd{}; dst->GetDesc(&dd);
         UINT cw = std::min((UINT)std::max(cs.Width, 1), sd.Width), ch = std::min((UINT)std::max(cs.Height, 1), sd.Height);
-        bool scaled = false;
-        if (p_->hwnd && dx == 0 && dy == 0 && (cw != p_->w || ch != p_->h) && cw >= 2 && ch >= 2)
-            scaled = p_->scaleTo(ctx, tex.get(), cw, ch, dst);  // fit the window into the fixed output (letterbox)
-        if (!scaled) {
-            if (p_->hwnd && (contentChanged || (cw != p_->w || ch != p_->h))) {  // 1:1 top-left, rest black
-                if (!p_->rtv || p_->rtvFor != dst) { p_->rtv = nullptr; p_->dev->CreateRenderTargetView(dst, nullptr, p_->rtv.put()); p_->rtvFor = dst; }
-                const float black[4] = {0, 0, 0, 1};
-                if (p_->rtv && contentChanged) ctx->ClearRenderTargetView(p_->rtv.get(), black);
+        if (p_->hwnd && dx == 0 && dy == 0) {
+            // Window: 1:1 centred when it fits (odd sizes get a 1 px pad, never a resample); larger -> scale to fit.
+            bool fits = cw <= p_->w && ch <= p_->h;
+            int mode = fits ? 0 : 1;
+            bool relayout = contentChanged || cw != p_->layoutW || ch != p_->layoutH || mode != p_->layoutMode;
+            if (relayout) { p_->layoutW = cw; p_->layoutH = ch; p_->layoutMode = mode; }
+            bool done = false;
+            if (fits) {
+                if (relayout) p_->clearDst(ctx, dst);
+                D3D11_BOX box{0, 0, 0, cw, ch, 1};
+                ctx->CopySubresourceRegion(dst, 0, (p_->w - cw) / 2, (p_->h - ch) / 2, 0, tex.get(), 0, &box);
+                done = true;
+            } else {
+                if (cw >= 2 && ch >= 2) done = p_->scaleTo(ctx, tex.get(), cw, ch, dst);
+                if (!done && cw >= 2 && ch >= 2) {
+                    if (relayout) p_->event(L"no video processor: scaling " + std::to_wstring(cw) + L"x" + std::to_wstring(ch) + L" by halves");
+                    done = p_->mipScale(ctx, tex.get(), cw, ch, dst, relayout);
+                }
+                if (!done) {  // last resort: centre crop
+                    if (relayout) p_->clearDst(ctx, dst);
+                    UINT sw = std::min(cw, p_->w), sh = std::min(ch, p_->h);
+                    D3D11_BOX box{(cw - sw) / 2, (ch - sh) / 2, 0, (cw - sw) / 2 + sw, (ch - sh) / 2 + sh, 1};
+                    ctx->CopySubresourceRegion(dst, 0, (p_->w - sw) / 2, (p_->h - sh) / 2, 0, tex.get(), 0, &box);
+                }
             }
+        } else {
             int bw = std::min(std::min((int)cw, (int)p_->w), (int)dd.Width - dx), bh = std::min(std::min((int)ch, (int)p_->h), (int)dd.Height - dy);
             if (dx >= 0 && dy >= 0 && bw > 0 && bh > 0) {
                 D3D11_BOX box{0, 0, 0, (UINT)bw, (UINT)bh, 1};
