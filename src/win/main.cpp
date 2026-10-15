@@ -4195,6 +4195,7 @@ int runCli(int argc, wchar_t** argv) {
         "  --log FILE           also write the result summary to FILE\n"
         "  --allow-synthetic    use a test pattern if screen capture is unavailable (CI)\n"
         "  --pattern            record the static test pattern instead of the screen (CI quality/fps)\n"
+        "  --moving-pattern     record a moving test pattern (every frame differs; CI replay ring)\n"
         "  --render-pattern FILE.bmp  write the test pattern reference image\n"
         "  --system-audio / --mic     record system audio / the default microphone\n"
         "  --test-tone          add a synthetic 440 Hz audio source (CI)\n"
@@ -4261,6 +4262,7 @@ int runCli(int argc, wchar_t** argv) {
         std::string v;
         if (a == L"--allow-synthetic") { o.allowSynthetic = true; continue; }
         if (a == L"--pattern") { o.forcePattern = true; continue; }
+        if (a == L"--moving-pattern") { o.forcePattern = o.movingPattern = true; continue; }
         if (a == L"--system-audio") { o.systemAudio = true; continue; }
         if (a == L"--mic") { o.mic = true; continue; }
         if (a == L"--test-tone") { o.testTone = true; continue; }

@@ -1103,7 +1103,7 @@ void Recorder::run() {
         }
         if (!src && (opt_.allowSynthetic || opt_.forcePattern)) {
             auto s = std::make_unique<SyntheticSource>();
-            s->still = opt_.forcePattern;
+            s->still = opt_.forcePattern && !opt_.movingPattern;
             if (s->init(dev.Get())) src = std::move(s);
         }
         if (!src) { r.message = L"Screen capture unavailable: " + (capErr.empty() ? std::wstring(L"no output") : capErr); return; }

@@ -60,6 +60,7 @@ struct RecordOptions {
     bool captureCursor = true;
     bool allowSynthetic = false;
     bool forcePattern = false;       // CI: static test pattern instead of the screen (quality / fps checks)
+    bool movingPattern = false;      // CI: with forcePattern, the moving pattern (every frame differs)
     bool systemAudio = true;         // WASAPI loopback of the default output device
     bool mic = false;
     std::wstring micId;              // empty = default microphone
