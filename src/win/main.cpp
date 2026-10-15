@@ -3774,6 +3774,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g.warm.running()) { writeSessionLog(g.warm.result(), L"warm-up (encoder probe cache)"); g.warmLogged = true; }
         startReplayBuffer();
         return 0;
+    case WM_APP_ENCODER_SWITCHED: {  // a stalled encoder was replaced live: small status note, not an error
+        std::unique_ptr<std::wstring> m((std::wstring*)lp);
+        if (m) { cr::appLog(L"encoder: " + *m); if (!g.quitting) setStatus(*m, C_TEXT2); }
+        return 0;
+    }
     case WM_APP_RECORDER_STARTED:
         if (g.rec.isActive()) { playTone(IDR_SND_START); notice(TK_STARTED, L"Recording started", L"", L""); }
         return 0;
@@ -4212,6 +4217,7 @@ int runCli(int argc, wchar_t** argv) {
         "  --replay SECONDS     keep an instant-replay buffer (5..900 s) while recording\n"
         "  --replay-only        buffer only, write no recording (with --save-replay-at)\n"
         "  --save-replay-at S   save the replay buffer S seconds in; --replay-out FILE.mp4\n"
+        "  --test-encoder-stall S  the encoder stops producing output S seconds in (CI: live encoder switch)\n"
         "  --remux IN OUT       stream-copy IN to OUT (no re-encode); --remux-engine mf|ffmpeg\n"
         "  --list-encoders      codec x vendor encoders available on this machine\n"
         "  --test-toast FILE.png / --test-toast-visible FILE.png  show a magenta toast (excluded from capture, or not),\n"
@@ -4297,7 +4303,7 @@ int runCli(int argc, wchar_t** argv) {
             && a != L"--test-hang-finalize" && a != L"--test-slow-post" && a != L"--test-late-publish" && a != L"--replay-max-mb" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--ui-size" && a != L"--render-pattern" && a != L"--window"
             && a != L"--source" && a != L"--noise-suppression" && a != L"--noise-gate" && a != L"--mic-volume" && a != L"--channels"
             && a != L"--codec" && a != L"--auto-remux" && a != L"--replay" && a != L"--save-replay-at" && a != L"--replay-out" && a != L"--remux"
-            && a != L"--remux-engine" && a != L"--test-toast" && a != L"--test-toast-visible" && a != L"--ui-theme" && a != L"--test-window-picker")
+            && a != L"--remux-engine" && a != L"--test-toast" && a != L"--test-toast-visible" && a != L"--ui-theme" && a != L"--test-window-picker" && a != L"--test-encoder-stall")
             return bad("unknown option " + U(a));
         if (!value(v)) return bad(U(a) + " needs a value");
         if (a == L"--codec") {
@@ -4317,6 +4323,10 @@ int runCli(int argc, wchar_t** argv) {
             char* end = nullptr; double d = strtod(v.c_str(), &end);
             if (v.empty() || !end || *end || !(d > 0) || d > 86400) return bad("--save-replay-at must be seconds > 0");
             saveReplayAt = d;
+        } else if (a == L"--test-encoder-stall") {
+            char* end = nullptr; double d = strtod(v.c_str(), &end);
+            if (v.empty() || !end || *end || !(d > 0) || d > 86400) return bad("--test-encoder-stall must be seconds > 0");
+            o.testStallAfterSec = d;
         } else if (a == L"--replay-out") { replayOut = W(v);
         } else if (a == L"--remux") {
             if (i + 1 >= argc) return bad("--remux needs IN and OUT");
@@ -4678,7 +4688,7 @@ int runCli(int argc, wchar_t** argv) {
         warmInfo += b;
     }
     std::string extra = warmInfo + replayInfo + "state=" + std::string(toString(r.state())) + "\n";
-    extra += "codec=" + U(res.codec) + " audio_tracks=" + std::to_string(res.audioTracks) + " fragmented=" + (res.fragmented ? "1" : "0") + "\n";
+    extra += "codec=" + U(res.codec) + " audio_tracks=" + std::to_string(res.audioTracks) + " fragmented=" + (res.fragmented ? "1" : "0") + " encoder_switches=" + std::to_string(res.encoderSwitches) + "\n";
     if (pausedOnce) { char b[96]; snprintf(b, sizeof b, "paused_ms=%llu pauses=%llu\n", pausedWall, res.pauses); extra += b; }
     if (res.abandoned) {  // same process: MF is poisoned, a second session must be refused
         bool again = r.start(o);

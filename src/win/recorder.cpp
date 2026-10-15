@@ -33,6 +33,7 @@
 #include "windows_enum.h"
 #include <future>
 #include <map>
+#include <set>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
@@ -700,42 +701,74 @@ std::wstring describeHardwareEncoders() {
     return s;
 }
 
-// Process-wide encoder probe cache: (adapter LUID, encoder ordinal, input format) -> worked?
-// Filled by the startup warm-up so pressing Record never waits on probes (3 AMD MFTs x ~1.5-2.5 s each).
+// Process-wide encoder probe cache: (adapter LUID, encoder ordinal, input format, codec) -> worked? + which setup.
+// Filled by the startup warm-up so pressing Record never waits on probes.
 static std::atomic<bool> g_writerWarm{false};
 static std::mutex g_probeM;
 static std::map<std::wstring, int> g_probe;  // 1 ok, 0 failed, 2 being probed (by the warm-up)
+static std::map<std::wstring, int> g_probeCfg;  // key -> EncCfg that passed
 static std::condition_variable g_probeCv;
-static std::map<std::wstring, ULONGLONG> g_probeFailAt;  // a FAIL is retried after 60 s (transient: dGPU waking up, driver busy)
-static std::wstring probeKey(ID3D11Device* dev, const HwEncoderInfo& e) {
+static std::map<std::wstring, ULONGLONG> g_probeFailAt;  // a FAIL is retried after kProbeFailTtlMs (transient: dGPU waking up, driver busy)
+static constexpr ULONGLONG kProbeFailTtlMs = 300000;  // 5 min: a re-probe of every setup variant costs seconds
+static std::map<std::wstring, ULONGLONG> g_nameFailAt;   // adapter/name/codec: every setup failed -> same-name duplicates skipped
+static std::set<std::wstring> g_runtimeFail;              // adapter/name/codec stalled in a real session: not used again this run
+static std::wstring adapterTag(ID3D11Device* dev) {
     ComPtr<IDXGIDevice> d; ComPtr<IDXGIAdapter> a; DXGI_ADAPTER_DESC ad{};
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d))) && SUCCEEDED(d->GetAdapter(&a))) a->GetDesc(&ad);
-    wchar_t b[128];
-    // "v2": probe at a fixed size with the drain/eager-input loop (v1.0 cached FAILs from a tiny-window probe).
-    swprintf(b, 128, L"v2/%08lX:%08lX/%d/%ls/%d/%ls", (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart, e.index, e.vendor.c_str(), e.argb ? 1 : 0, codecName(e.subtype));
+    wchar_t b[40]; swprintf(b, 40, L"%08lX:%08lX", (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart);
     return b;
 }
+static std::wstring probeKey(ID3D11Device* dev, const HwEncoderInfo& e) {
+    wchar_t b[160];
+    // "v3": sustained 1 s real-time probe with setup variants (v2 passed on the first output and missed later stalls).
+    swprintf(b, 160, L"v3/%ls/%d/%ls/%d/%ls", adapterTag(dev).c_str(), e.index, e.vendor.c_str(), e.argb ? 1 : 0, codecName(e.subtype));
+    return b;
+}
+static std::wstring nameKey(ID3D11Device* dev, const HwEncoderInfo& e) {
+    return adapterTag(dev) + L"/" + e.name + L"/" + e.vendor + L"/" + (e.argb ? L"1/" : L"0/") + codecName(e.subtype);
+}
+
+// An encoder that passed its probe but stalled in a real session: never picked again in this run (until the encoder
+// or GPU setting changes), and Auto GPU decides again (e.g. back to the display adapter + software).
+void markEncoderRuntimeFailed(ID3D11Device* dev, const HwEncoderInfo& e);
 
 // Probe with the process-wide cache; waits for a concurrent probe of the same encoder instead of starting another.
-static bool cachedProbe(ID3D11Device* dev, const HwEncoderInfo& e, int fps, std::wstring& elog, bool* wasCached = nullptr) {
-    const std::wstring key = probeKey(dev, e);
+// Tries the setup variants in order and stores the first one that sustains real-time output in e.cfg.
+static bool cachedProbe(ID3D11Device* dev, HwEncoderInfo& e, int fps, std::wstring& elog, bool* wasCached = nullptr) {
+    const std::wstring key = probeKey(dev, e), nk = nameKey(dev, e);
     int cached = -1;
+    bool nameFailed = false, runtimeFailed = false;
     {
         std::unique_lock<std::mutex> g(g_probeM);
-        g_probeCv.wait_for(g, std::chrono::seconds(8), [&] { auto it = g_probe.find(key); return it == g_probe.end() || it->second != 2; });
+        g_probeCv.wait_for(g, std::chrono::seconds(20), [&] { auto it = g_probe.find(key); return it == g_probe.end() || it->second != 2; });
+        runtimeFailed = g_runtimeFail.count(nk) > 0;
         auto it = g_probe.find(key);
         if (it != g_probe.end() && it->second == 0) {
             auto f = g_probeFailAt.find(key);
-            if (f != g_probeFailAt.end() && GetTickCount64() - f->second >= 60000) { g_probe.erase(it); g_probeFailAt.erase(f); it = g_probe.end(); }
+            if (f != g_probeFailAt.end() && GetTickCount64() - f->second >= kProbeFailTtlMs) { g_probe.erase(it); g_probeFailAt.erase(f); it = g_probe.end(); }
         }
-        if (it != g_probe.end() && it->second != 2) cached = it->second;
-        else g_probe[key] = 2;
+        auto nf = g_nameFailAt.find(nk);
+        if (nf != g_nameFailAt.end() && GetTickCount64() - nf->second < kProbeFailTtlMs) nameFailed = true;
+        if (it != g_probe.end() && it->second != 2) { cached = it->second; if (cached == 1) e.cfg = g_probeCfg[key]; }
+        else if (!runtimeFailed && !nameFailed) g_probe[key] = 2;
     }
-    if (wasCached) *wasCached = cached >= 0;
+    if (wasCached) *wasCached = cached >= 0 || runtimeFailed || nameFailed;
+    if (runtimeFailed) { elog += L"probe " + e.name + L": stalled in an earlier session this run, skipped\n"; return false; }
     if (cached == 0) { elog += L"probe " + e.name + L": cached FAIL (this run), skipped\n"; return false; }
-    if (cached == 1) { elog += L"probe " + e.name + L": cached OK\n"; return true; }
-    bool okp = probeHwEncoder(dev, e, kProbeW, kProbeH, fps, 4500, elog);
-    { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp ? 1 : 0; if (!okp) g_probeFailAt[key] = GetTickCount64(); }
+    if (cached == 1) { elog += L"probe " + e.name + L": cached OK (" + encCfgName(e.cfg) + L")\n"; return true; }
+    if (nameFailed) { elog += L"probe " + e.name + L" [" + std::to_wstring(e.index) + L"]: same MFT as one that failed every setup, skipped\n"; return false; }
+    bool okp = false;
+    for (int c = 0; c < kCfgCount && !okp; ++c) {
+        if (c == kCfgSysMem && e.argb) continue;
+        e.cfg = c;
+        okp = probeHwEncoder(dev, e, kProbeW, kProbeH, fps, 3500, elog);
+    }
+    if (!okp) e.cfg = kCfgDefault;
+    {
+        std::lock_guard<std::mutex> g(g_probeM);
+        g_probe[key] = okp ? 1 : 0;
+        if (okp) g_probeCfg[key] = e.cfg; else { g_probeFailAt[key] = GetTickCount64(); g_nameFailAt[nk] = GetTickCount64(); }
+    }
     g_probeCv.notify_all();
     return okp;
 }
@@ -752,7 +785,11 @@ static std::map<std::wstring, AutoAdDecision> g_autoAd;
 static constexpr ULONGLONG kAutoFailTtlMs = 60000;
 void resetEncoderDecisions() {
     { std::lock_guard<std::mutex> lk(g_autoAdM); for (auto it = g_autoAd.begin(); it != g_autoAd.end();) it = it->second.found ? std::next(it) : g_autoAd.erase(it); }
-    { std::lock_guard<std::mutex> g(g_probeM); for (auto it = g_probe.begin(); it != g_probe.end();) it = it->second == 0 ? g_probe.erase(it) : std::next(it); g_probeFailAt.clear(); }
+    { std::lock_guard<std::mutex> g(g_probeM); for (auto it = g_probe.begin(); it != g_probe.end();) it = it->second == 0 ? g_probe.erase(it) : std::next(it); g_probeFailAt.clear(); g_nameFailAt.clear(); g_runtimeFail.clear(); }
+}
+void markEncoderRuntimeFailed(ID3D11Device* dev, const HwEncoderInfo& e) {
+    { std::lock_guard<std::mutex> g(g_probeM); g_runtimeFail.insert(nameKey(dev, e)); g_probe[probeKey(dev, e)] = 0; g_probeFailAt[probeKey(dev, e)] = GetTickCount64(); }
+    { std::lock_guard<std::mutex> lk(g_autoAdM); g_autoAd.clear(); }  // Auto GPU decides again next session
 }
 static bool pickEncodeAdapter(IDXGIFactory1* fac, IDXGIAdapter1* display, UINT wantVendor, const GUID& codec, int fps, LUID& out, std::wstring& log) {
     std::lock_guard<std::mutex> lk(g_autoAdM);
@@ -1188,6 +1225,11 @@ void Recorder::run() {
         ComPtr<IMFMediaBuffer> swLast;
         bool latestDirty = true;
         unsigned long long swReadbacks = 0, swReused = 0, swPoolNew = 0;
+        // Live encoder switch state: what is encoding now, and what else on this device passed its probe.
+        HwEncoderInfo curInfo; bool curHw = false; GUID curSub = MFVideoFormat_H264;
+        std::vector<HwEncoderInfo> hwCands;
+        bool hwSys = false;          // hardware MFT fed CPU NV12 (kCfgSysMem): same buffer path as the software MFT
+        bool needRetype = false;     // replay ring takes the new encoder's type (keeping its packets) on its next packet
         auto swBuffer = [&](DWORD bytes) -> ComPtr<IMFMediaBuffer> {
             for (auto& b : swPool) {
                 if (b == swLast) continue;
@@ -1207,7 +1249,8 @@ void Recorder::run() {
         auto resetWriter = [&] { bool wa = wr.wantAudio, fr = wr.fragmented; int tr = wr.tracks; UINT32 ch = wr.achannels; wr = Writer{}; wr.wantAudio = wa; wr.tracks = tr; wr.achannels = ch; wr.fragmented = fr; };
         auto muxOut = [&](IMFSample* es) -> HRESULT {
             if (replay) {
-                if (!ringAttached) { ComPtr<IMFMediaType> ot = hw->muxType(); replay->attach(ot.Get(), opt_.fps, (int)wr.achannels, wr.tracks, wr.wantAudio); ringAttached = true; }
+                if (!ringAttached) { ComPtr<IMFMediaType> ot = hw->muxType(); replay->attach(ot.Get(), opt_.fps, (int)wr.achannels, wr.tracks, wr.wantAudio); ringAttached = true; needRetype = false; }
+                else if (needRetype) { ComPtr<IMFMediaType> ot = hw->muxType(); replay->retype(ot.Get()); needRetype = false; }
                 replay->addVideo(es);
             }
             if (!toFile) return S_OK;
@@ -1224,6 +1267,23 @@ void Recorder::run() {
         double convMs = 0, encMs = 0;
         LONGLONG lastOutTick = 0;
         unsigned long long lastOutCount = 0;
+        // CPU NV12 input (software MFT, hardware MFT in system-memory mode, or after a live switch to software):
+        // GPU BGRA->NV12 (+scale) and an NV12 readback where the video processor works, CPU conversion otherwise.
+        auto prepCpuInput = [&]() -> bool {
+            if (!cpuStaging) {
+                D3D11_TEXTURE2D_DESC sd = td; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                if (FAILED(dev->CreateTexture2D(&sd, nullptr, &cpuStaging))) { r.message = L"CreateTexture2D(cpuStaging) failed"; return false; }
+            }
+            nv12Cpu.resize((size_t)W * H * 3 / 2);
+            if (!swGpu && videoSupport && conv.init(dev.Get(), src->w, src->h, W, H)) {
+                D3D11_TEXTURE2D_DESC nd{}; nd.Width = W; nd.Height = H; nd.MipLevels = 1; nd.ArraySize = 1; nd.Format = DXGI_FORMAT_NV12;
+                nd.SampleDesc.Count = 1; nd.Usage = D3D11_USAGE_STAGING; nd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                swGpu = SUCCEEDED(dev->CreateTexture2D(&nd, nullptr, &nv12Staging));
+            }
+            if (!swGpu) conv = GpuConvert{};
+            elog += swGpu ? L"CPU NV12 input: GPU NV12 conversion + NV12 readback\n" : L"CPU NV12 input: CPU NV12 conversion (no GPU video processor)\n";
+            return true;
+        };
         auto setup = [&]() -> bool {
             audioReady.wait();
             r.encoderLog += alog;
@@ -1280,8 +1340,11 @@ void Recorder::run() {
                         auto enc = std::make_unique<HwEncoder>();
                         unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
                         if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog) && muxable(*enc)) {
-                            hw = std::move(enc); zeroCopy = true; opened = true;
-                            r.encoderUsed = std::wstring(vendorLabel(e.vendor)) + L" (hardware)";
+                            hwSys = enc->sysmem();
+                            hw = std::move(enc); zeroCopy = !hwSys; opened = true;
+                            curInfo = e; curHw = true; curSub = st;
+                            hwCands = encs;
+                            r.encoderUsed = std::wstring(vendorLabel(e.vendor)) + L" (hardware" + (hwSys ? L", system-memory input)" : e.cfg ? L", " + std::wstring(encCfgName(e.cfg)) + L")" : L")");
                             break;
                         }
                         enc->release();
@@ -1298,13 +1361,14 @@ void Recorder::run() {
                 auto enc = std::make_unique<HwEncoder>();
                 unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
                 if (enc->openSoftware(W, H, opt_.fps, br, opt_.quality >= Quality::High, elog, st) && muxable(*enc)) {
-                    hw = std::move(enc); swNv12 = true; opened = true;
+                    hw = std::move(enc); swNv12 = true; opened = true; curHw = false; curSub = st;
                     r.encoderUsed = L"Software (Media Foundation " + std::wstring(codecName(st)) + L")";
                     if (opt_.encoder != Encoder::Software) r.encoderUsed += L", hardware encoder unavailable";
                 } else enc->release();
             }
             if (opened) r.codec = codecName(st);
             }
+            if (hwSys) swNv12 = true;  // hardware MFT in system-memory mode: CPU NV12 buffers like the software MFT
             if (!opened && !toFile) { r.message = L"Replay buffer needs an encoder MFT (none could be opened)"; return false; }
             if (!opened) {
                 opened = wr.open(tmp, dev.Get(), W, H, opt_, false, false, err);
@@ -1329,18 +1393,7 @@ void Recorder::run() {
             for (auto& t : ring) if (FAILED(dev->CreateTexture2D(&ed, nullptr, &t))) { r.message = L"CreateTexture2D(ring) failed"; return false; }
             // Zero-copy safety net: last good NV12 frame (separate texture, survives processor rebuilds) and a
             // BGRA staging texture for the CPU fallback if the GPU video processor keeps failing.
-            if (swNv12) {
-                D3D11_TEXTURE2D_DESC sd = td; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                if (FAILED(dev->CreateTexture2D(&sd, nullptr, &cpuStaging))) { r.message = L"CreateTexture2D(cpuStaging) failed"; return false; }
-                nv12Cpu.resize((size_t)W * H * 3 / 2);
-                if (videoSupport && conv.init(dev.Get(), src->w, src->h, W, H)) {
-                    D3D11_TEXTURE2D_DESC nd{}; nd.Width = W; nd.Height = H; nd.MipLevels = 1; nd.ArraySize = 1; nd.Format = DXGI_FORMAT_NV12;
-                    nd.SampleDesc.Count = 1; nd.Usage = D3D11_USAGE_STAGING; nd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                    swGpu = SUCCEEDED(dev->CreateTexture2D(&nd, nullptr, &nv12Staging));
-                }
-                if (!swGpu) conv = GpuConvert{};
-                elog += swGpu ? L"software encode: GPU NV12 conversion + NV12 readback\n" : L"software encode: CPU NV12 conversion (no GPU video processor)\n";
-            }
+            if (swNv12) { conv = GpuConvert{}; if (!prepCpuInput()) return false; }
             if (zeroCopy) {
                 if (!bgraDirect && FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return false; }
             }
@@ -1369,6 +1422,66 @@ void Recorder::run() {
             mark(L"writer_prewarm");
             return true;
             };
+
+        // ---- live encoder switch: a stalled encoder never ends the recording / replay buffer ----
+        // Next: another hardware encoder on this device that already passed its probe (no probing mid-session),
+        // finally the software MFT. The writer and the replay ring keep going (in-band parameter sets on key frames).
+        int switches = 0;
+        auto switchEncoder = [&](const wchar_t* why) -> bool {
+            const std::wstring oldLabel = hw ? hw->label : std::wstring(L"encoder");
+            {
+                wchar_t b[400];
+                swprintf(b, 400, L"encoder switch: %ls %ls (in=%llu out=%llu raw=%llu NeedInput=%llu HaveOutput=%llu queued=%zu backpressure=%llu polled=%llu)\n",
+                         oldLabel.c_str(), why, hw ? hw->inputs : 0ull, hw ? hw->outputs : 0ull, hw ? hw->rawOutputs : 0ull, hw ? hw->evNeedInput : 0ull,
+                         hw ? hw->evHaveOutput : 0ull, hw ? hw->queued() : (size_t)0, hw ? hw->backpressureDrops : 0ull, hw ? hw->polledOutputs : 0ull);
+                elog += b;
+            }
+            if (curHw) markEncoderRuntimeFailed(dev.Get(), curInfo);
+            if (hw) { hw->leak(); hw.reset(); }  // stalled: never touch it again (a drain could block)
+            const unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
+            const bool high = opt_.quality >= Quality::High;
+            std::unique_ptr<HwEncoder> enc;
+            std::wstring used;
+            if (curHw && !bgraDirect) {
+                for (auto& e : hwCands) {
+                    if (e.name == curInfo.name && e.vendor == curInfo.vendor) continue;  // same MFT: would stall the same way
+                    bool cached = false;
+                    { std::lock_guard<std::mutex> g(g_probeM); auto it = g_probe.find(probeKey(dev.Get(), e)); cached = it != g_probe.end() && it->second == 1; if (cached) e.cfg = g_probeCfg[probeKey(dev.Get(), e)]; }
+                    if (!cached) continue;
+                    if (swNv12 && e.cfg != kCfgSysMem) continue;  // CPU-buffer path already: only a system-memory setup fits
+                    if (!swNv12 && e.cfg == kCfgSysMem && !videoSupport) continue;
+                    auto c = std::make_unique<HwEncoder>();
+                    if (c->open(dev.Get(), e, W, H, opt_.fps, br, high, elog)) { enc = std::move(c); curInfo = e; used = std::wstring(vendorLabel(e.vendor)) + L" (hardware)"; break; }
+                    c->release();
+                }
+            }
+            if (!enc) {
+                auto c = std::make_unique<HwEncoder>();
+                if (c->openSoftware(W, H, opt_.fps, br, high, elog, curSub)) { enc = std::move(c); used = L"Software (Media Foundation " + std::wstring(codecName(curSub)) + L")"; }
+                else if (curSub != MFVideoFormat_H264 && !wr.sw && !ringAttached) {  // nothing written yet: H.264 is fine too
+                    c = std::make_unique<HwEncoder>();
+                    if (c->openSoftware(W, H, opt_.fps, br, high, elog, MFVideoFormat_H264)) { enc = std::move(c); curSub = MFVideoFormat_H264; r.codec = L"H.264"; used = L"Software (Media Foundation H.264)"; }
+                }
+                curHw = false;
+            }
+            if (!enc) { elog += L"encoder switch: no other encoder could be opened\n"; return false; }
+            if (enc->sysmem() || !curHw) {
+                if (!swNv12) { swNv12 = true; zeroCopy = false; bgraDirect = false; if (!prepCpuInput()) return false; }
+            }
+            hw = std::move(enc);
+            if (opt_.testStallAfterSec > 0) hw->testStall = false;
+            needRetype = true;
+            lastOutTick = 0; lastOutCount = 0;
+            latestDirty = true; swLast.Reset();
+            ++switches; r.encoderSwitches = switches;
+            r.encoderUsed = used + L", switched from " + oldLabel + L" (stalled)";
+            elog += L"encoder switch: now " + used + L"\n";
+            if (opt_.notify) {
+                auto* msg = new std::wstring(L"Encoder switched to " + used + L" (" + oldLabel + L" stopped responding)");
+                if (!PostMessageW(opt_.notify, WM_APP_ENCODER_SWITCHED, 0, (LPARAM)msg)) delete msg;
+            }
+            return true;
+        };
 
         if (opt_.warmupOnly) {
             setup();
@@ -1594,10 +1707,20 @@ void Recorder::run() {
                 if (SUCCEEDED(whr)) { smp->AddBuffer(buf.Get()); smp->SetSampleTime(next * dur); smp->SetSampleDuration(dur); whr = hw->encode(smp.Get(), muxOut); }
                 if (whr == S_FALSE) { whr = S_OK; counted = false; ++r.dropped; }  // encoder backpressure: drop, never block
                 if (FAILED(muxHr)) whr = muxHr;
-                // Runtime stall guard: no encoded output for 2 s while we keep feeding -> end cleanly (no hang).
+                // Runtime stall guard: no encoded output for 2 s while we keep feeding -> switch to the next encoder
+                // (the recording / replay buffer keeps going); only if nothing else opens does the session end.
+                // Before that: offer queued input directly (300 ms) and ask for output without an event (500 ms).
                 LARGE_INTEGER nw; QueryPerformanceCounter(&nw);
+                if (opt_.testStallAfterSec > 0 && !switches && !hw->testStall && nw.QuadPart - t0.QuadPart > (LONGLONG)(opt_.testStallAfterSec * freq.QuadPart)) { hw->testStall = true; elog += L"test: encoder stall injected\n"; }
                 if (hw->outputs != lastOutCount || !lastOutTick) { lastOutCount = hw->outputs; lastOutTick = nw.QuadPart; }
-                else if (nw.QuadPart - lastOutTick > 2 * freq.QuadPart) { r.message = L"Hardware encoder stopped responding - recording ended early"; r.encoderStalled = true; break; }
+                else if (nw.QuadPart - lastOutTick > 2 * freq.QuadPart) {
+                    if (!switchEncoder(L"produced no output for 2 s")) { r.message = L"Hardware encoder stopped responding - recording ended early"; r.encoderStalled = true; break; }
+                    counted = false;
+                } else if (nw.QuadPart - lastOutTick > freq.QuadPart * 3 / 10) {
+                    HRESULT rh = hw->tryEagerInput();
+                    if (SUCCEEDED(rh) && nw.QuadPart - lastOutTick > freq.QuadPart / 2) rh = hw->pollOutput(muxOut);
+                    (void)rh;
+                }
             } else if (SUCCEEDED(whr) && buf) whr = wr.write(buf.Get(), next * dur, dur);
             { LARGE_INTEGER cs2; QueryPerformanceCounter(&cs2); encMs += (double)(cs2.QuadPart - cs1.QuadPart) * 1000.0 / freq.QuadPart; ++encN; }
             if (FAILED(whr)) { r.message = hrMsg(L"WriteSample", whr); break; }
@@ -2120,6 +2243,20 @@ void ReplayRing::attach(IMFMediaType* vt, int fps, int channels, int tracks, boo
     }
     p_->offset = p_->lastEnd;  // continue the ring's timeline (session time starts at 0 again)
     p_->attached = true;
+}
+void ReplayRing::retype(IMFMediaType* vt) {
+    std::lock_guard<std::mutex> g(p_->m);
+    if (!vt) return;
+    GUID sub{}; UINT32 w = 0, h = 0; std::vector<BYTE> hdr;
+    vt->GetGUID(MF_MT_SUBTYPE, &sub);
+    MFGetAttributeSize(vt, MF_MT_FRAME_SIZE, &w, &h);
+    UINT32 sz = 0;
+    if (SUCCEEDED(vt->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &sz)) && sz) { hdr.resize(sz); vt->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), sz, nullptr); }
+    if (sub != p_->sub || w != p_->w || h != p_->h) { p_->v.clear(); p_->a.clear(); p_->bytes = 0; p_->cur.reset(); }  // can't share a track
+    ComPtr<IMFMediaType> c;
+    MFCreateMediaType(&c);
+    vt->CopyAllItems(c.Get());
+    p_->vtype = c; p_->sub = sub; p_->w = w; p_->h = h; p_->hdr = hdr;
 }
 void ReplayRing::detach() { std::lock_guard<std::mutex> g(p_->m); p_->attached = false; }
 std::wstring ReplayRing::stats() const {

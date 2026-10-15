@@ -10,6 +10,7 @@
 #include <codecapi.h>
 #include <cstdio>
 #include <atomic>
+#include <algorithm>
 #include <memory>
 #include <thread>
 
@@ -90,6 +91,15 @@ void setCodec(ICodecAPI* c, const GUID& k, VARTYPE vt, ULONG v, const wchar_t* n
 }
 
 }  // namespace
+
+const wchar_t* encCfgName(int cfg) {
+    switch (cfg) {
+        case kCfgLowLatency: return L"low-latency CBR";
+        case kCfgPlain: return L"driver defaults";
+        case kCfgSysMem: return L"system-memory input";
+        default: return L"default";
+    }
+}
 
 const wchar_t* codecName(const GUID& st) {
     if (st == MFVideoFormat_HEVC) return L"HEVC";
@@ -185,6 +195,9 @@ bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT 
     act_ = acts[info.index];
     label = info.name;
     argb_ = info.argb;
+    cfg_ = (info.cfg >= 0 && info.cfg < kCfgCount) ? info.cfg : kCfgDefault;
+    if (argb_ && cfg_ == kCfgSysMem) cfg_ = kCfgPlain;  // BGRA input only as D3D surfaces
+    log += std::wstring(L"setup: ") + encCfgName(cfg_) + L"\n";
     HRESULT hr = act_->ActivateObject(IID_PPV_ARGS(&mft_));
     logHr(log, L"ActivateObject", hr);
     if (FAILED(hr)) return false;
@@ -194,7 +207,7 @@ bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT 
     if (SUCCEEDED(mft_->GetAttributes(&a)) && a) {
         a->GetUINT32(kMF_TRANSFORM_ASYNC, &isAsync);
         if (isAsync) { hr = a->SetUINT32(kMF_TRANSFORM_ASYNC_UNLOCK, TRUE); logHr(log, L"MF_TRANSFORM_ASYNC_UNLOCK", hr); if (FAILED(hr)) return false; }
-        a->SetUINT32(MF_LOW_LATENCY, TRUE);
+        if (cfg_ == kCfgDefault || cfg_ == kCfgLowLatency) a->SetUINT32(MF_LOW_LATENCY, TRUE);
     }
     if (!isAsync) { log += L"MFT is synchronous: not supported on this path\n"; return false; }
     hr = mft_.As(&ev_);
@@ -205,6 +218,10 @@ bool HwEncoder::open(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT 
     if (hr == E_NOTIMPL) { inId_ = 0; outId_ = 0; hr = S_OK; }
     logHr(log, L"GetStreamIDs", hr);
 
+    if (cfg_ == kCfgSysMem) {  // no D3D manager: the MFT takes CPU NV12 buffers and uploads them itself
+        log += L"D3D manager: not set (system-memory input)\n";
+        return configure(w, h, fps, bitrate, high, log);
+    }
     UINT token = 0;
     hr = MFCreateDXGIDeviceManager(&token, &mgr_);
     if (SUCCEEDED(hr)) hr = mgr_->ResetDevice(dev, token);
@@ -246,13 +263,24 @@ bool HwEncoder::configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, 
     if (SUCCEEDED(mft_->QueryInterface(kIID_ICodecAPI, (void**)codec.GetAddressOf())) && codec) {
         // Peak-constrained VBR at a resolution/fps-scaled mean, quality-first preset, no low-latency mode
         // (low-latency/CBR on AMF/QSV trades a lot of quality for latency we don't need when recording).
-        setCodec(codec.Get(), kCODECAPI_AVEncCommonRateControlMode, VT_UI4, eAVEncCommonRateControlMode_PeakConstrainedVBR, L"CODECAPI RateControl=PeakConstrainedVBR", log);
-        setCodec(codec.Get(), kCODECAPI_AVEncCommonMeanBitRate, VT_UI4, bitrate, L"CODECAPI MeanBitRate", log);
-        setCodec(codec.Get(), kCODECAPI_AVEncCommonMaxBitRate, VT_UI4, (ULONG)((double)bitrate * 1.5), L"CODECAPI MaxBitRate", log);
-        setCodec(codec.Get(), kCODECAPI_AVEncCommonQualityVsSpeed, VT_UI4, high ? 100 : 60, L"CODECAPI QualityVsSpeed", log);
-        setCodec(codec.Get(), kCODECAPI_AVLowLatencyMode, VT_BOOL, 0, L"CODECAPI LowLatencyMode=off", log);
-        setCodec(codec.Get(), kCODECAPI_AVEncMPVDefaultBPictureCount, VT_UI4, 0, L"CODECAPI BPictureCount=0", log);
-        setCodec(codec.Get(), kCODECAPI_AVEncMPVGOPSize, VT_UI4, (ULONG)fps, L"CODECAPI GOPSize=1s", log);
+        if (sync_ || cfg_ == kCfgDefault) {
+            setCodec(codec.Get(), kCODECAPI_AVEncCommonRateControlMode, VT_UI4, eAVEncCommonRateControlMode_PeakConstrainedVBR, L"CODECAPI RateControl=PeakConstrainedVBR", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncCommonMeanBitRate, VT_UI4, bitrate, L"CODECAPI MeanBitRate", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncCommonMaxBitRate, VT_UI4, (ULONG)((double)bitrate * 1.5), L"CODECAPI MaxBitRate", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncCommonQualityVsSpeed, VT_UI4, high ? 100 : 60, L"CODECAPI QualityVsSpeed", log);
+            setCodec(codec.Get(), kCODECAPI_AVLowLatencyMode, VT_BOOL, 0, L"CODECAPI LowLatencyMode=off", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncMPVDefaultBPictureCount, VT_UI4, 0, L"CODECAPI BPictureCount=0", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncMPVGOPSize, VT_UI4, (ULONG)fps, L"CODECAPI GOPSize=1s", log);
+        } else if (cfg_ == kCfgLowLatency) {
+            setCodec(codec.Get(), kCODECAPI_AVEncCommonRateControlMode, VT_UI4, eAVEncCommonRateControlMode_CBR, L"CODECAPI RateControl=CBR", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncCommonMeanBitRate, VT_UI4, bitrate, L"CODECAPI MeanBitRate", log);
+            setCodec(codec.Get(), kCODECAPI_AVLowLatencyMode, VT_BOOL, 1, L"CODECAPI LowLatencyMode=on", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncMPVDefaultBPictureCount, VT_UI4, 0, L"CODECAPI BPictureCount=0", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncMPVGOPSize, VT_UI4, (ULONG)fps, L"CODECAPI GOPSize=1s", log);
+        } else {  // plain / system memory: the driver's own defaults, only the bitrate and a 1 s GOP
+            setCodec(codec.Get(), kCODECAPI_AVEncCommonMeanBitRate, VT_UI4, bitrate, L"CODECAPI MeanBitRate", log);
+            setCodec(codec.Get(), kCODECAPI_AVEncMPVGOPSize, VT_UI4, (ULONG)fps, L"CODECAPI GOPSize=1s", log);
+        }
     } else log += L"ICodecAPI not available\n";
 
     // Output type FIRST (required by AMF/NVENC/QSV encoders), then input.
@@ -378,6 +406,7 @@ HRESULT HwEncoder::deliver(IMFSample* s, const OutputFn& out) {
     if (FAILED(b->Lock(&p, nullptr, &len))) return S_OK;
     bool idr = false; std::vector<BYTE> vps, sps, pps;
     const bool hevc = sub_ == MFVideoFormat_HEVC, av1 = sub_ == MFVideoFormat_AV1;
+    const bool annexB = len >= 4 && p[0] == 0 && p[1] == 0 && (p[2] == 1 || (p[2] == 0 && p[3] == 1));
     if (!av1) forNals(p, len, hevc, [&](int t, const BYTE* q, DWORD l) {
         if (hevc) {
             if (t >= 16 && t <= 21) idr = true;  // BLA / IDR / CRA
@@ -401,6 +430,30 @@ HRESULT HwEncoder::deliver(IMFSample* s, const OutputFn& out) {
     // Annex-B start codes we can parse (length-prefixed output): don't throw the whole stream away waiting for one.
     if (!gotKey_ && rawOutputs == 1 && !clean && !idr) idr = true;
     if (idr && !clean) { s->SetUINT32(MFSampleExtension_CleanPoint, TRUE); clean = 1; }
+    // Key frames always carry their parameter sets in-band (Annex B): a recording / replay buffer that switches
+    // encoder mid-way (hardware stall -> software) then stays decodable across the switch, whatever the file's
+    // stored header says. Only when the encoder didn't already repeat them; length-prefixed output is left alone.
+    ComPtr<IMFSample> withHdr;
+    if (clean && annexB && !av1 && sps.empty()) {
+        std::vector<BYTE> hdr = seqHeader_;
+        if (hdr.empty()) {
+            ComPtr<IMFMediaType> ct = currentOutputType(); UINT32 hs = 0;
+            if (ct && SUCCEEDED(ct->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hs)) && hs) { hdr.resize(hs); ct->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdr.data(), hs, nullptr); }
+        }
+        if (hdr.size() >= 4 && hdr[0] == 0 && hdr[1] == 0 && (hdr[2] == 1 || (hdr[2] == 0 && hdr[3] == 1))) {
+            if (seqHeader_.empty()) seqHeader_ = hdr;
+            ComPtr<IMFMediaBuffer> nb; BYTE* q = nullptr;
+            if (SUCCEEDED(MFCreateMemoryBuffer((DWORD)(hdr.size() + len), &nb)) && SUCCEEDED(nb->Lock(&q, nullptr, nullptr))) {
+                BYTE* p2 = nullptr; DWORD l2 = 0;
+                if (SUCCEEDED(b->Lock(&p2, nullptr, &l2))) {
+                    memcpy(q, hdr.data(), hdr.size()); memcpy(q + hdr.size(), p2, l2);
+                    b->Unlock();
+                    nb->Unlock(); nb->SetCurrentLength((DWORD)(hdr.size() + l2));
+                    if (SUCCEEDED(MFCreateSample(&withHdr))) { s->CopyAllItems(withHdr.Get()); withHdr->AddBuffer(nb.Get()); ++injectedHeaders; }
+                } else nb->Unlock();
+            }
+        }
+    }
     if (!gotKey_) {
         if (!clean) { ++dropsBeforeKey; return S_OK; }  // the MP4/MKV must start on a keyframe
         gotKey_ = true;
@@ -408,10 +461,11 @@ HRESULT HwEncoder::deliver(IMFSample* s, const OutputFn& out) {
     const LONGLONG dur = 10000000LL / fps_;
     LONGLONG t = 0, d = 0;
     if (FAILED(s->GetSampleTime(&t))) { t = nextTime_; s->SetSampleTime(t); }
-    if (FAILED(s->GetSampleDuration(&d)) || d <= 0) s->SetSampleDuration(dur);
+    if (FAILED(s->GetSampleDuration(&d)) || d <= 0) { d = dur; s->SetSampleDuration(dur); }
+    if (withHdr) { withHdr->SetSampleTime(t); withHdr->SetSampleDuration(d); }
     nextTime_ = t + dur;
     ++outputs;
-    return out(s);
+    return out(withHdr ? withHdr.Get() : s);
 }
 
 ComPtr<IMFMediaType> HwEncoder::muxType() {
@@ -439,13 +493,19 @@ ComPtr<IMFMediaType> HwEncoder::muxType() {
 }
 
 HRESULT HwEncoder::pump(const OutputFn& out) {
+    if (testStall) return S_OK;
     if (sync_) {
         for (;;) { HRESULT hr = processOutput(out); if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return S_OK; if (FAILED(hr)) return hr; }
     }
     for (;;) {
         ComPtr<IMFMediaEvent> e;
         HRESULT hr = ev_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &e);
-        if (hr == MF_E_NO_EVENTS_AVAILABLE) return S_OK;
+        if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+            // An input request that arrived while nothing was queued is still open: the MFT will not post another
+            // METransformNeedInput until it gets that frame, so serve it now from the queue.
+            if (needInput_ > 0 && !queue_.empty()) { hr = submitQueued(); if (FAILED(hr)) { lastError = hr; lastErrorAt = L"ProcessInput"; return hr; } }
+            return S_OK;
+        }
         if (FAILED(hr)) return hr;
         MediaEventType t = MEUnknown; e->GetType(&t);
         HRESULT st = S_OK; e->GetStatus(&st);
@@ -458,6 +518,7 @@ HRESULT HwEncoder::pump(const OutputFn& out) {
 }
 
 HRESULT HwEncoder::encode(IMFSample* s, const OutputFn& out) {
+    if (testStall) { ++inputs; return S_OK; }
     if (sync_) {
         HRESULT hr = mft_->ProcessInput(inId_, s, 0);
         if (hr == MF_E_NOTACCEPTING) { hr = pump(out); if (SUCCEEDED(hr)) hr = mft_->ProcessInput(inId_, s, 0); }
@@ -474,8 +535,17 @@ HRESULT HwEncoder::encode(IMFSample* s, const OutputFn& out) {
     return result;
 }
 
+HRESULT HwEncoder::pollOutput(const OutputFn& out) {
+    if (sync_ || !mft_ || testStall) return S_OK;
+    unsigned long long before = rawOutputs;
+    HRESULT hr = processOutput(out);
+    if (rawOutputs != before) ++polledOutputs;
+    (void)hr;  // E_UNEXPECTED / NEED_MORE_INPUT when there's nothing: expected
+    return S_OK;
+}
+
 HRESULT HwEncoder::tryEagerInput() {
-    if (sync_ || queue_.empty() || !mft_) return S_OK;
+    if (sync_ || queue_.empty() || !mft_ || testStall) return S_OK;
     HRESULT hr = mft_->ProcessInput(inId_, queue_.front().Get(), 0);
     if (hr == MF_E_NOTACCEPTING) { ++notAccepting; return S_OK; }
     if (FAILED(hr)) { lastError = hr; lastErrorAt = L"ProcessInput(eager)"; return hr; }
@@ -518,6 +588,7 @@ bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h
                     std::wstring& log) {
     // Private device on the same adapter so a stalled probe can be leaked without touching the recording device.
     w = kProbeW; h = kProbeH;  // fixed size: the verdict is about the encoder, not about this session's source
+    if (fps <= 0) fps = 60;
     ComPtr<IDXGIDevice> dd; ComPtr<IDXGIAdapter> ad;
     if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dd))) || FAILED(dd->GetAdapter(&ad))) { log += L"probe: no adapter\n"; return false; }
     struct St { std::atomic<int> state{0}; std::wstring log; bool ok = false; };  // 0 running, 1 done, 2 abandoned
@@ -536,73 +607,95 @@ bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h
         if (SUCCEEDED(hr)) {
             ComPtr<ID3D10Multithread> mt;
             if (SUCCEEDED(pdev.As(&mt))) mt->SetMultithreadProtected(TRUE);
-            if (enc->open(pdev.Get(), info, w, h, fps, 4000000, false, lg)) {
-                D3D11_TEXTURE2D_DESC td{};
-                td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = info.argb ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_NV12;
-                td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                ComPtr<ID3D11Texture2D> tex;
-                hr = pdev->CreateTexture2D(&td, nullptr, &tex);
-                if (FAILED(hr)) { td.BindFlags = D3D11_BIND_RENDER_TARGET; hr = pdev->CreateTexture2D(&td, nullptr, &tex); }
-                logHr(lg, L"probe CreateTexture2D(NV12)", hr);
-                // A few distinct surfaces (an AMF MFT may hold its input until the frame is encoded), with content.
-                ComPtr<ID3D11Texture2D> texs[4]; texs[0] = tex;
-                for (int k = 1; k < 4 && SUCCEEDED(hr); ++k)
-                    if (FAILED(pdev->CreateTexture2D(&td, nullptr, &texs[k]))) texs[k] = tex;
+            if (enc->open(pdev.Get(), info, w, h, fps, 12000000, false, lg)) {
+                const bool sys = enc->sysmem(), argb = info.argb;
+                // 8 distinct pictures (moving gradient) -> copied into a 16-surface ring per frame, like a recording.
+                const size_t ySize = (size_t)w * h, nvSize = ySize * 3 / 2;
+                std::vector<std::vector<uint8_t>> pics(8);
+                for (int k = 0; k < 8; ++k) {
+                    auto& v = pics[k];
+                    if (argb) {
+                        v.resize(ySize * 4);
+                        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) { uint8_t* q = &v[((size_t)y * w + x) * 4]; q[0] = (uint8_t)(x + k * 8); q[1] = (uint8_t)(y + k * 4); q[2] = (uint8_t)((x ^ y) >> 2); q[3] = 255; }
+                    } else {
+                        v.resize(nvSize);
+                        for (UINT y = 0; y < h; ++y) for (UINT x = 0; x < w; ++x) v[(size_t)y * w + x] = (uint8_t)(16 + ((x / 4 + y / 4 + k * 6) % 200));
+                        for (size_t i = ySize; i < nvSize; i += 2) { v[i] = (uint8_t)(96 + k * 8); v[i + 1] = (uint8_t)(160 - k * 8); }
+                    }
+                }
+                ComPtr<ID3D11Texture2D> srcT[8], ring[16];
+                if (!sys) {
+                    D3D11_TEXTURE2D_DESC td{};
+                    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = argb ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_NV12;
+                    td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                    for (int k = 0; k < 8 && SUCCEEDED(hr); ++k) {
+                        D3D11_SUBRESOURCE_DATA sd{pics[k].data(), argb ? w * 4 : w, 0};
+                        hr = pdev->CreateTexture2D(&td, &sd, &srcT[k]);
+                        if (FAILED(hr)) { td.BindFlags = D3D11_BIND_RENDER_TARGET; hr = pdev->CreateTexture2D(&td, &sd, &srcT[k]); }
+                    }
+                    for (int k = 0; k < 16 && SUCCEEDED(hr); ++k) hr = pdev->CreateTexture2D(&td, nullptr, &ring[k]);
+                    logHr(lg, argb ? L"probe surfaces (BGRA)" : L"probe surfaces (NV12)", hr);
+                }
                 const LONGLONG dur = 10000000LL / fps;
-                int sent = 0;  // frames handed to encode() (queued; inputs = actually taken by the MFT)
-                const ULONGLONG t0 = GetTickCount64(), end = t0 + 3000;
-                ULONGLONG lastProgress = t0, firstOut = 0;
-                unsigned long long lastIn = 0;
+                const unsigned long long target = (unsigned long long)std::min(fps, 60);  // one second of video
+                LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+                auto ms = [&]() { LARGE_INTEGER q; QueryPerformanceCounter(&q); return (long long)((q.QuadPart - q0.QuadPart) * 1000 / qf.QuadPart); };
+                long long sent = 0, firstIn = -1, firstOut = -1, lastOut = -1, lastInT = 0, lastOutT = 0;
+                unsigned long long lastIn = 0, lastOutN = 0;
+                const wchar_t* why = L"";
                 auto sink = [&](IMFSample*) { return S_OK; };
-                // Event loop: offer a frame every ~frame interval (queued until NeedInput), pump events, and offer the
-                // oldest queued frame directly when the MFT went quiet for 100 ms (no NeedInput) - some drivers
-                // stop posting the event but accept input.
-                while (SUCCEEDED(hr) && enc->rawOutputs == 0 && GetTickCount64() < end && st->state.load() == 0) {
-                    if (sent < 60 && enc->queued() < 3) {
+                while (SUCCEEDED(hr) && st->state.load() == 0) {
+                    const long long now = ms();
+                    if (enc->outputs >= target) break;
+                    if (now > 1800) { why = L"too slow (not real time)"; break; }
+                    if (firstIn >= 0 && enc->outputs == 0 && now - firstIn > 1000) { why = enc->inputs <= 1 ? L"took one frame and never asked for more" : L"frames accepted, no bitstream"; break; }
+                    if (lastOut >= 0 && now - lastOut > 700) { why = L"stopped producing output"; break; }
+                    if (sent <= now * fps / 1000) {
                         ComPtr<IMFMediaBuffer> b; ComPtr<IMFSample> s;
-                        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texs[sent & 3].Get(), 0, FALSE, &b);
-                        if (SUCCEEDED(hr)) { ComPtr<IMF2DBuffer> b2; DWORD len = 0; if (SUCCEEDED(b.As(&b2))) b2->GetContiguousLength(&len); b->SetCurrentLength(len); }
+                        if (sys) {
+                            hr = MFCreateMemoryBuffer((DWORD)nvSize, &b);
+                            BYTE* q = nullptr;
+                            if (SUCCEEDED(hr) && SUCCEEDED(hr = b->Lock(&q, nullptr, nullptr))) { memcpy(q, pics[sent & 7].data(), nvSize); b->Unlock(); b->SetCurrentLength((DWORD)nvSize); }
+                        } else {
+                            ID3D11Texture2D* rt = ring[sent & 15].Get();
+                            pctx->CopyResource(rt, srcT[sent & 7].Get());
+                            hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), rt, 0, FALSE, &b);
+                            if (SUCCEEDED(hr)) { ComPtr<IMF2DBuffer> b2; DWORD len = 0; if (SUCCEEDED(b.As(&b2))) b2->GetContiguousLength(&len); b->SetCurrentLength(len); }
+                        }
                         if (SUCCEEDED(hr)) hr = MFCreateSample(&s);
                         if (SUCCEEDED(hr)) { s->AddBuffer(b.Get()); s->SetSampleTime(sent * dur); s->SetSampleDuration(dur); }
                         if (SUCCEEDED(hr)) { hr = enc->encode(s.Get(), sink); if (SUCCEEDED(hr)) { ++sent; hr = S_OK; } }
                     } else hr = enc->pump(sink);
-                    if (enc->inputs != lastIn) { lastIn = enc->inputs; lastProgress = GetTickCount64(); }
-                    else if (SUCCEEDED(hr) && GetTickCount64() - lastProgress > 100) { hr = enc->tryEagerInput(); lastProgress = GetTickCount64(); }
-                    if (enc->rawOutputs && !firstOut) firstOut = GetTickCount64();
-                    Sleep(4);
+                    const long long t2 = ms();
+                    if (enc->inputs != lastIn) { if (firstIn < 0) firstIn = t2; lastIn = enc->inputs; lastInT = t2; }
+                    else if (SUCCEEDED(hr) && t2 - lastInT > 100 && enc->queued()) { hr = enc->tryEagerInput(); lastInT = t2; }
+                    if (enc->outputs != lastOutN) { if (firstOut < 0) firstOut = t2; lastOut = t2; lastOutN = enc->outputs; lastOutT = t2; }
+                    else if (SUCCEEDED(hr) && t2 - lastOutT > 300 && enc->inputs > enc->rawOutputs) { enc->pollOutput(sink); lastOutT = t2; }
+                    Sleep(1);
                 }
-                // Nothing came out yet: end the stream and drain (encoders with a deep lookahead only emit on drain).
-                bool drainedOk = false;
-                if (SUCCEEDED(hr) && enc->rawOutputs == 0 && st->state.load() == 0) {
-                    drainedOk = enc->drain(sink, 600);
-                    if (enc->rawOutputs && !firstOut) firstOut = GetTickCount64();
-                }
-                if (FAILED(hr)) logHr(lg, (L"probe encode (" + enc->lastErrorAt + L")").c_str(), hr);
-                wchar_t b[400];
-                swprintf(b, 400, L"probe: %d frame(s) offered, %llu taken (%llu eager, %llu not-accepting), %llu raw out, %llu delivered, "
-                                 L"events NeedInput=%llu HaveOutput=%llu other=%llu, %llu dropped before key, first output %lld ms%ls\n",
-                         sent, enc->inputs, enc->eagerInputs, enc->notAccepting, enc->rawOutputs, enc->outputs,
-                         enc->evNeedInput, enc->evHaveOutput, enc->evOther, enc->dropsBeforeKey,
-                         firstOut ? (long long)(firstOut - t0) : -1LL, drainedOk ? L", drained" : L"");
+                if (FAILED(hr)) { logHr(lg, (L"probe encode (" + enc->lastErrorAt + L")").c_str(), hr); why = L"error"; }
+                ok = SUCCEEDED(hr) && enc->outputs >= target;
+                wchar_t b[480];
+                swprintf(b, 480, L"probe [%ls]: %lld offered, %llu taken, %llu out in %lld ms (first output %lld ms), NeedInput=%llu HaveOutput=%llu other=%llu, "
+                                 L"eager=%llu polled=%llu not-accepting=%llu backpressure=%llu -> %ls%ls%ls\n",
+                         encCfgName(enc->cfg()), sent, enc->inputs, enc->outputs, ms(), firstOut, enc->evNeedInput, enc->evHaveOutput, enc->evOther,
+                         enc->eagerInputs, enc->polledOutputs, enc->notAccepting, enc->backpressureDrops,
+                         ok ? L"PASS" : L"FAIL", ok ? L"" : L": ", ok ? L"" : why);
                 lg += b;
-                if (enc->rawOutputs == 0) {
-                    if (enc->evNeedInput <= 1 && enc->inputs <= 1) lg += L"probe: encoder took one frame and never asked for more (stalled pipeline)\n";
-                    else if (enc->inputs > 1) lg += L"probe: frames accepted but no bitstream produced\n";
-                    if (FAILED(enc->lastError)) logHr(lg, (L"probe last error at " + enc->lastErrorAt).c_str(), enc->lastError);
-                }
-                ok = SUCCEEDED(hr) && enc->rawOutputs > 0;
+                if (!ok && FAILED(enc->lastError)) logHr(lg, (L"probe last error at " + enc->lastErrorAt).c_str(), enc->lastError);
             }
         }
-        int expect = 0;
         st->log = lg; st->ok = ok;
-        if (st->state.compare_exchange_strong(expect, 1)) {
+        int expect = 0;
+        const bool mine = st->state.compare_exchange_strong(expect, 1);  // results published; the caller no longer waits
+        if (mine && ok) {
             enc->release();
             enc.reset();
-            if (SUCCEEDED(co)) CoUninitialize();
         } else {
-            enc->leak(); enc.release();  // caller gave up on us: never touch the MFT again
+            enc->leak(); enc.release();  // failed or abandoned: never touch a possibly stuck MFT again
             pdev.Detach(); pctx.Detach();
         }
+        if (SUCCEEDED(co)) CoUninitialize();
     });
         int running = 0; st->state.compare_exchange_strong(running, 1);  // threw: report "done, failed" instead of a timeout
     });
@@ -614,7 +707,7 @@ bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h
         log += L"probe: TIMED OUT (encoder stalled), leaked and skipped\n";
         return false;
     }
-    t.join();
+    t.detach();  // the helper releases (or leaks) the MFT on its own: a stuck release never blocks the caller
     log += st->log;
     return st->ok;
 }

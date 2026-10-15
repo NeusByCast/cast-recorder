@@ -39,6 +39,9 @@ public:
     bool saveImpl(const std::wstring& path, double& savedSeconds, std::wstring& err);
     // recorder side
     void attach(IMFMediaType* videoType, int fps, int channels, int tracks, bool audio);
+    // Live encoder switch inside a session: take the new encoder's type but keep every packet (key frames carry
+    // their parameter sets in-band, so a save across the switch stays decodable).
+    void retype(IMFMediaType* videoType);
     void addVideo(IMFSample* s);
     void addAudio(long long t100ns, const std::vector<short>* const pcm[3]);
     void detach();
@@ -83,6 +86,7 @@ struct RecordOptions {
     std::shared_ptr<ReplayRing> ring;  // feed encoded packets + audio into this replay buffer
     bool bufferOnly = false;         // replay buffer session: no file is written
     UINT doneMsg = 0;                // notify with this instead of WM_APP_RECORDER_DONE (replay buffer session)
+    double testStallAfterSec = 0;    // CI: the encoder stops producing output after this many seconds (live switch test)
 };
 
 // Work after a recording is saved (never inside the recorder / Finalize watchdog): MKV conversion and audio track
@@ -126,6 +130,7 @@ struct RecordResult {
     std::wstring encoderLog;         // per-step HRESULTs: enumeration, probe, MFT setup, drain
     std::vector<std::wstring> encoderFallbacks;  // hardware encoders that failed the probe / setup
     bool encoderStalled = false;
+    int encoderSwitches = 0;         // live switches after a stalled encoder (recording / replay kept going)
     std::wstring latencyLog;         // press -> first frame breakdown
     bool windowClosed = false;       // window capture ended because the window closed
     double startMs = 0;              // press -> first captured frame
@@ -139,6 +144,8 @@ struct RecordResult {
 
 constexpr UINT WM_APP_RECORDER_DONE = WM_APP + 40;
 constexpr UINT WM_APP_RECORDER_STARTED = WM_APP + 42;  // first frame captured: play the start tone now
+// Live encoder switch (hardware stalled -> next encoder): lParam = new std::wstring (status text), receiver deletes.
+constexpr UINT WM_APP_ENCODER_SWITCHED = WM_APP + 47;
 constexpr UINT WM_APP_WARMUP_DONE = WM_APP + 43;
 
 class Recorder {

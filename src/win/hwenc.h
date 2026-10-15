@@ -20,7 +20,19 @@ struct HwEncoderInfo {
     int index = 0;         // ordinal in the LUID-filtered enumeration
     GUID subtype = MFVideoFormat_H264;  // H.264, HEVC or AV1 output
     bool argb = false;     // feed BGRA (MFVideoFormat_ARGB32) surfaces instead of NV12 (VideoProcessor unavailable)
+    int cfg = 0;           // EncCfg: MFT setup variant that passed the probe
 };
+
+// MFT setup variants, tried in this order by the probe; the first that sustains real-time output is used.
+// Some AMD iGPU MFTs take one D3D11 frame and never ask for another with the default setup.
+enum EncCfg : int {
+    kCfgDefault = 0,     // peak-constrained VBR, quality preset, LowLatencyMode off, D3D11 surfaces
+    kCfgLowLatency = 1,  // CBR + LowLatencyMode on + MF_LOW_LATENCY, D3D11 surfaces
+    kCfgPlain = 2,       // only the bitrate set (driver defaults), no MF_LOW_LATENCY, D3D11 surfaces
+    kCfgSysMem = 3,      // driver defaults + bitrate, no D3D manager: CPU NV12 buffers (GPU convert + readback)
+    kCfgCount = 4
+};
+const wchar_t* encCfgName(int cfg);
 
 // Hardware H.264 encoders registered for the adapter that owns `dev` (MFT_ENUM_ADAPTER_LUID).
 std::vector<HwEncoderInfo> hwEncodersForDevice(ID3D11Device* dev, std::wstring& log, const GUID& subtype = MFVideoFormat_H264);
@@ -62,6 +74,13 @@ public:
     // Async MFTs that stop posting METransformNeedInput (seen with AMD AMF after the first frame): offer the oldest
     // queued frame directly. MF_E_NOTACCEPTING is harmless and keeps it queued.
     HRESULT tryEagerInput();
+    // Stall rescue: ask for output without a METransformHaveOutput event (some drivers stop posting it).
+    // Errors (E_UNEXPECTED / NEED_MORE_INPUT) are expected and ignored.
+    HRESULT pollOutput(const OutputFn& out);
+    unsigned long long polledOutputs = 0, injectedHeaders = 0;
+    bool sysmem() const { return cfg_ == kCfgSysMem; }
+    int cfg() const { return cfg_; }
+    bool testStall = false;  // CI: behave like a stalled hardware MFT (swallow input, never output)
     bool drainedFlag() const { return drained_; }
     size_t queued() const { return queue_.size(); }
 private:
@@ -73,6 +92,7 @@ private:
     GUID sub_ = MFVideoFormat_H264;
     bool sync_ = false;
     bool argb_ = false;
+    int cfg_ = kCfgDefault;
     bool gotKey_ = false;
     std::vector<BYTE> seqHeader_;
     UINT w_ = 0, h_ = 0; int fps_ = 30; unsigned br_ = 0; UINT32 profile_ = 77;
@@ -89,11 +109,13 @@ private:
     DWORD outBufSize_ = 0;
 };
 
-// Pre-flight probe: opens the encoder on `dev`'s adapter (private device), feeds up to 60 frames for ~3 s with an
-// event loop, then drains; any encoded output = pass. Logs event/IO counters on failure. Runs on a helper thread;
-// a stalled MFT is leaked (never touched again), never blocks the caller beyond timeoutMs.
+// Pre-flight probe of one setup variant (info.cfg): opens the encoder on `dev`'s adapter (private device) and
+// feeds it like a recording does - distinct NV12 surfaces copied into a 16-surface ring (or CPU NV12 buffers for
+// kCfgSysMem), paced at `fps`, through the same queue/event driver. Pass = at least min(fps, 60) encoded frames
+// (one second of video) within 1.8 s; an encoder that stops producing output mid-way fails. Runs on a helper
+// thread; a failed MFT is leaked (never touched again), never blocks the caller beyond timeoutMs.
 // The probe always runs at kProbeW x kProbeH so the verdict doesn't depend on the source (a tiny window).
-constexpr UINT kProbeW = 1280, kProbeH = 720;
+constexpr UINT kProbeW = 1920, kProbeH = 1080;
 // Runs on a helper thread; a stalled MFT is leaked (never touched again), never blocks the caller.
 bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h, int fps, DWORD timeoutMs,
                     std::wstring& log);
