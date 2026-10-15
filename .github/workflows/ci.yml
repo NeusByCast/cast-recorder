@@ -718,8 +718,9 @@ jobs:
             $aud = ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 $f
             "$(Split-Path $f -Leaf): duration=$dur s frames=$n last_video_pts=$last audio=$aud"
             if ($dur -lt 8.5) { throw "$f is $dur s: footage before or after the switch is missing" }
-            if ($last -lt 8) { throw "$f video ends at $last s: nothing encoded after the switch" }
-            if ($n -lt 150) { throw "$f has only $n frames" }
+            # no hole in the video timeline (the stalled encoder's frames are re-encoded): video ends with the audio
+            if ($last -lt $dur - 1.0) { throw "$f video ends at $last s but the file is $dur s: frames lost in the switch left a hole (A/V drift)" }
+            if ($n -lt 240) { throw "$f has only $n frames" }
             if (-not ($aud -match 'aac')) { throw "$f lost its audio" }
           }
           $k0 = ffprobe -v error -select_streams v:0 -show_entries frame=key_frame -of csv=p=0 -read_intervals "%+#1" "$o\replay.mp4" | Select-Object -First 1
