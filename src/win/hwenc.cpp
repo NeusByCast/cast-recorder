@@ -104,12 +104,29 @@ static const wchar_t* vendorOf(const std::wstring& v) {
     return L"Hardware";
 }
 
+std::vector<LUID> hardwareAdapterLuids() {
+    std::vector<LUID> v;
+    ComPtr<IDXGIFactory1> f;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&f)))) return v;
+    ComPtr<IDXGIAdapter1> a;
+    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i, a.Reset()) {
+        DXGI_ADAPTER_DESC1 d{}; a->GetDesc1(&d);
+        if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        bool dup = false;
+        for (auto& x : v) if (x.LowPart == d.AdapterLuid.LowPart && x.HighPart == d.AdapterLuid.HighPart) dup = true;
+        if (!dup) v.push_back(d.AdapterLuid);
+    }
+    return v;
+}
+
 std::vector<CodecSupport> probeCodecSupport(const LUID* adapter) {
     std::vector<CodecSupport> r;
     std::wstring log;
+    // Auto GPU: every hardware adapter (hybrid laptops: the iGPU that drives the panel and the dGPU).
+    std::vector<LUID> luids = adapter ? std::vector<LUID>{*adapter} : hardwareAdapterLuids();
     for (const GUID& st : {MFVideoFormat_AV1, MFVideoFormat_HEVC, MFVideoFormat_H264}) {
-        if (adapter) {
-            for (auto& a : enumForLuid(*adapter, 0, log, st)) {
+        for (const LUID& luid : luids) {
+            for (auto& a : enumForLuid(luid, 0, log, st)) {
                 CodecSupport c{st, codecName(st), vendorOf(str(a.Get(), kMFT_ENUM_HARDWARE_VENDOR_ID)), true};
                 bool dup = false;
                 for (auto& x : r) if (x.subtype == st && x.vendor == c.vendor) dup = true;
@@ -334,7 +351,7 @@ HRESULT HwEncoder::processOutput(const OutputFn& out) {
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { if (ob.pSample && !mine) ob.pSample->Release(); return sync_ ? hr : S_OK; }
     if (FAILED(hr)) { if (ob.pSample && !mine) ob.pSample->Release(); return hr; }
     HRESULT ohr = S_OK;
-    if (ob.pSample) { ohr = deliver(ob.pSample, out); if (!mine) ob.pSample->Release(); }
+    if (ob.pSample) { ++rawOutputs; ohr = deliver(ob.pSample, out); if (!mine) ob.pSample->Release(); }
     return ohr;
 }
 
@@ -380,9 +397,12 @@ HRESULT HwEncoder::deliver(IMFSample* s, const OutputFn& out) {
     UINT32 clean = 0;
     if (FAILED(s->GetUINT32(MFSampleExtension_CleanPoint, &clean))) clean = 0;
     if (av1 && !gotKey_ && !clean) idr = true;  // the first AV1 temporal unit is always a key frame
+    // The very first output of a fresh encoder is an IDR even when the driver neither flags CleanPoint nor emits
+    // Annex-B start codes we can parse (length-prefixed output): don't throw the whole stream away waiting for one.
+    if (!gotKey_ && rawOutputs == 1 && !clean && !idr) idr = true;
     if (idr && !clean) { s->SetUINT32(MFSampleExtension_CleanPoint, TRUE); clean = 1; }
     if (!gotKey_) {
-        if (!clean) return S_OK;  // the MP4/MKV must start on a keyframe
+        if (!clean) { ++dropsBeforeKey; return S_OK; }  // the MP4/MKV must start on a keyframe
         gotKey_ = true;
     }
     const LONGLONG dur = 10000000LL / fps_;
@@ -429,10 +449,11 @@ HRESULT HwEncoder::pump(const OutputFn& out) {
         if (FAILED(hr)) return hr;
         MediaEventType t = MEUnknown; e->GetType(&t);
         HRESULT st = S_OK; e->GetStatus(&st);
-        if (FAILED(st)) return st;
-        if (t == METransformNeedInput) { ++needInput_; hr = submitQueued(); if (FAILED(hr)) return hr; }
-        else if (t == METransformHaveOutput) { hr = processOutput(out); if (FAILED(hr)) return hr; }
+        if (FAILED(st)) { lastError = st; lastErrorAt = L"event " + std::to_wstring((int)t) + L" status"; return st; }
+        if (t == METransformNeedInput) { ++evNeedInput; ++needInput_; hr = submitQueued(); if (FAILED(hr)) { lastError = hr; lastErrorAt = L"ProcessInput"; return hr; } }
+        else if (t == METransformHaveOutput) { ++evHaveOutput; hr = processOutput(out); if (FAILED(hr)) { lastError = hr; lastErrorAt = L"ProcessOutput"; return hr; } }
         else if (t == METransformDrainComplete) drained_ = true;
+        else ++evOther;
     }
 }
 
@@ -453,10 +474,20 @@ HRESULT HwEncoder::encode(IMFSample* s, const OutputFn& out) {
     return result;
 }
 
+HRESULT HwEncoder::tryEagerInput() {
+    if (sync_ || queue_.empty() || !mft_) return S_OK;
+    HRESULT hr = mft_->ProcessInput(inId_, queue_.front().Get(), 0);
+    if (hr == MF_E_NOTACCEPTING) { ++notAccepting; return S_OK; }
+    if (FAILED(hr)) { lastError = hr; lastErrorAt = L"ProcessInput(eager)"; return hr; }
+    queue_.erase(queue_.begin());
+    ++inputs; ++eagerInputs;
+    return S_OK;
+}
+
 HRESULT HwEncoder::submitQueued() {
     while (needInput_ > 0 && !queue_.empty()) {
         HRESULT hr = mft_->ProcessInput(inId_, queue_.front().Get(), 0);
-        if (hr == MF_E_NOTACCEPTING) return S_OK;
+        if (hr == MF_E_NOTACCEPTING) { ++notAccepting; return S_OK; }
         if (FAILED(hr)) return hr;
         queue_.erase(queue_.begin());
         --needInput_;
@@ -486,6 +517,7 @@ bool HwEncoder::drain(const OutputFn& out, DWORD timeoutMs) {
 bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h, int fps, DWORD timeoutMs,
                     std::wstring& log) {
     // Private device on the same adapter so a stalled probe can be leaked without touching the recording device.
+    w = kProbeW; h = kProbeH;  // fixed size: the verdict is about the encoder, not about this session's source
     ComPtr<IDXGIDevice> dd; ComPtr<IDXGIAdapter> ad;
     if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dd))) || FAILED(dd->GetAdapter(&ad))) { log += L"probe: no adapter\n"; return false; }
     struct St { std::atomic<int> state{0}; std::wstring log; bool ok = false; };  // 0 running, 1 done, 2 abandoned
@@ -512,26 +544,53 @@ bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h
                 hr = pdev->CreateTexture2D(&td, nullptr, &tex);
                 if (FAILED(hr)) { td.BindFlags = D3D11_BIND_RENDER_TARGET; hr = pdev->CreateTexture2D(&td, nullptr, &tex); }
                 logHr(lg, L"probe CreateTexture2D(NV12)", hr);
+                // A few distinct surfaces (an AMF MFT may hold its input until the frame is encoded), with content.
+                ComPtr<ID3D11Texture2D> texs[4]; texs[0] = tex;
+                for (int k = 1; k < 4 && SUCCEEDED(hr); ++k)
+                    if (FAILED(pdev->CreateTexture2D(&td, nullptr, &texs[k]))) texs[k] = tex;
                 const LONGLONG dur = 10000000LL / fps;
-                int sent = 0;
-                ULONGLONG end = GetTickCount64() + 1500;
+                int sent = 0;  // frames handed to encode() (queued; inputs = actually taken by the MFT)
+                const ULONGLONG t0 = GetTickCount64(), end = t0 + 3000;
+                ULONGLONG lastProgress = t0, firstOut = 0;
+                unsigned long long lastIn = 0;
                 auto sink = [&](IMFSample*) { return S_OK; };
-                while (SUCCEEDED(hr) && enc->outputs == 0 && GetTickCount64() < end && st->state.load() == 0) {
-                    if (sent < 30) {
+                // Event loop: offer a frame every ~frame interval (queued until NeedInput), pump events, and offer the
+                // oldest queued frame directly when the MFT went quiet for 100 ms (no NeedInput) - some drivers
+                // stop posting the event but accept input.
+                while (SUCCEEDED(hr) && enc->rawOutputs == 0 && GetTickCount64() < end && st->state.load() == 0) {
+                    if (sent < 60 && enc->queued() < 3) {
                         ComPtr<IMFMediaBuffer> b; ComPtr<IMFSample> s;
-                        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), tex.Get(), 0, FALSE, &b);
+                        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texs[sent & 3].Get(), 0, FALSE, &b);
                         if (SUCCEEDED(hr)) { ComPtr<IMF2DBuffer> b2; DWORD len = 0; if (SUCCEEDED(b.As(&b2))) b2->GetContiguousLength(&len); b->SetCurrentLength(len); }
                         if (SUCCEEDED(hr)) hr = MFCreateSample(&s);
                         if (SUCCEEDED(hr)) { s->AddBuffer(b.Get()); s->SetSampleTime(sent * dur); s->SetSampleDuration(dur); }
-                        if (SUCCEEDED(hr)) { hr = enc->encode(s.Get(), sink); if (hr == S_OK) ++sent; else if (hr == S_FALSE) hr = S_OK; }
+                        if (SUCCEEDED(hr)) { hr = enc->encode(s.Get(), sink); if (SUCCEEDED(hr)) { ++sent; hr = S_OK; } }
                     } else hr = enc->pump(sink);
-                    Sleep(5);
+                    if (enc->inputs != lastIn) { lastIn = enc->inputs; lastProgress = GetTickCount64(); }
+                    else if (SUCCEEDED(hr) && GetTickCount64() - lastProgress > 100) { hr = enc->tryEagerInput(); lastProgress = GetTickCount64(); }
+                    if (enc->rawOutputs && !firstOut) firstOut = GetTickCount64();
+                    Sleep(4);
                 }
-                if (FAILED(hr)) logHr(lg, L"probe encode", hr);
-                wchar_t b[128];
-                swprintf(b, 128, L"probe: %d frame(s) in, %llu out\n", sent, enc->outputs);
+                // Nothing came out yet: end the stream and drain (encoders with a deep lookahead only emit on drain).
+                bool drainedOk = false;
+                if (SUCCEEDED(hr) && enc->rawOutputs == 0 && st->state.load() == 0) {
+                    drainedOk = enc->drain(sink, 600);
+                    if (enc->rawOutputs && !firstOut) firstOut = GetTickCount64();
+                }
+                if (FAILED(hr)) logHr(lg, (L"probe encode (" + enc->lastErrorAt + L")").c_str(), hr);
+                wchar_t b[400];
+                swprintf(b, 400, L"probe: %d frame(s) offered, %llu taken (%llu eager, %llu not-accepting), %llu raw out, %llu delivered, "
+                                 L"events NeedInput=%llu HaveOutput=%llu other=%llu, %llu dropped before key, first output %lld ms%ls\n",
+                         sent, enc->inputs, enc->eagerInputs, enc->notAccepting, enc->rawOutputs, enc->outputs,
+                         enc->evNeedInput, enc->evHaveOutput, enc->evOther, enc->dropsBeforeKey,
+                         firstOut ? (long long)(firstOut - t0) : -1LL, drainedOk ? L", drained" : L"");
                 lg += b;
-                ok = SUCCEEDED(hr) && enc->outputs > 0;
+                if (enc->rawOutputs == 0) {
+                    if (enc->evNeedInput <= 1 && enc->inputs <= 1) lg += L"probe: encoder took one frame and never asked for more (stalled pipeline)\n";
+                    else if (enc->inputs > 1) lg += L"probe: frames accepted but no bitstream produced\n";
+                    if (FAILED(enc->lastError)) logHr(lg, (L"probe last error at " + enc->lastErrorAt).c_str(), enc->lastError);
+                }
+                ok = SUCCEEDED(hr) && enc->rawOutputs > 0;
             }
         }
         int expect = 0;

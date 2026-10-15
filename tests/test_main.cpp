@@ -5,6 +5,8 @@
 #include "../src/core/hotkey.h"
 #include "../src/core/settings.h"
 #include "../src/core/fsm.h"
+#include "../src/core/winlabel.h"
+#include "../src/core/notify_policy.h"
 
 using namespace cr;
 static int g_fail = 0, g_pass = 0;
@@ -228,7 +230,46 @@ static void testSettingsV11() {
     CHECK(cr::validate(cr::Hotkey{cr::MOD_CTRL_ | cr::MOD_SHIFT_, 'G'}).severity != cr::Severity::Ok);
 }
 
+static void testWindowPicker() {
+    // label: app name first, page title with the browser suffix removed
+    CHECK(appDisplayName(L"brave.exe", L"Brave Browser") == L"Brave");
+    CHECK(appDisplayName(L"C:\\x\\msedge.exe", L"") == L"Edge");
+    CHECK(appDisplayName(L"foo.exe", L"Foo Editor") == L"Foo Editor");
+    CHECK(appDisplayName(L"foo.exe", L"") == L"Foo");
+    CHECK(stripAppSuffix(L"Cast Recorder v1.0 release - Brave", L"brave.exe", L"Brave") == L"Cast Recorder v1.0 release");
+    CHECK(stripAppSuffix(L"Inbox - Gmail - Google Chrome", L"chrome.exe", L"Chrome") == L"Inbox - Gmail");
+    CHECK(stripAppSuffix(L"News - Personal - Microsoft\u200B Edge", L"msedge.exe", L"Edge") == L"News");
+    CHECK(stripAppSuffix(L"Doc \u2014 Mozilla Firefox", L"firefox.exe", L"Firefox") == L"Doc");
+    CHECK(stripAppSuffix(L"Brave", L"brave.exe", L"Brave") == L"");
+    CHECK(stripAppSuffix(L"notes.txt - Notepad", L"notepad.exe", L"Notepad") == L"notes.txt");
+    CHECK(windowLabel(L"Brave", L"Cast Recorder v1.0 release") == L"Brave \u00B7 Cast Recorder v1.0 release");
+    CHECK(windowLabel(L"Brave", L"") == L"Brave");
+    // which windows are pickable
+    WinFacts main; main.style = ws::CAPTION | ws::SYSMENU | ws::THICKFRAME | ws::MINIMIZEBOX; main.titleLen = 10; main.w = 1280; main.h = 800; main.cls = L"Chrome_WidgetWin_1";
+    CHECK(pickReject(main) == nullptr);
+    WinFacts hover = main; hover.style = ws::POPUP; hover.exStyle = ws::EX_TOOLWINDOW | ws::EX_NOACTIVATE; hover.w = 300; hover.h = 120;
+    CHECK(pickReject(hover) != nullptr);
+    WinFacts media = main; media.style = ws::POPUP; media.exStyle = ws::EX_TOPMOST; media.w = 146; media.h = 21;
+    CHECK(pickReject(media) != nullptr);  // the 146x21 Brave popup from the v1.0 report
+    WinFacts bare = main; bare.style = ws::POPUP; bare.w = 400; bare.h = 300;
+    CHECK(pickReject(bare) != nullptr);
+    WinFacts owned = main; owned.owned = true; CHECK(pickReject(owned) != nullptr);
+    owned.exStyle = ws::EX_APPWINDOW; CHECK(pickReject(owned) == nullptr);
+    WinFacts tiny = main; tiny.w = 100; tiny.h = 30; CHECK(pickReject(tiny) != nullptr);
+    WinFacts cloaked = main; cloaked.cloaked = true; CHECK(pickReject(cloaked) != nullptr);
+    WinFacts tip = main; tip.cls = L"tooltips_class32"; CHECK(pickReject(tip) != nullptr);
+}
+
+static void testNoticePolicy() {
+    CHECK(noticeTarget(true, false, true) == NoticeTarget::StatusOnly);       // app open and in front: status only
+    CHECK(noticeTarget(true, true, false) == NoticeTarget::OnScreenToast);    // minimized
+    CHECK(noticeTarget(true, false, false) == NoticeTarget::OnScreenToast);   // another window in front
+    CHECK(noticeTarget(false, false, false) == NoticeTarget::OnScreenToast);  // hidden
+}
+
 int main() {
+    testNoticePolicy();
+    testWindowPicker();
     testSettingsV11();
     testSettingsV2();
     testMicFx();

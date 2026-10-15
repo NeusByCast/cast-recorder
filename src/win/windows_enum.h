@@ -11,9 +11,17 @@ struct CaptureWindow {
     std::wstring exe;      // process image name, e.g. "notepad.exe"
     HICON icon = nullptr;  // borrowed from the window/class: don't DestroyIcon
     bool minimized = false;
-    RECT rect{};
+    RECT rect{};           // DWM extended frame bounds (visible frame, no shadow); restored placement when minimized
+    std::wstring app;      // "Brave"
+    std::wstring page;     // title without the app suffix ("Cast Recorder v1.0 release"); may be empty
+    std::wstring label() const;  // "Brave · Cast Recorder v1.0 release"
 };
-std::vector<CaptureWindow> listCaptureWindows();  // z-order (topmost first); excludes our own process
+// Real top-level app windows only (alt-tab rules: no tool windows, owned popups, hover cards, tooltips, media
+// popups, cloaked or tiny windows), one entry per app window (exact duplicates folded), grouped by app in z-order.
+std::vector<CaptureWindow> listCaptureWindows();
+void includeOwnWindowsForTest(bool on);  // CI picker test: its test windows live in this process
+// Why a window is not offered (nullptr = offered). For logs and the CI picker test.
+const char* captureRejectReason(HWND h);
 HWND findCaptureWindow(const std::wstring& titleOrExe);  // case-insensitive substring match (CLI/tests)
 
 struct DisplayInfo {
@@ -31,7 +39,8 @@ struct CaptureTarget {
     HMONITOR mon = nullptr;   // Monitor (nullptr = primary)
     HWND hwnd = nullptr;      // Window
 };
-// Re-find a saved window: exact exe+title, then same exe (title changed, e.g. document name), else nullptr.
+// Re-find a saved window among the offered ones: exact exe+title, then the largest window of the same exe (title
+// changed, e.g. another tab), else nullptr. Never a popup of that app.
 HWND resolveSavedWindow(const std::wstring& exe, const std::wstring& title);
 std::wstring windowExe(HWND h);
 }

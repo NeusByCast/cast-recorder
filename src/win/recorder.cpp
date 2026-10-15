@@ -105,6 +105,7 @@ struct Source {
     virtual bool acquire(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew) = 0;
     virtual bool ended() const { return false; }      // window capture: the window closed
     virtual std::wstring events() { return L""; }     // window capture: minimized/restored/resized
+    virtual void setFrameInterval(double) {}          // WGC: don't deliver faster than this (high-refresh displays)
     UINT w = 0, h = 0;
 };
 
@@ -213,6 +214,7 @@ struct WgcSourceAdapter : Source {
     }
     bool ended() const override { return window && cap.closed(); }
     std::wstring events() override { return cap.takeEvents(); }
+    void setFrameInterval(double ms) override { cap.setFrameInterval(ms); }
     bool acquire(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT timeoutMs, bool& gotNew) override {
         return cap.copyLatest(ctx, dst, timeoutMs, gotNew);
     }
@@ -224,6 +226,7 @@ struct WgcAllDisplays : Source {
     POINT origin{0, 0};
     bool cleared = false;
     const wchar_t* name() const override { return L"Windows Graphics Capture (all displays)"; }
+    void setFrameInterval(double ms) override { for (auto& m : mons) m.cap->setFrameInterval(ms); }
     bool init(ID3D11Device* d, bool cursor, std::wstring& err) {
         std::vector<std::pair<HMONITOR, RECT>> ms;
         EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT r, LPARAM p) -> BOOL {
@@ -707,8 +710,78 @@ static std::wstring probeKey(ID3D11Device* dev, const HwEncoderInfo& e) {
     ComPtr<IDXGIDevice> d; ComPtr<IDXGIAdapter> a; DXGI_ADAPTER_DESC ad{};
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d))) && SUCCEEDED(d->GetAdapter(&a))) a->GetDesc(&ad);
     wchar_t b[128];
-    swprintf(b, 128, L"%08lX:%08lX/%d/%ls/%d/%ls", (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart, e.index, e.vendor.c_str(), e.argb ? 1 : 0, codecName(e.subtype));
+    // "v2": probe at a fixed size with the drain/eager-input loop (v1.0 cached FAILs from a tiny-window probe).
+    swprintf(b, 128, L"v2/%08lX:%08lX/%d/%ls/%d/%ls", (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart, e.index, e.vendor.c_str(), e.argb ? 1 : 0, codecName(e.subtype));
     return b;
+}
+
+// Probe with the process-wide cache; waits for a concurrent probe of the same encoder instead of starting another.
+static bool cachedProbe(ID3D11Device* dev, const HwEncoderInfo& e, int fps, std::wstring& elog, bool* wasCached = nullptr) {
+    const std::wstring key = probeKey(dev, e);
+    int cached = -1;
+    {
+        std::unique_lock<std::mutex> g(g_probeM);
+        g_probeCv.wait_for(g, std::chrono::seconds(8), [&] { auto it = g_probe.find(key); return it == g_probe.end() || it->second != 2; });
+        auto it = g_probe.find(key);
+        if (it != g_probe.end() && it->second != 2) cached = it->second;
+        else g_probe[key] = 2;
+    }
+    if (wasCached) *wasCached = cached >= 0;
+    if (cached == 0) { elog += L"probe " + e.name + L": cached FAIL (this run), skipped\n"; return false; }
+    if (cached == 1) { elog += L"probe " + e.name + L": cached OK\n"; return true; }
+    bool okp = probeHwEncoder(dev, e, kProbeW, kProbeH, fps, 4500, elog);
+    { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp ? 1 : 0; }
+    g_probeCv.notify_all();
+    return okp;
+}
+
+// Auto GPU on hybrid laptops: the adapter that drives the panel (often the iGPU) may have no working hardware
+// encoder. Probe it first; if none of its encoders work, try the other hardware adapters (dGPU) and record on the
+// first one that does - Windows Graphics Capture copies the frames across adapters. Decided once per process.
+static std::mutex g_autoAdM;
+static bool g_autoAdDone = false;
+static LUID g_autoAdLuid{};
+static bool g_autoAdOther = false;
+static std::wstring g_autoAdLog;
+static bool pickEncodeAdapter(IDXGIFactory1* fac, IDXGIAdapter1* display, UINT wantVendor, int fps, LUID& out, std::wstring& log) {
+    std::lock_guard<std::mutex> lk(g_autoAdM);
+    if (g_autoAdDone) { out = g_autoAdLuid; log += g_autoAdLog; return g_autoAdOther; }
+    std::wstring lg;
+    DXGI_ADAPTER_DESC1 dd{}; if (display) display->GetDesc1(&dd);
+    std::vector<ComPtr<IDXGIAdapter1>> order;
+    if (display) order.push_back(display);
+    ComPtr<IDXGIAdapter1> a;
+    for (UINT i = 0; fac->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i, a.Reset()) {
+        DXGI_ADAPTER_DESC1 d{}; a->GetDesc1(&d);
+        if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        if (display && d.AdapterLuid.LowPart == dd.AdapterLuid.LowPart && d.AdapterLuid.HighPart == dd.AdapterLuid.HighPart) continue;
+        order.push_back(a);
+    }
+    bool found = false, other = false;
+    for (size_t k = 0; k < order.size() && !found; ++k) {
+        DXGI_ADAPTER_DESC1 d{}; order[k]->GetDesc1(&d);
+        wchar_t hb[200];
+        swprintf(hb, 200, L"auto GPU: adapter %ls (vendor %04X, LUID %08lX:%08lX)%ls\n", d.Description, d.VendorId,
+                 (unsigned long)d.AdapterLuid.HighPart, (unsigned long)d.AdapterLuid.LowPart, k == 0 && display ? L" [drives the display]" : L"");
+        lg += hb;
+        ComPtr<ID3D11Device> pdev;
+        HRESULT hr = D3D11CreateDevice(order[k].Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                       nullptr, 0, D3D11_SDK_VERSION, &pdev, nullptr, nullptr);
+        if (FAILED(hr)) { wchar_t b[96]; swprintf(b, 96, L"auto GPU:   no video device (0x%08lX)\n", (unsigned long)hr); lg += b; continue; }
+        ComPtr<ID3D10Multithread> mt;
+        if (SUCCEEDED(pdev.As(&mt))) mt->SetMultithreadProtected(TRUE);
+        auto encs = hwEncodersForDevice(pdev.Get(), lg, MFVideoFormat_H264);
+        for (auto& e : encs) {
+            if (wantVendor && e.pciVendor != wantVendor) continue;
+            if (cachedProbe(pdev.Get(), e, fps, lg)) { found = true; other = !(k == 0 && display); out = d.AdapterLuid; break; }
+        }
+        if (!found) lg += L"auto GPU:   no working hardware H.264 encoder on this adapter\n";
+    }
+    if (found && other) lg += L"auto GPU: encoding on the other adapter (cross-adapter capture)\n";
+    if (!found) lg += L"auto GPU: no working hardware encoder on any adapter\n";
+    g_autoAdDone = true; g_autoAdLuid = out; g_autoAdOther = found && other; g_autoAdLog = lg;
+    log += lg;
+    return found && other;
 }
 
 static AbandonLatch& processLatch() { static AbandonLatch* l = new AbandonLatch; return *l; }  // never destroyed
@@ -853,8 +926,12 @@ void Recorder::run() {
         typedef HANDLE(WINAPI * AvSet)(LPCWSTR, LPDWORD);
         HMODULE av = LoadLibraryExW(L"avrt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         DWORD task = 0;
-        if (av) if (auto f = (AvSet)GetProcAddress(av, "AvSetMmThreadCharacteristicsW")) mmcss = f(L"Capture", &task);
-        if (!mmcss) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        // The always-on replay buffer runs at normal priority: it must never make games/the desktop stutter. A real
+        // recording (user pressed Record) gets MMCSS "Capture" so it doesn't drop frames under load.
+        if (!opt_.bufferOnly) {
+            if (av) if (auto f = (AvSet)GetProcAddress(av, "AvSetMmThreadCharacteristicsW")) mmcss = f(L"Capture", &task);
+            if (!mmcss) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        }
     }
     RecordResult r;
     bool abandonedMf = false;
@@ -911,6 +988,21 @@ void Recorder::run() {
                 }
                 if (!output) adapter.Reset();
             }
+        }
+        // Auto GPU + hardware wanted: if the display adapter has no working encoder, move to one that has.
+        if (opt_.gpuIndex < 0 && opt_.encoder != Encoder::Software && !opt_.forcePattern) {
+            LUID pick{};
+            if (pickEncodeAdapter(fac.Get(), adapter.Get(), vendorPci(opt_.encoder), opt_.fps, pick, r.encoderLog)) {
+                ComPtr<IDXGIAdapter1> a2;
+                for (UINT i = 0; fac->EnumAdapters1(i, &a2) != DXGI_ERROR_NOT_FOUND; ++i, a2.Reset()) {
+                    DXGI_ADAPTER_DESC1 d{}; a2->GetDesc1(&d);
+                    if (d.AdapterLuid.LowPart == pick.LowPart && d.AdapterLuid.HighPart == pick.HighPart) {
+                        adapter = a2; adapterName = d.Description; output.Reset();  // WGC captures cross-adapter
+                        break;
+                    }
+                }
+            }
+            mark(L"adapter_pick");
         }
         if (!output) {  // selected GPU drives no display (e.g. laptop dGPU): WGC copies across adapters
             MONITORINFO mi{sizeof mi};
@@ -989,6 +1081,10 @@ void Recorder::run() {
         }
         if (!src) { r.message = L"Screen capture unavailable: " + (capErr.empty() ? std::wstring(L"no output") : capErr); return; }
         r.captureUsed = src->name();
+        // Arrivals at the display rate (240 Hz panels) only cost compositor + copy work: cap them just above the
+        // recording rate (0.75 x frame interval keeps pacing jitter-free).
+        src->setFrameInterval(opt_.fps > 0 ? 750.0 / opt_.fps : 0);
+        if (opt_.window) r.encoderLog += L"window capture output " + std::to_wstring(src->w) + L"x" + std::to_wstring(src->h) + L"\n";
         mark(L"capture_init");
         UINT W = 0, H = 0;  // encoded size (even; optionally downscaled)
         scaledSize(opt_.scale, src->w, src->h, W, H);
@@ -1056,6 +1152,27 @@ void Recorder::run() {
         bool haveGood = false, cpuFallback = false;
         long long failSince = 0;
         std::vector<uint8_t> nv12Cpu;
+        // Software encoder path: GPU BGRA->NV12 (+scale) then an NV12 readback (1.5 B/px instead of 4 B/px and no
+        // CPU colour conversion); NV12 written straight into pooled MF buffers; a repeated frame reuses the last
+        // buffer (no readback at all). v1.0 read back BGRA, converted on the CPU and allocated a buffer per frame.
+        bool swGpu = false;
+        ComPtr<ID3D11Texture2D> nv12Staging;
+        std::vector<ComPtr<IMFMediaBuffer>> swPool;
+        ComPtr<IMFMediaBuffer> swLast;
+        bool latestDirty = true;
+        unsigned long long swReadbacks = 0, swReused = 0, swPoolNew = 0;
+        auto swBuffer = [&](DWORD bytes) -> ComPtr<IMFMediaBuffer> {
+            for (auto& b : swPool) {
+                if (b == swLast) continue;
+                b->AddRef();
+                if (b->Release() == 1) return b;  // only the pool holds it: the encoder is done with it
+            }
+            ComPtr<IMFMediaBuffer> nb;
+            if (FAILED(MFCreateMemoryBuffer(bytes, &nb))) return nullptr;
+            ++swPoolNew;
+            if (swPool.size() < 12) swPool.push_back(nb);
+            return nb;
+        };
         D3D11_BOX box{};
         // Encoded-sample sink for the hardware path: the MP4 writer is opened on the first output so it gets the
         // encoder's final output type (sequence header).
@@ -1129,26 +1246,10 @@ void Recorder::run() {
                 if (!encs.empty()) {
                     for (auto& e : encs) {
                         elog += L"probe " + e.name + L"\n";
-                        const std::wstring key = probeKey(dev.Get(), e);
-                        int cached = -1;
-                        {
-                        // Another session (the launch warm-up) is probing this encoder: wait for its verdict, don't
-                        // run a second concurrent probe (AMD/NVENC session limits). Capture is already running.
-                        std::unique_lock<std::mutex> g(g_probeM);
-                        g_probeCv.wait_for(g, std::chrono::seconds(6), [&] { auto it = g_probe.find(key); return it == g_probe.end() || it->second != 2; });
-                        auto it = g_probe.find(key);
-                        if (it != g_probe.end() && it->second != 2) cached = it->second;
-                        else g_probe[key] = 2;
-                    }
-                        if (cached == 0) { elog += L"probe " + e.name + L": cached FAIL, skipped\n"; r.encoderFallbacks.push_back(e.name); continue; }
-                        if (cached == 1) elog += L"probe " + e.name + L": cached OK\n";
-                        else {
-                            bool okp = probeHwEncoder(dev.Get(), e, W, H, opt_.fps, 2500, elog);
-                            { std::lock_guard<std::mutex> g(g_probeM); g_probe[key] = okp ? 1 : 0; }
-                        g_probeCv.notify_all();
-                            mark(L"probe");
-                            if (!okp) { r.encoderFallbacks.push_back(e.name); continue; }
-                        }
+                        bool wasCached = false;
+                        bool okp = cachedProbe(dev.Get(), e, opt_.fps, elog, &wasCached);
+                        if (!wasCached) mark(L"probe");
+                        if (!okp) { r.encoderFallbacks.push_back(e.name); continue; }
                         auto enc = std::make_unique<HwEncoder>();
                         unsigned br = bitrateFor(opt_.quality, (int)W, (int)H, opt_.fps, opt_.bitrateCap);
                         if (enc->open(dev.Get(), e, W, H, opt_.fps, br, opt_.quality >= Quality::High, elog) && muxable(*enc)) {
@@ -1205,6 +1306,13 @@ void Recorder::run() {
                 D3D11_TEXTURE2D_DESC sd = td; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.MiscFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
                 if (FAILED(dev->CreateTexture2D(&sd, nullptr, &cpuStaging))) { r.message = L"CreateTexture2D(cpuStaging) failed"; return false; }
                 nv12Cpu.resize((size_t)W * H * 3 / 2);
+                if (videoSupport && conv.init(dev.Get(), src->w, src->h, W, H)) {
+                    D3D11_TEXTURE2D_DESC nd{}; nd.Width = W; nd.Height = H; nd.MipLevels = 1; nd.ArraySize = 1; nd.Format = DXGI_FORMAT_NV12;
+                    nd.SampleDesc.Count = 1; nd.Usage = D3D11_USAGE_STAGING; nd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    swGpu = SUCCEEDED(dev->CreateTexture2D(&nd, nullptr, &nv12Staging));
+                }
+                if (!swGpu) conv = GpuConvert{};
+                elog += swGpu ? L"software encode: GPU NV12 conversion + NV12 readback\n" : L"software encode: CPU NV12 conversion (no GPU video processor)\n";
             }
             if (zeroCopy) {
                 if (!bgraDirect && FAILED(dev->CreateTexture2D(&ed, nullptr, &lastGood))) { r.message = L"CreateTexture2D(lastGood) failed"; return false; }
@@ -1321,6 +1429,7 @@ void Recorder::run() {
                 if (!pauseBegin) { LARGE_INTEGER pb; QueryPerformanceCounter(&pb); pauseBegin = pb.QuadPart; }
                 bool got = false;
                 if (!src->acquire(ctx.Get(), latest.Get(), 20, got)) { r.message = L"Capture failed"; break; }
+                if (got) latestDirty = true;
                 mixer.setPaused(true);
                 continue;
             }
@@ -1335,6 +1444,7 @@ void Recorder::run() {
             }
             if (bi < backlog.size()) {  // encode what was captured while the encoder was initialising
                 ctx->CopyResource(latest.Get(), slots[backlog[bi].slot].Get());
+                latestDirty = true;
                 next = backlog[bi].idx; ++bi;
                 if (bi == backlog.size()) { slots.clear(); }
             } else {
@@ -1346,7 +1456,7 @@ void Recorder::run() {
                 LONGLONG waitMs = (target - now.QuadPart) * 1000 / freq.QuadPart;
                 bool got = false;
                 if (!src->acquire(ctx.Get(), latest.Get(), (UINT)(waitMs > 1 ? waitMs - 1 : 0), got)) { r.message = L"Capture failed"; break; }
-                if (got) ++capArrivals;
+                if (got) { ++capArrivals; latestDirty = true; }
                 if (hw) { HRESULT ph = hw->pump(muxOut); if (FAILED(ph)) { r.message = hrMsg(L"Encoder", ph); break; } }
                 QueryPerformanceCounter(&now);
                 if (now.QuadPart < target && timer) {
@@ -1358,7 +1468,7 @@ void Recorder::run() {
             }
             if (due > next + 1) { unsigned long long skip = (unsigned long long)(due - next - 1); r.late += skip; r.dropped += skip; next = due - 1; }
             }
-            if (cursorByGdi) drawCursor(latest.Get(), origin);
+            if (cursorByGdi) { drawCursor(latest.Get(), origin); latestDirty = true; }
             ID3D11Texture2D* t = ring[next % RING].Get();
             LARGE_INTEGER cs0; QueryPerformanceCounter(&cs0);
             ComPtr<IMFMediaBuffer> buf;
@@ -1367,11 +1477,12 @@ void Recorder::run() {
                 whr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), t, 0, FALSE, &buf);
                 if (SUCCEEDED(whr)) { ComPtr<IMF2DBuffer> b2; if (SUCCEEDED(buf.As(&b2))) { DWORD len = 0; b2->GetContiguousLength(&len); buf->SetCurrentLength(len); } }
             } else if (zeroCopy && !cpuFallback) {
-                // GPU BGRA->NV12 (+scale) into the ring surface; no CPU readback.
-                bool okConv = conv.convert(latest.Get());
+                // GPU BGRA->NV12 (+scale) into the ring surface; no CPU readback. A repeated frame skips the conversion.
+                bool okConv = (!latestDirty && haveGood) ? true : conv.convert(latest.Get());
+                const bool converted = latestDirty || !haveGood;
                 LARGE_INTEGER nowc; QueryPerformanceCounter(&nowc);
                 if (okConv) {
-                    ctx->CopyResource(lastGood.Get(), conv.nv12.Get());
+                    if (converted) ctx->CopyResource(lastGood.Get(), conv.nv12.Get());
                     haveGood = true;
                     failSince = 0;
                 } else {
@@ -1395,18 +1506,36 @@ void Recorder::run() {
             }
             if (bgraDirect) {
             } else if ((zeroCopy && cpuFallback) || swNv12) {
-                ctx->CopyResource(cpuStaging.Get(), latest.Get());
-                D3D11_MAPPED_SUBRESOURCE m{};
-                whr = ctx->Map(cpuStaging.Get(), 0, D3D11_MAP_READ, 0, &m);
-                if (SUCCEEDED(whr)) {
-                    bgraToNv12((const uint8_t*)m.pData, src->w, src->h, m.RowPitch, nv12Cpu.data(), W, H);
-                    ctx->Unmap(cpuStaging.Get(), 0);
-                    whr = MFCreateMemoryBuffer((DWORD)nv12Cpu.size(), &buf);
+                const DWORD nvBytes = W * H * 3 / 2;
+                if (!latestDirty && swLast) { buf = swLast; ++swReused; }  // same picture: same NV12, no readback
+                else {
+                    ComPtr<IMFMediaBuffer> nb = swBuffer(nvBytes);
                     BYTE* bp = nullptr;
-                    if (SUCCEEDED(whr) && SUCCEEDED(whr = buf->Lock(&bp, nullptr, nullptr))) {
-                        memcpy(bp, nv12Cpu.data(), nv12Cpu.size());
-                        buf->Unlock();
-                        buf->SetCurrentLength((DWORD)nv12Cpu.size());
+                    whr = nb ? nb->Lock(&bp, nullptr, nullptr) : E_OUTOFMEMORY;
+                    if (SUCCEEDED(whr)) {
+                        bool done = false;
+                        if (swGpu && conv.convert(latest.Get())) {
+                            ctx->CopyResource(nv12Staging.Get(), conv.nv12.Get());
+                            D3D11_MAPPED_SUBRESOURCE m{};
+                            if (SUCCEEDED(ctx->Map(nv12Staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+                                MFCopyImage(bp, (LONG)W, (const BYTE*)m.pData, (LONG)m.RowPitch, W, H);
+                                MFCopyImage(bp + (size_t)W * H, (LONG)W, (const BYTE*)m.pData + (size_t)m.RowPitch * H, (LONG)m.RowPitch, W, H / 2);
+                                ctx->Unmap(nv12Staging.Get(), 0);
+                                done = true;
+                            }
+                        }
+                        if (!done) {
+                            ctx->CopyResource(cpuStaging.Get(), latest.Get());
+                            D3D11_MAPPED_SUBRESOURCE m{};
+                            whr = ctx->Map(cpuStaging.Get(), 0, D3D11_MAP_READ, 0, &m);
+                            if (SUCCEEDED(whr)) {
+                                bgraToNv12((const uint8_t*)m.pData, src->w, src->h, m.RowPitch, bp, W, H);
+                                ctx->Unmap(cpuStaging.Get(), 0);
+                            }
+                        }
+                        nb->Unlock();
+                        nb->SetCurrentLength(nvBytes);
+                        if (SUCCEEDED(whr)) { buf = nb; swLast = nb; ++swReadbacks; }
                     }
                 }
                 if (FAILED(whr)) { r.message = hrMsg(L"CPU fallback", whr); break; }
@@ -1429,6 +1558,7 @@ void Recorder::run() {
                 }
             }
             bool counted = buf != nullptr;
+            if (buf) latestDirty = false;
             LARGE_INTEGER cs1; QueryPerformanceCounter(&cs1);
             convMs += (double)(cs1.QuadPart - cs0.QuadPart) * 1000.0 / freq.QuadPart; ++convN;
             if (SUCCEEDED(whr) && buf && hw) {
@@ -1450,7 +1580,7 @@ void Recorder::run() {
             ++next;
             bool got = false;
             if (!src->acquire(ctx.Get(), latest.Get(), 0, got)) { r.message = L"Capture failed"; break; }
-            if (got) ++capArrivals;
+            if (got) { ++capArrivals; latestDirty = true; }
             if (!got) ++r.duplicated;  // reuse last frame
         }
         if (timer) CloseHandle(timer);
@@ -1481,7 +1611,8 @@ void Recorder::run() {
             pushAudio(next * dur, true);
             while (!audioPending.empty() && wr.sw) { writeChunk(audioPending.front()); audioPending.pop_front(); }
         }
-        if (replay && ringAttached) replay->detach();
+        if (replay && ringAttached) { replay->detach(); elog += replay->stats() + L"\n"; }
+        if (swNv12) { wchar_t sb[200]; swprintf(sb, 200, L"software encode: %llu readbacks, %llu repeated frames reused, %llu buffers allocated (pool %zu)\n", swReadbacks, swReused, swPoolNew, swPool.size()); elog += sb; }
         r.encoderLog += L"audio stats: " + mixer.stats() + L"\n";
         mixer.stop();
 
@@ -1834,10 +1965,39 @@ struct ReplayRing::Impl {
     ComPtr<IMFMediaType> vtype;
     GUID sub{}; UINT32 w = 0, h = 0; std::vector<BYTE> hdr;
     int fps = 30, channels = 1, tracks = 1; bool audio = false;
-    struct V { ComPtr<IMFSample> s; LONGLONG t = 0, d = 0; bool key = false; size_t bytes = 0; };
+    // Packet storage: an arena of 4 MB blocks reused in a ring. A packet is a slice of a block; when every slice
+    // of a block has been trimmed (and no save snapshot still holds it) the block is reused as-is: in steady state
+    // the buffer allocates nothing per packet (v1.0 made an IMFMediaBuffer + IMFSample per packet and a heap vector
+    // per audio chunk).
+    struct Block { std::unique_ptr<BYTE[]> data; size_t cap = 0, used = 0; };
+    struct Slice { std::shared_ptr<Block> b; uint32_t off = 0, len = 0; const BYTE* ptr() const { return b ? b->data.get() + off : nullptr; } };
+    static constexpr size_t kBlock = (size_t)4 << 20;
+    std::vector<std::shared_ptr<Block>> blocks;  // pool (ring order); use_count()==1 -> free
+    std::shared_ptr<Block> cur;
+    size_t blocksAllocated = 0, blocksReused = 0;
+    Slice alloc(size_t len) {
+        if (cur) cur->used = std::min(cur->cap, (cur->used + 15) & ~(size_t)15);  // 16-byte aligned slices (PCM is read as int16)
+        if (cur && cur->cap - cur->used >= len) { Slice sl{cur, (uint32_t)cur->used, (uint32_t)len}; cur->used += len; return sl; }
+        std::shared_ptr<Block> nb;
+        if (len <= kBlock) {
+            for (auto& b : blocks) if (b.use_count() == 1 && b != cur) { nb = b; nb->used = 0; ++blocksReused; break; }
+            if (!nb) { nb = std::make_shared<Block>(); nb->data.reset(new BYTE[kBlock]); nb->cap = kBlock; blocks.push_back(nb); ++blocksAllocated; }
+        } else {  // oversized packet (huge key frame): its own block, freed with it
+            nb = std::make_shared<Block>(); nb->data.reset(new BYTE[len]); nb->cap = len; ++blocksAllocated;
+        }
+        cur = nb;
+        Slice sl{cur, 0, (uint32_t)len}; cur->used = len; return sl;
+    }
+    // Free blocks beyond what the cap allows (after a shrink) are released.
+    void releaseSpare() {
+        size_t keep = maxBytes / kBlock + 2;
+        for (size_t i = 0; i < blocks.size() && blocks.size() > keep;)
+            if (blocks[i].use_count() == 1 && blocks[i] != cur) blocks.erase(blocks.begin() + (ptrdiff_t)i); else ++i;
+    }
+    struct V { Slice s; LONGLONG t = 0, d = 0; bool key = false; size_t bytes = 0; };
     std::deque<V> v;
-    // PCM chunks are immutable once queued: save() takes refs under the lock and copies nothing there.
-    struct A { LONGLONG t = 0; std::shared_ptr<const std::vector<short>> pcm[3]; size_t bytes = 0; };
+    // PCM chunks are immutable once queued (arena slices too): save() takes refs under the lock and copies nothing there.
+    struct A { LONGLONG t = 0; Slice pcm[3]; size_t bytes = 0; };
     std::deque<A> a;
     LONGLONG offset = 0, lastEnd = 0;
     bool attached = false;
@@ -1905,7 +2065,7 @@ ReplayRing::~ReplayRing() = default;
 void ReplayRing::setSeconds(int s) { std::lock_guard<std::mutex> g(p_->m); p_->seconds = s < 5 ? 5 : s > 900 ? 900 : s; p_->trim(); }
 int ReplayRing::seconds() const { std::lock_guard<std::mutex> g(p_->m); return p_->seconds; }
 size_t ReplayRing::bytes() const { std::lock_guard<std::mutex> g(p_->m); return p_->bytes; }
-void ReplayRing::setMaxBytes(size_t b) { std::lock_guard<std::mutex> g(p_->m); p_->maxBytes = b < ((size_t)1 << 20) ? ((size_t)1 << 20) : b; p_->trim(); }
+void ReplayRing::setMaxBytes(size_t b) { std::lock_guard<std::mutex> g(p_->m); p_->maxBytes = b < ((size_t)1 << 20) ? ((size_t)1 << 20) : b; p_->trim(); p_->releaseSpare(); }
 size_t ReplayRing::maxBytes() const { std::lock_guard<std::mutex> g(p_->m); return p_->maxBytes; }
 bool ReplayRing::cappedByMemory() const { std::lock_guard<std::mutex> g(p_->m); return p_->capped; }
 double ReplayRing::bufferedSeconds() const {
@@ -1924,7 +2084,7 @@ void ReplayRing::attach(IMFMediaType* vt, int fps, int channels, int tracks, boo
     const bool same = p_->vtype && sub == p_->sub && w == p_->w && h == p_->h && hdr == p_->hdr && fps == p_->fps &&
                       channels == p_->channels && tracks == p_->tracks && audio == p_->audio;
     if (!same) {  // different encoder configuration: older packets could not be muxed with this one
-        p_->v.clear(); p_->a.clear(); p_->bytes = 0; p_->lastEnd = 0;
+        p_->v.clear(); p_->a.clear(); p_->bytes = 0; p_->lastEnd = 0; p_->cur.reset();
         ComPtr<IMFMediaType> c;
         MFCreateMediaType(&c);
         vt->CopyAllItems(c.Get());
@@ -1934,6 +2094,13 @@ void ReplayRing::attach(IMFMediaType* vt, int fps, int channels, int tracks, boo
     p_->attached = true;
 }
 void ReplayRing::detach() { std::lock_guard<std::mutex> g(p_->m); p_->attached = false; }
+std::wstring ReplayRing::stats() const {
+    std::lock_guard<std::mutex> g(p_->m);
+    wchar_t b[200];
+    swprintf(b, 200, L"replay ring: %zu packets, %zu audio chunks, %.1f MB held, arena %zu x 4 MB blocks (%zu allocated, %zu reused)",
+             p_->v.size(), p_->a.size(), p_->bytes / 1048576.0, p_->blocks.size(), p_->blocksAllocated, p_->blocksReused);
+    return b;
+}
 
 void ReplayRing::addVideo(IMFSample* s) {
     LONGLONG t = 0, d = 0;
@@ -1941,42 +2108,46 @@ void ReplayRing::addVideo(IMFSample* s) {
     if (FAILED(s->GetSampleDuration(&d)) || d <= 0) d = 10000000LL / 30;
     UINT32 clean = 0;
     if (FAILED(s->GetUINT32(MFSampleExtension_CleanPoint, &clean))) clean = 0;
-    // Own copy of the bytes: encoder MFTs may recycle their output samples from a small pool.
-    ComPtr<IMFMediaBuffer> src, dst;
-    if (FAILED(s->ConvertToContiguousBuffer(&src))) return;
+    // Own copy of the bytes (encoder MFTs recycle their output samples), into the preallocated arena.
+    ComPtr<IMFMediaBuffer> src;
+    DWORD nb = 0;
+    if (FAILED(s->GetBufferCount(&nb)) || nb == 0) return;
+    if (nb == 1) { if (FAILED(s->GetBufferByIndex(0, &src))) return; }
+    else if (FAILED(s->ConvertToContiguousBuffer(&src))) return;
     BYTE* p = nullptr; DWORD len = 0;
     if (FAILED(src->Lock(&p, nullptr, &len))) return;
-    HRESULT hr = MFCreateMemoryBuffer(len ? len : 1, &dst);
-    BYTE* q = nullptr;
-    if (SUCCEEDED(hr) && SUCCEEDED(hr = dst->Lock(&q, nullptr, nullptr))) { memcpy(q, p, len); dst->Unlock(); dst->SetCurrentLength(len); }
+    {
+        std::lock_guard<std::mutex> g(p_->m);
+        if (p_->attached && !(p_->v.empty() && !clean)) {  // the ring always starts on a key frame
+            try {
+                Impl::V x; x.s = p_->alloc(len ? len : 1); memcpy(x.s.b->data.get() + x.s.off, p, len); x.s.len = len;
+                x.t = t + p_->offset; x.d = d; x.key = clean != 0; x.bytes = len;
+                p_->v.push_back(std::move(x));
+                p_->bytes += len;
+                if (t + p_->offset + d > p_->lastEnd) p_->lastEnd = t + p_->offset + d;
+                p_->trim();
+            } catch (const std::bad_alloc&) { p_->oom(); }
+        }
+    }
     src->Unlock();
-    if (FAILED(hr)) return;
-    ComPtr<IMFSample> c;
-    if (FAILED(MFCreateSample(&c))) return;
-    c->AddBuffer(dst.Get());
-    std::lock_guard<std::mutex> g(p_->m);
-    if (!p_->attached) return;
-    try {
-    Impl::V x; x.s = c; x.t = t + p_->offset; x.d = d; x.key = clean != 0; x.bytes = len;
-    if (p_->v.empty() && !x.key) return;  // the ring always starts on a key frame
-    p_->v.push_back(x);
-    p_->bytes += len;
-    if (x.t + d > p_->lastEnd) p_->lastEnd = x.t + d;
-    p_->trim();
-    } catch (const std::bad_alloc&) { p_->oom(); }
 }
 
 void ReplayRing::addAudio(long long t, const std::vector<short>* const pcm[3]) {
-    Impl::A c;  // copy the PCM before taking the lock
-    try {
-        for (int k = 0; k < 3; ++k) if (pcm[k] && !pcm[k]->empty()) { c.pcm[k] = std::make_shared<const std::vector<short>>(*pcm[k]); c.bytes += pcm[k]->size() * sizeof(short); }
-    } catch (const std::bad_alloc&) { std::lock_guard<std::mutex> g(p_->m); p_->oom(); return; }
     std::lock_guard<std::mutex> g(p_->m);
     if (!p_->attached || !p_->audio || p_->v.empty()) return;
-    c.t = t + p_->offset;
-    for (int k = p_->tracks; k < 3; ++k) { if (c.pcm[k]) c.bytes -= c.pcm[k]->size() * sizeof(short); c.pcm[k].reset(); }
-    const size_t nb = c.bytes;
-    try { p_->a.push_back(std::move(c)); p_->bytes += nb; } catch (const std::bad_alloc&) { p_->oom(); }
+    try {
+        Impl::A c;
+        c.t = t + p_->offset;
+        for (int k = 0; k < p_->tracks && k < 3; ++k)
+            if (pcm[k] && !pcm[k]->empty()) {
+                size_t n = pcm[k]->size() * sizeof(short);
+                c.pcm[k] = p_->alloc(n);
+                memcpy(c.pcm[k].b->data.get() + c.pcm[k].off, pcm[k]->data(), n);
+                c.bytes += n;
+            }
+        const size_t nb = c.bytes;
+        p_->a.push_back(std::move(c)); p_->bytes += nb;
+    } catch (const std::bad_alloc&) { p_->oom(); }
 }
 
 bool ReplayRing::save(const std::wstring& path, double& savedSeconds, std::wstring& err) {
@@ -2012,18 +2183,19 @@ bool ReplayRing::saveImpl(const std::wstring& path, double& savedSeconds, std::w
         if (!w.openPassthrough(path, vt.Get(), err)) return;
         size_t ai = 0;
         const LONGLONG perFrame = 10000000LL / AudioMixer::kRate;
+        std::vector<short> part;
         auto writeAudioUpTo = [&](LONGLONG until) -> HRESULT {
             for (; ai < as.size() && as[ai].t <= until; ++ai) {
                 const Impl::A& c = as[ai];
                 for (int k = 0; k < tracks; ++k) {
-                    if (!c.pcm[k]) continue;
-                    const std::vector<short>& pc = *c.pcm[k];
-                    if (pc.empty()) continue;
+                    if (!c.pcm[k].b || !c.pcm[k].len) continue;
+                    const short* pc = (const short*)c.pcm[k].ptr();
+                    const size_t pn = c.pcm[k].len / sizeof(short);
                     LONGLONG t = c.t - start;
                     size_t skip = 0;
                     if (t < 0) { skip = (size_t)((-t) / perFrame) * (size_t)channels; t = 0; }
-                    if (skip >= pc.size()) continue;
-                    std::vector<short> part(pc.begin() + (ptrdiff_t)skip, pc.end());
+                    if (skip >= pn) continue;
+                    part.assign(pc + skip, pc + pn);
                     HRESULT h = w.writeAudio(part, t, k);
                     if (FAILED(h)) return h;
                 }
@@ -2034,7 +2206,8 @@ bool ReplayRing::saveImpl(const std::wstring& path, double& savedSeconds, std::w
             HRESULT h = w.wantAudio ? writeAudioUpTo(x.t) : S_OK;
             ComPtr<IMFSample> c; ComPtr<IMFMediaBuffer> b;
             if (SUCCEEDED(h)) h = MFCreateSample(&c);
-            if (SUCCEEDED(h)) h = x.s->GetBufferByIndex(0, &b);
+            if (SUCCEEDED(h)) h = MFCreateMemoryBuffer(x.s.len ? x.s.len : 1, &b);
+            if (SUCCEEDED(h)) { BYTE* q = nullptr; if (SUCCEEDED(h = b->Lock(&q, nullptr, nullptr))) { memcpy(q, x.s.ptr(), x.s.len); b->Unlock(); b->SetCurrentLength(x.s.len); } }
             if (SUCCEEDED(h)) h = c->AddBuffer(b.Get());
             if (SUCCEEDED(h)) { c->SetSampleTime(x.t - start); c->SetSampleDuration(x.d); if (x.key) c->SetUINT32(MFSampleExtension_CleanPoint, TRUE); h = w.sw->WriteSample(w.stream, c.Get()); }
             if (FAILED(h)) { err = hrMsg(L"WriteSample", h); return; }

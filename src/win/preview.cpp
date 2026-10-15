@@ -175,11 +175,14 @@ void GpuPreview::run(bool cursor) {
         LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
         LARGE_INTEGER last{};
         bool any = false;
+        double capInterval = -1;  // WGC delivery cap: preview rate, not the panel's 144/240 Hz
+        auto setInterval = [&](double ms) { if (ms != capInterval) { capInterval = ms; for (auto& c : caps) c.c->setFrameInterval(ms); } };
         while (!quit_) {
             const bool rec = recording_.load();
             SetThreadPriority(GetCurrentThread(), rec ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL);
-            if (!visible_.load()) { Sleep(50); continue; }
+            if (!visible_.load()) { setInterval(500); Sleep(50); continue; }
             bool retarget = gen != targetGen_.load();
+            if (retarget) capInterval = -1;
             if (retarget) {
                 ctx->ClearState(); ctx->Flush();
                 if (!openTarget()) {  // target unavailable (window closed): tell the UI, show the primary monitor
@@ -188,6 +191,7 @@ void GpuPreview::run(bool cursor) {
                     if (!openTarget()) { failed_ = true; break; }
                 }
             }
+            setInterval(rec ? 45.0 : 15.0);
             bool got = false;
             bool ok = true;
             for (size_t i = 0; i < caps.size(); ++i) {

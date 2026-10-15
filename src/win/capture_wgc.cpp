@@ -30,6 +30,20 @@ struct WgcCapture::Impl {
     std::atomic<bool> isClosed{false};
     bool wasIconic = false;
     int lastCw = 0, lastCh = 0;
+    double intervalMs = 0;
+    // window mode: content size != output size -> copy to `scaleIn`, GPU-scale (letterbox) into the output
+    winrt::com_ptr<ID3D11Texture2D> scaleIn;
+    UINT scaleInW = 0, scaleInH = 0;
+    winrt::com_ptr<ID3D11VideoDevice> vdev;
+    winrt::com_ptr<ID3D11VideoContext> vctx;
+    winrt::com_ptr<ID3D11VideoProcessorEnumerator> ven;
+    winrt::com_ptr<ID3D11VideoProcessor> vp;
+    winrt::com_ptr<ID3D11VideoProcessorInputView> viv;
+    winrt::com_ptr<ID3D11VideoProcessorOutputView> vov;
+    ID3D11Texture2D* vovFor = nullptr;
+    bool vpBroken = false;
+    bool scaleTo(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, UINT cw, UINT ch, ID3D11Texture2D* dst);
+    void applyInterval();
     winrt::com_ptr<ID3D11RenderTargetView> rtv;
     ID3D11Texture2D* rtvFor = nullptr;
     std::mutex evM;
@@ -93,7 +107,28 @@ bool WgcCapture::startWindow(ID3D11Device* dev, HWND hwnd, bool cursor, std::wst
         p_->wasIconic = IsIconic(hwnd) != 0;
         Impl* ip = p_.get();
         p_->closedTok = p_->item.Closed([ip](auto&&, auto&&) { ip->isClosed = true; ip->event(L"closed"); SetEvent(ip->arrived); });
-        return p_->begin(dev, cursor, err);
+        if (!p_->begin(dev, cursor, err)) return false;
+        // Output size: the window's real size. Minimized -> its restored placement (the item is only the caption then).
+        UINT ow = p_->w, oh = p_->h;
+        if (p_->wasIconic) {
+            WINDOWPLACEMENT wp{sizeof wp};
+            if (GetWindowPlacement(hwnd, &wp)) {
+                LONG nw = wp.rcNormalPosition.right - wp.rcNormalPosition.left, nh = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+                // The placement includes the invisible resize borders (left/right/bottom) that WGC doesn't capture.
+                if (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_THICKFRAME) {
+                    UINT dpi = GetDpiForWindow(hwnd); if (!dpi) dpi = 96;
+                    LONG b = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    if (nw > 3 * b && nh > 3 * b) { nw -= 2 * b; nh -= b; }
+                }
+                ow = (UINT)std::max<LONG>(0, nw); oh = (UINT)std::max<LONG>(0, nh);
+            }
+            p_->event(L"minimized at start: output sized from the restored window " + std::to_wstring(ow) + L"x" + std::to_wstring(oh));
+        }
+        ow = std::max(ow, kMinWindowOut); oh = std::max(oh, kMinWindowOut);
+        ow = (ow + 1) & ~1u; oh = (oh + 1) & ~1u;  // encoders need even sizes
+        ow = std::min(ow, 8192u); oh = std::min(oh, 8192u);
+        p_->w = ow; p_->h = oh;
+        return true;
     } catch (const winrt::hresult_error& e) {
         err = L"WGC window: " + std::wstring(e.message().c_str());
         return false;
@@ -102,6 +137,64 @@ bool WgcCapture::startWindow(ID3D11Device* dev, HWND hwnd, bool cursor, std::wst
         return false;
     }
 }
+void WgcCapture::setFrameInterval(double ms) { p_->intervalMs = ms; p_->applyInterval(); }
+void WgcCapture::Impl::applyInterval() {
+    if (!session) return;
+    // Windows 11 24H2+: MinUpdateInterval (default throttles; 1 ms = every composed frame)
+    if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
+        long long hns = intervalMs > 0 ? (long long)(intervalMs * 10000.0) : 10000;
+        try { session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{hns}); } catch (...) {}
+    }
+}
+bool WgcCapture::Impl::scaleTo(ID3D11DeviceContext* ctx, ID3D11Texture2D* src, UINT cw, UINT ch, ID3D11Texture2D* dst) {
+    if (vpBroken) return false;
+    try {
+        if (!vdev) { vdev = dev.try_as<ID3D11VideoDevice>(); winrt::com_ptr<ID3D11DeviceContext> c; c.copy_from(ctx); vctx = c.try_as<ID3D11VideoContext>(); }
+        if (!vdev || !vctx) { vpBroken = true; return false; }
+        D3D11_TEXTURE2D_DESC od{}; dst->GetDesc(&od);
+        if (!scaleIn || scaleInW != cw || scaleInH != ch) {
+            scaleIn = nullptr; vp = nullptr; ven = nullptr; viv = nullptr; vov = nullptr; vovFor = nullptr;
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = cw; td.Height = ch; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, scaleIn.put()))) { vpBroken = true; return false; }
+            scaleInW = cw; scaleInH = ch;
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
+            cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+            cd.InputWidth = cw; cd.InputHeight = ch; cd.OutputWidth = w; cd.OutputHeight = h;
+            cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+            if (FAILED(vdev->CreateVideoProcessorEnumerator(&cd, ven.put())) || FAILED(vdev->CreateVideoProcessor(ven.get(), 0, vp.put()))) { vpBroken = true; return false; }
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{}; ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            if (FAILED(vdev->CreateVideoProcessorInputView(scaleIn.get(), ven.get(), &ivd, viv.put()))) { vpBroken = true; return false; }
+            vctx->VideoProcessorSetStreamAutoProcessingMode(vp.get(), 0, FALSE);
+            vctx->VideoProcessorSetStreamFrameFormat(vp.get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            D3D11_VIDEO_COLOR bg{}; bg.RGBA.A = 1;
+            vctx->VideoProcessorSetOutputBackgroundColor(vp.get(), FALSE, &bg);
+            double sa = (double)cw / ch, ta = (double)w / h;
+            RECT d{0, 0, (LONG)w, (LONG)h};
+            if (sa > ta) { LONG h2 = (LONG)(w / sa + 0.5) & ~1L; d.top = ((LONG)h - h2) / 2; d.bottom = d.top + h2; }
+            else { LONG w2 = (LONG)(h * sa + 0.5) & ~1L; d.left = ((LONG)w - w2) / 2; d.right = d.left + w2; }
+            RECT s0{0, 0, (LONG)cw, (LONG)ch};
+            vctx->VideoProcessorSetStreamSourceRect(vp.get(), 0, TRUE, &s0);
+            vctx->VideoProcessorSetStreamDestRect(vp.get(), 0, TRUE, &d);
+            RECT full{0, 0, (LONG)w, (LONG)h};
+            vctx->VideoProcessorSetOutputTargetRect(vp.get(), TRUE, &full);
+        }
+        if (vovFor != dst) {
+            vov = nullptr;
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{}; ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            if (FAILED(vdev->CreateVideoProcessorOutputView(dst, ven.get(), &ovd, vov.put()))) { vpBroken = true; return false; }
+            vovFor = dst;
+        }
+        D3D11_BOX box{0, 0, 0, cw, ch, 1};
+        ctx->CopySubresourceRegion(scaleIn.get(), 0, 0, 0, 0, src, 0, &box);
+        D3D11_VIDEO_PROCESSOR_STREAM st{}; st.Enable = TRUE; st.pInputSurface = viv.get();
+        if (FAILED(vctx->VideoProcessorBlt(vp.get(), vov.get(), 0, 1, &st))) { vpBroken = true; return false; }
+        (void)od;
+        return true;
+    } catch (...) { vpBroken = true; return false; }
+}
+
 bool WgcCapture::closed() const { return p_->isClosed.load() || (p_->hwnd && !IsWindow(p_->hwnd)); }
 std::wstring WgcCapture::takeEvents() { std::lock_guard<std::mutex> g(p_->evM); std::wstring e; e.swap(p_->events); return e; }
 
@@ -124,10 +217,7 @@ bool WgcCapture::Impl::begin(ID3D11Device* devIn, bool cursor, std::wstring& err
         if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsBorderRequired")) {
             try { p_->session.IsBorderRequired(false); } catch (...) {}
         }
-        // Windows 11 24H2+: default MinUpdateInterval throttles delivery; ask for every composed frame.
-        if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
-            try { p_->session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{std::chrono::milliseconds(1)}); } catch (...) {}
-        }
+        p_->applyInterval();
         p_->session.StartCapture();
         p_->lastCw = (int)p_->w; p_->lastCh = (int)p_->h;
         return p_->w && p_->h;
@@ -156,28 +246,38 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
             if (ic != p_->wasIconic) { p_->wasIconic = ic; p_->event(ic ? L"minimized (holding last frame)" : L"restored"); }
         }
         if (!frame) return true;
+        if (p_->hwnd && p_->wasIconic) { frame.Close(); return true; }  // minimized: only the caption is rendered; hold the last frame
         auto cs = frame.ContentSize();
+        bool contentChanged = false;
         if (p_->hwnd && (cs.Width != p_->lastCw || cs.Height != p_->lastCh)) {
-            // Window resized: rebuild the pool at the new size so frames aren't cropped by the old buffers;
-            // the output stays at the start size (content top-left, rest cleared).
-            p_->lastCw = cs.Width; p_->lastCh = cs.Height;
+            // Window resized: rebuild the pool at the new size so frames aren't cropped by the old buffers.
+            p_->lastCw = cs.Width; p_->lastCh = cs.Height; contentChanged = true;
             p_->event(L"resized " + std::to_wstring(cs.Width) + L"x" + std::to_wstring(cs.Height));
             winrt::com_ptr<IDXGIDevice> dxgi = p_->dev.as<IDXGIDevice>();
             winrt::com_ptr<::IInspectable> insp;
             if (SUCCEEDED(CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), insp.put())))
                 p_->pool.Recreate(insp.as<wdx::Direct3D11::IDirect3DDevice>(), wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 3, cs);
-            if (!p_->rtv || p_->rtvFor != dst) { p_->rtv = nullptr; p_->dev->CreateRenderTargetView(dst, nullptr, p_->rtv.put()); p_->rtvFor = dst; }
-            const float black[4] = {0, 0, 0, 1};
-            if (p_->rtv) ctx->ClearRenderTargetView(p_->rtv.get(), black);
         }
         auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         winrt::com_ptr<ID3D11Texture2D> tex;
         winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(tex.put())));
+        D3D11_TEXTURE2D_DESC sd{}; tex->GetDesc(&sd);
         D3D11_TEXTURE2D_DESC dd{}; dst->GetDesc(&dd);
-        int bw = std::min(std::min(cs.Width, (int)p_->w), (int)dd.Width - dx), bh = std::min(std::min(cs.Height, (int)p_->h), (int)dd.Height - dy);
-        if (dx >= 0 && dy >= 0 && bw > 0 && bh > 0) {
-            D3D11_BOX box{0, 0, 0, (UINT)bw, (UINT)bh, 1};
-            ctx->CopySubresourceRegion(dst, 0, (UINT)dx, (UINT)dy, 0, tex.get(), 0, &box);
+        UINT cw = std::min((UINT)std::max(cs.Width, 1), sd.Width), ch = std::min((UINT)std::max(cs.Height, 1), sd.Height);
+        bool scaled = false;
+        if (p_->hwnd && dx == 0 && dy == 0 && (cw != p_->w || ch != p_->h) && cw >= 2 && ch >= 2)
+            scaled = p_->scaleTo(ctx, tex.get(), cw, ch, dst);  // fit the window into the fixed output (letterbox)
+        if (!scaled) {
+            if (p_->hwnd && (contentChanged || (cw != p_->w || ch != p_->h))) {  // 1:1 top-left, rest black
+                if (!p_->rtv || p_->rtvFor != dst) { p_->rtv = nullptr; p_->dev->CreateRenderTargetView(dst, nullptr, p_->rtv.put()); p_->rtvFor = dst; }
+                const float black[4] = {0, 0, 0, 1};
+                if (p_->rtv && contentChanged) ctx->ClearRenderTargetView(p_->rtv.get(), black);
+            }
+            int bw = std::min(std::min((int)cw, (int)p_->w), (int)dd.Width - dx), bh = std::min(std::min((int)ch, (int)p_->h), (int)dd.Height - dy);
+            if (dx >= 0 && dy >= 0 && bw > 0 && bh > 0) {
+                D3D11_BOX box{0, 0, 0, (UINT)bw, (UINT)bh, 1};
+                ctx->CopySubresourceRegion(dst, 0, (UINT)dx, (UINT)dy, 0, tex.get(), 0, &box);
+            }
         }
         frame.Close();
         gotNew = true;

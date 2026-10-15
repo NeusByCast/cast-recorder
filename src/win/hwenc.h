@@ -27,7 +27,8 @@ std::vector<HwEncoderInfo> hwEncodersForDevice(ID3D11Device* dev, std::wstring& 
 // What this machine can encode: hardware encoders on the adapter with this LUID (MFTEnum2) per codec, plus the
 // software MFTs. Labels: "H.264 · NVIDIA", "HEVC · Software" ...
 struct CodecSupport { GUID subtype; std::wstring codec, vendor; bool hardware; };
-std::vector<CodecSupport> probeCodecSupport(const LUID* adapter);
+std::vector<CodecSupport> probeCodecSupport(const LUID* adapter);  // nullptr = all hardware adapters
+std::vector<LUID> hardwareAdapterLuids();
 const wchar_t* codecName(const GUID& subtype);
 
 class HwEncoder {
@@ -54,6 +55,15 @@ public:
     void leak();     // abandon a stalled MFT without touching it again
     std::wstring label;
     unsigned long long inputs = 0, outputs = 0, backpressureDrops = 0;
+    // Diagnostics (probe log): async events seen, raw outputs (before the wait-for-keyframe gate), eager inputs.
+    unsigned long long evNeedInput = 0, evHaveOutput = 0, evOther = 0, rawOutputs = 0, notAccepting = 0, eagerInputs = 0, dropsBeforeKey = 0;
+    HRESULT lastError = S_OK;
+    std::wstring lastErrorAt;
+    // Async MFTs that stop posting METransformNeedInput (seen with AMD AMF after the first frame): offer the oldest
+    // queued frame directly. MF_E_NOTACCEPTING is harmless and keeps it queued.
+    HRESULT tryEagerInput();
+    bool drainedFlag() const { return drained_; }
+    size_t queued() const { return queue_.size(); }
 private:
     bool configure(UINT w, UINT h, int fps, unsigned bitrate, bool high, std::wstring& log);
     HRESULT processOutput(const OutputFn& out);
@@ -79,7 +89,11 @@ private:
     DWORD outBufSize_ = 0;
 };
 
-// Pre-flight probe: opens the encoder on `dev`, feeds ~12 frames and requires output within timeoutMs.
+// Pre-flight probe: opens the encoder on `dev`'s adapter (private device), feeds up to 60 frames for ~3 s with an
+// event loop, then drains; any encoded output = pass. Logs event/IO counters on failure. Runs on a helper thread;
+// a stalled MFT is leaked (never touched again), never blocks the caller beyond timeoutMs.
+// The probe always runs at kProbeW x kProbeH so the verdict doesn't depend on the source (a tiny window).
+constexpr UINT kProbeW = 1280, kProbeH = 720;
 // Runs on a helper thread; a stalled MFT is leaked (never touched again), never blocks the caller.
 bool probeHwEncoder(ID3D11Device* dev, const HwEncoderInfo& info, UINT w, UINT h, int fps, DWORD timeoutMs,
                     std::wstring& log);

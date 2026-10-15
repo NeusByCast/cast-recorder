@@ -16,9 +16,16 @@ public:
     WgcCapture();
     ~WgcCapture();
     bool start(ID3D11Device* dev, HMONITOR mon, bool cursor, std::wstring& err);
-    // Single window (CreateForWindow). Output size is fixed at start; if the window is resized the content is
-    // copied at 1:1 into the top-left and the rest cleared. Minimized: no new frames (last frame is held).
+    // Single window (CreateForWindow). Output size is fixed at start from the window's real (restored) frame size,
+    // made even and at least kMinWindowOut on each side: a window minimized at start is sized from its restored
+    // placement, never from the tiny minimized caption. If the window is later resized, its content is scaled to fit
+    // the fixed output (letterboxed, GPU video processor; 1:1 top-left copy where no video processor exists).
+    // Minimized: no new frames (the last frame is held).
+    static constexpr UINT kMinWindowOut = 128;
     bool startWindow(ID3D11Device* dev, HWND hwnd, bool cursor, std::wstring& err);
+    // Deliver at most one frame per `ms` (WGC MinUpdateInterval). 0 = every composed frame. On high-refresh monitors
+    // (144/240 Hz) this keeps the compositor and our copies at the recording rate instead of the display rate.
+    void setFrameInterval(double ms);
     bool closed() const;       // captured window/item went away
     std::wstring takeEvents(); // "minimized", "restored", "resized WxH", "closed"
     // dx/dy: destination offset (all-displays compositing). The copy is clipped to dst.

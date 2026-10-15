@@ -33,6 +33,8 @@ namespace Gdiplus { using std::min; using std::max; }
 #include "audio.h"
 #include "applog.h"
 #include "windows_enum.h"
+#include "winlabel.h"
+#include "notify_policy.h"
 #include "resource.h"
 #include "version.h"
 #include "click_wav.h"
@@ -513,11 +515,12 @@ void startRecording() {
     trayUpdate(NIM_MODIFY);
 }
 struct Toast; Toast* showToast(int kind, const std::wstring& title, const std::wstring& sub, const std::wstring& path, bool inApp, bool testVisible);
+void notice(int kind, const std::wstring& title, const std::wstring& sub, const std::wstring& path);
 void stopRecording() {
     if (!g.rec.isActive()) return;
     playTone(IDR_SND_STOP);
     g.rec.stop();
-    showToast(TK_STOPPED, L"Recording stopped", L"", L"", false, false);
+    notice(TK_STOPPED, L"Recording stopped", L"", L"");
     setStatus(L"Finishing file\u2026", C_TEXT2);
     trayUpdate(NIM_MODIFY);
 }
@@ -906,7 +909,7 @@ std::wstring hkText(const Hotkey& h) {
 }
 
 // ---------- sources ----------
-struct SrcRow { int kind = 0; std::wstring label, right; HMONITOR mon = nullptr; HWND hwnd = nullptr; HICON ic = nullptr; std::wstring exe, device; float y = 0, h = 0; };
+struct SrcRow { int kind = 0; std::wstring label, right, app, page; HMONITOR mon = nullptr; HWND hwnd = nullptr; HICON ic = nullptr; std::wstring exe, device; float y = 0, h = 0; };
 enum { SR_ALL = 0, SR_MON = 1, SR_WIN = 2, SR_DIV = 10, SR_SEARCH = 11, SR_CAPTION = 12 };
 std::wstring dims(int w, int h) { return std::to_wstring(w) + L" \u00d7 " + std::to_wstring(h); }
 RECT virtualRect() {
@@ -919,7 +922,9 @@ const DisplayInfo* displayFor(HMONITOR m) {
     for (auto& d : g_displays) if (d.primary) return &d;
     return g_displays.empty() ? nullptr : &g_displays[0];
 }
-std::wstring g_srcTitle;  // window title for the field
+std::wstring g_srcTitle;  // window title (raw; saved to settings, used for file names)
+std::wstring g_srcApp, g_srcPage;  // field label: app name, then the page title muted ("Brave · Cast Recorder v1.0 release")
+void setSrcWindow(const std::wstring& title, const std::wstring& app, const std::wstring& page) { g_srcTitle = title; g_srcApp = app; g_srcPage = page; }
 // Window titles can hold private text (document names, chats, URLs): the log gets a stable hash instead, the
 // settings file keeps the real title so the window can still be found again.
 std::wstring redactTitle(const std::wstring& t) {  // length only: no content, no hash (a hash of a short title is guessable)
@@ -927,7 +932,7 @@ std::wstring redactTitle(const std::wstring& t) {  // length only: no content, n
 }
 HICON g_srcIcon = nullptr;
 std::wstring sourceText() {
-    if (g.target.kind == CaptureTarget::Window) return g_srcTitle.empty() ? L"Window" : g_srcTitle;
+    if (g.target.kind == CaptureTarget::Window) return !g_srcApp.empty() ? cr::windowLabel(g_srcApp, g_srcPage) : g_srcTitle.empty() ? L"Window" : g_srcTitle;
     if (g.target.kind == CaptureTarget::AllDisplays) { RECT u = virtualRect(); return L"Full screen \u00b7 " + dims(u.right - u.left, u.bottom - u.top); }
     const DisplayInfo* d = displayFor(g.target.mon);
     return d ? L"Monitor " + std::to_wstring(d->index) + L" \u00b7 " + dims(d->rect.right - d->rect.left, d->rect.bottom - d->rect.top) : L"Monitor";
@@ -944,7 +949,7 @@ void sourceSize(int& w, int& h) {
 void resolveSource() {
     g_displays = listDisplays();
     g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays;
-    g_srcTitle.clear(); g_srcIcon = nullptr;
+    setSrcWindow(L"", L"", L""); g_srcIcon = nullptr;
     if (g.s.sourceKind == "monitor") {
         g.target.kind = CaptureTarget::Monitor;
         g.target.mon = nullptr;
@@ -957,7 +962,7 @@ void resolveSource() {
         HWND h = resolveSavedWindow(W(g.s.sourceExe), W(g.s.sourceTitle));
         if (h) {
             g.target.kind = CaptureTarget::Window; g.target.hwnd = h;
-            for (auto& w : listCaptureWindows()) if (w.hwnd == h) { g_srcTitle = w.title; g_srcIcon = w.icon; }
+            for (auto& w : listCaptureWindows()) if (w.hwnd == h) { setSrcWindow(w.title, w.app, w.page); g_srcIcon = w.icon; }
         } else {
             cr::appLog(L"source: saved window " + W(g.s.sourceExe) + L" " + redactTitle(W(g.s.sourceTitle)) + L" not found, using Full screen");
             setStatus(L"Saved window isn't open \u2013 using Full screen", toRef(T_TEXT2));
@@ -966,11 +971,11 @@ void resolveSource() {
     g.gprev.setTarget(g.target);
 }
 void selectSource(const SrcRow& r) {
-    if (r.kind == SR_ALL) { g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g.s.sourceKind = "all"; g_srcTitle.clear(); }
-    else if (r.kind == SR_MON) { g.target = CaptureTarget{}; g.target.kind = CaptureTarget::Monitor; g.target.mon = r.mon; g.s.sourceKind = "monitor"; g.s.sourceMonitor = U(r.device); g_srcTitle.clear(); }
+    if (r.kind == SR_ALL) { g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g.s.sourceKind = "all"; setSrcWindow(L"", L"", L""); }
+    else if (r.kind == SR_MON) { g.target = CaptureTarget{}; g.target.kind = CaptureTarget::Monitor; g.target.mon = r.mon; g.s.sourceKind = "monitor"; g.s.sourceMonitor = U(r.device); setSrcWindow(L"", L"", L""); }
     else if (r.kind == SR_WIN) {
         g.target = CaptureTarget{}; g.target.kind = CaptureTarget::Window; g.target.hwnd = r.hwnd;
-        g.s.sourceKind = "window"; g.s.sourceExe = U(r.exe); g.s.sourceTitle = U(r.label); g_srcTitle = r.label; g_srcIcon = r.ic;
+        g.s.sourceKind = "window"; g.s.sourceExe = U(r.exe); g.s.sourceTitle = U(r.label); setSrcWindow(r.label, r.app, r.page); g_srcIcon = r.ic;
     } else return;
     g.gprev.setTarget(g.target);
     save();
@@ -1168,7 +1173,7 @@ struct Popup {
     std::vector<SrcRow> rows;
     bool dragVol = false;
 } P;
-const float kShadow = 18.f;   // logical margin around the card for the shadow
+const float kShadow = 26.f;   // logical margin around the card for the shadow (blur 16 + offset 6 + slack)
 void renderPopup();
 int popupIndexOf(int id) { return id >= P_BASE && id < P_BASE + 900 ? id - P_BASE : -1; }
 std::vector<int> selectableRows() {
@@ -1197,11 +1202,14 @@ void buildSourceRows() {
     std::wstring q = lowerW(P.search);
     int n = 0;
     for (auto& w : listCaptureWindows()) {
-        if (!q.empty() && lowerW(w.title).find(q) == std::wstring::npos && lowerW(w.exe).find(q) == std::wstring::npos) continue;
-        SrcRow r; r.kind = SR_WIN; r.hwnd = w.hwnd; r.ic = w.icon; r.exe = w.exe; r.label = w.title;
+        if (!q.empty() && lowerW(w.title).find(q) == std::wstring::npos && lowerW(w.exe).find(q) == std::wstring::npos && lowerW(w.app).find(q) == std::wstring::npos) continue;
+        SrcRow r; r.kind = SR_WIN; r.hwnd = w.hwnd; r.ic = w.icon; r.exe = w.exe; r.label = w.title; r.app = w.app; r.page = w.page;
         add(r, 34, 0); ++n;
     }
-    if (g_renderOnly && g_renderLong && q.empty()) { SrcRow r; r.kind = SR_WIN; r.label = kLongTitle; r.exe = L"POWERPNT.EXE"; add(r, 34, 0); ++n; }
+    if (g_renderOnly && g_renderLong && q.empty()) {
+        SrcRow r; r.kind = SR_WIN; r.label = kLongTitle; r.exe = L"POWERPNT.EXE"; r.app = L"PowerPoint"; r.page = cr::stripAppSuffix(kLongTitle, r.exe, L"Microsoft PowerPoint"); add(r, 34, 0); ++n;
+        SrcRow b; b.kind = SR_WIN; b.hwnd = (HWND)(intptr_t)2; b.label = L"Cast Recorder v1.0 release - Brave"; b.exe = L"brave.exe"; b.app = L"Brave"; b.page = L"Cast Recorder v1.0 release"; add(b, 34, 0); ++n;
+    }
     if (!n) { SrcRow none; none.kind = SR_CAPTION; none.label = q.empty() ? L"No windows" : L"No matching windows"; add(none, 30, 0); }
     P.contentH = y + 6;
 }
@@ -1313,7 +1321,16 @@ float chevronAngle(int id) {
     return P.closing ? 180.f * (1.f - (float)ease(E_IN, P.close.progress())) : 180.f * P.open.value();
 }
 bool popupOpenFor(int id) { return P.kind != PK_NONE && !P.closing && P.dd == id; }
-void ddField(gp::Graphics& gr, RF r, int id, const std::wstring& t, int glyph = -1, HICON wicon = nullptr) {
+// "Brave · page title": app name in the primary color (never squeezed below its width when it fits), the page part
+// muted and ellipsized into what is left.
+void appTitle(gp::Graphics& gr, const std::wstring& app, const std::wstring& page, RF r, gp::Font* f, gp::Color main, gp::Color muted) {
+    if (page.empty()) { txt(gr, app, r, f, main); return; }
+    float aw = std::min(txtW(gr, app, f) + 1, r.Width * 0.6f);
+    txt(gr, app, RF(r.X, r.Y, aw, r.Height), f, main);
+    float x = r.X + aw + 5;
+    txt(gr, L"\u00B7  " + page, RF(x, r.Y, std::max(0.f, r.X + r.Width - x), r.Height), f, muted);
+}
+void ddField(gp::Graphics& gr, RF r, int id, const std::wstring& t, int glyph = -1, HICON wicon = nullptr, const std::wstring* page = nullptr) {
     bool dis = locked(id), open = popupOpenFor(id);
     float hv = dis ? 0.f : hovA(id);
     fillRR(gr, r, 6, mix(T_INPUT, T_INPUT_H, open ? 1.f : hv));
@@ -1321,7 +1338,8 @@ void ddField(gp::Graphics& gr, RF r, int id, const std::wstring& t, int glyph = 
     float x = r.X + 12, cy = r.Y + r.Height / 2;
     if (wicon) { drawWinIcon(gr, wicon, x, cy - 8, 16); x += 26; }
     else if (glyph >= 0) { icon(gr, glyph, x, cy - 8, 16, C(dis ? T_DIS : T_TEXT2)); x += 26; }
-    txt(gr, t, RF(x, r.Y, r.X + r.Width - 36 - x, r.Height), F.body, C(dis ? T_DIS : T_TEXT));
+    if (page) appTitle(gr, t, *page, RF(x, r.Y, r.X + r.Width - 36 - x, r.Height), F.body, C(dis ? T_DIS : T_TEXT), C(dis ? T_DIS : T_MUTED));
+    else txt(gr, t, RF(x, r.Y, r.X + r.Width - 36 - x, r.Height), F.body, C(dis ? T_DIS : T_TEXT));
     icon(gr, G_CHEVRON, r.X + r.Width - 28, cy - 8, 16, C(dis ? T_DIS : T_TEXT2), chevronAngle(id));
     addReg(r, id);
 }
@@ -1877,7 +1895,8 @@ void paintRecordView(gp::Graphics& gr, float W, float H) {
     bool finishing = !g_fakeRec && (st == RecState::Stopping || st == RecState::Finishing);
     // toolbar
     int glyph = g.target.kind == CaptureTarget::AllDisplays ? G_FULLSCREEN : g.target.kind == CaptureTarget::Monitor ? G_MONITOR : G_WINDOW;
-    ddField(gr, L.src, H_SRC, sourceText(), glyph, g.target.kind == CaptureTarget::Window ? g_srcIcon : nullptr);
+    if (g.target.kind == CaptureTarget::Window && !g_srcApp.empty()) ddField(gr, L.src, H_SRC, g_srcApp, glyph, g_srcIcon, &g_srcPage);
+    else ddField(gr, L.src, H_SRC, sourceText(), glyph, g.target.kind == CaptureTarget::Window ? g_srcIcon : nullptr);
     focusRing(gr, L.src, 8, H_SRC);
     ddField(gr, L.fps, H_DD_FPS, ddItem(H_DD_FPS, ddSel(H_DD_FPS)));
     focusRing(gr, L.fps, 8, H_DD_FPS);
@@ -2475,7 +2494,8 @@ void paintPopupContent(gp::Graphics& gr) {
                     else icon(gr, s.kind == SR_ALL ? G_FULLSCREEN : G_MONITOR, r.X + 10, r.Y + r.Height / 2 - 8, 16, C(T_TEXT2));
                     float rw = s.right.empty() ? 0 : txtW(gr, s.right, F.label) + 4;
                     float rx = r.X + r.Width - (sel ? 36 : 12) - rw;
-                    txt(gr, s.label, RF(r.X + 36, r.Y, rx - r.X - 44, r.Height), F.body, C(T_TEXT));
+                    if (s.kind == SR_WIN && !s.app.empty()) appTitle(gr, s.app, s.page, RF(r.X + 36, r.Y, rx - r.X - 44, r.Height), F.body, C(T_TEXT), C(T_MUTED));
+                    else txt(gr, s.label, RF(r.X + 36, r.Y, rx - r.X - 44, r.Height), F.body, C(T_TEXT));
                     if (rw > 0) txt(gr, s.right, RF(rx, r.Y, rw, r.Height), F.label, C(T_MUTED), AL_R, false);
                     popReg(r, id);
                     break;
@@ -2528,61 +2548,198 @@ void paintPopupContent(gp::Graphics& gr) {
         fillRR(gr, RF(w - 6, ty + 2, 3, th - 4), 1.5f, WA(A_STRONG));
     }
 }
-void drawPopupFrame(gp::Graphics& gr, bool shadow = true) {
-    RF r(0, 0, P.w, P.h);
-    if (shadow) for (int i = 10; i >= 1; --i) fillRR(gr, RF(r.X - i, r.Y - i + 6, r.Width + 2.f * i, r.Height + 2.f * i), 10.f + i, gp::Color(7, 0, 0, 0));
-    if (P.kind == PK_MIC) {  // 8 px arrow pointing at the chip
-        gp::PointF tri[3] = {gp::PointF(P.w / 2 - 8, P.h - 1), gp::PointF(P.w / 2 + 8, P.h - 1), gp::PointF(P.w / 2, P.h + 7)};
-        gp::SolidBrush ab(C(T_ELEV)); gr.FillPolygon(&ab, tri, 3);
-        gp::Pen ap(WA(A_DEFAULT), 1.f); gr.DrawLine(&ap, tri[0].X, tri[0].Y + 0.5f, tri[2].X, tri[2].Y); gr.DrawLine(&ap, tri[2].X, tri[2].Y, tri[1].X, tri[1].Y + 0.5f);
+// ---------- layered cards: dropdowns, popovers, toasts ----------
+// Pixel-exact compositing: the card sits on whole device pixels (no half-pixel blur from a fractional margin), its
+// body is painted on an opaque background so text gets ClearType like the main window, then it is clipped to the
+// rounded rect by an anti-aliased texture fill. The shadow is a real blur (3 box passes ~ gaussian), cached per
+// size/DPI. Animation frames don't repaint: they only move the layered window and change its alpha.
+struct LayerSurf {
+    HDC mem = nullptr; HBITMAP hb = nullptr; HGDIOBJ old = nullptr; uint32_t* px = nullptr; int w = 0, h = 0;
+    bool ensure(int pw, int ph) {
+        if (hb && pw == w && ph == h) return true;
+        release();
+        BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = pw; bi.bmiHeader.biHeight = -ph;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+        HDC sdc = GetDC(nullptr); mem = CreateCompatibleDC(sdc); ReleaseDC(nullptr, sdc);
+        void* bits = nullptr;
+        hb = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!hb) { release(); return false; }
+        old = SelectObject(mem, hb); px = (uint32_t*)bits; w = pw; h = ph;
+        return true;
     }
-    fillRR(gr, r, 10, C(T_ELEV));
-    gp::GraphicsPath clip; rrPath(clip, r, 10);
-    gp::GraphicsState st = gr.Save();
-    gr.SetClip(&clip, gp::CombineModeIntersect);
-    paintPopupContent(gr);
-    gr.Restore(st);
-    strokeRR(gr, r, 10, WA(A_DEFAULT));
+    void release() {
+        if (mem) { if (old) SelectObject(mem, old); DeleteDC(mem); }
+        if (hb) DeleteObject(hb);
+        mem = nullptr; hb = nullptr; old = nullptr; px = nullptr; w = h = 0;
+    }
+    ~LayerSurf() { release(); }
+    void present(HWND wnd, POINT pos, BYTE alpha) const {
+        BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA}; POINT src{0, 0}; SIZE sz{w, h};
+        UpdateLayeredWindow(wnd, nullptr, &pos, &sz, mem, &src, 0, &bf, ULW_ALPHA);
+    }
+    // Same pixels, new position / opacity: what every animation frame does (no GDI+ work at all).
+    static void move(HWND wnd, POINT pos, BYTE alpha) {
+        BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+        UpdateLayeredWindow(wnd, nullptr, &pos, nullptr, nullptr, nullptr, 0, &bf, ULW_ALPHA);
+    }
+};
+// Blurred rounded-rect shadow (premultiplied black), (cw + 2m) x (ch + 2m) device px.
+struct ShadowCache { int cw = 0, ch = 0, m = 0, rad = 0, blur = 0, dy = 0, alpha = 0; std::vector<uint32_t> px; };
+const std::vector<uint32_t>& shadowFor(int cw, int ch, int m, int radPx, int blurPx, int dyPx, int alpha) {
+    static ShadowCache cache[6]; static int next = 0;
+    for (auto& c : cache) if (c.cw == cw && c.ch == ch && c.m == m && c.rad == radPx && c.blur == blurPx && c.dy == dyPx && c.alpha == alpha && !c.px.empty()) return c.px;
+    ShadowCache& c = cache[next++ % 6];
+    c.cw = cw; c.ch = ch; c.m = m; c.rad = radPx; c.blur = blurPx; c.dy = dyPx; c.alpha = alpha;
+    const int W = cw + 2 * m, H = ch + 2 * m;
+    std::vector<float> a((size_t)W * H, 0.f), t((size_t)W * H);
+    {   // coverage mask of the card shape (anti-aliased), offset down by dy
+        gp::Bitmap mb(W, H, PixelFormat32bppARGB);
+        { gp::Graphics g2(&mb); g2.SetSmoothingMode(gp::SmoothingModeAntiAlias); g2.SetPixelOffsetMode(gp::PixelOffsetModeHalf); g2.Clear(gp::Color(0, 0, 0, 0)); fillRR(g2, RF((float)m, (float)(m + dyPx), (float)cw, (float)ch), (float)radPx, gp::Color(255, 0, 0, 0)); }
+        gp::BitmapData bd; gp::Rect rr(0, 0, W, H);
+        if (mb.LockBits(&rr, gp::ImageLockModeRead, PixelFormat32bppARGB, &bd) == gp::Ok) {
+            for (int y = 0; y < H; ++y) { const uint32_t* row = (const uint32_t*)((BYTE*)bd.Scan0 + (size_t)y * bd.Stride); for (int x = 0; x < W; ++x) a[(size_t)y * W + x] = (row[x] >> 24) / 255.f; }
+            mb.UnlockBits(&bd);
+        }
+    }
+    const int r = std::max(1, (int)std::lround(blurPx / 3.0));  // 3 box passes of radius r ~ gaussian sigma ~ blur/3
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int y = 0; y < H; ++y) {  // horizontal
+            float acc = 0; const float* in = &a[(size_t)y * W]; float* out = &t[(size_t)y * W];
+            for (int x = -r; x <= r; ++x) acc += (x >= 0 && x < W) ? in[x] : 0.f;
+            for (int x = 0; x < W; ++x) { out[x] = acc / (2 * r + 1); int xo = x - r, xi = x + r + 1; if (xo >= 0) acc -= in[xo]; if (xi < W) acc += in[xi]; }
+        }
+        for (int x = 0; x < W; ++x) {  // vertical
+            float acc = 0;
+            for (int y = -r; y <= r; ++y) acc += (y >= 0 && y < H) ? t[(size_t)y * W + x] : 0.f;
+            for (int y = 0; y < H; ++y) { a[(size_t)y * W + x] = acc / (2 * r + 1); int yo = y - r, yi = y + r + 1; if (yo >= 0) acc -= t[(size_t)yo * W + x]; if (yi < H) acc += t[(size_t)yi * W + x]; }
+        }
+    }
+    c.px.assign((size_t)W * H, 0);
+    for (size_t i = 0; i < c.px.size(); ++i) { uint32_t al = (uint32_t)std::lround(std::min(1.f, a[i]) * alpha); c.px[i] = al << 24; }
+    return c.px;
 }
+struct CardStyle { float radius = 10; unsigned bg = 0; gp::Color border{0, 0, 0, 0}; int blur = 16, dy = 6, shadowA = 0x66; };
+// Composes a card into a premultiplied pixel buffer `dst` (pw x ph, origin = the buffer's top-left). The card's
+// top-left sits at (mPx, mPx). `body` paints in logical units (card-local), on an opaque style.bg background.
+// `under` (optional) paints in logical card-local units before the card fill (e.g. the mic popover's arrow).
+void composeCard(uint32_t* dst, int pw, int ph, int mPx, float s, float cwL, float chL, const CardStyle& st,
+                 const std::function<void(gp::Graphics&)>& body, const std::function<void(gp::Graphics&)>& under = nullptr) {
+    const int cw = std::max(1, (int)std::lround(cwL * s)), ch = std::max(1, (int)std::lround(chL * s));
+    const int radPx = (int)std::lround(st.radius * s);
+    const auto& sh = shadowFor(cw, ch, mPx, radPx, (int)std::lround(st.blur * s), (int)std::lround(st.dy * s), st.shadowA);
+    const int sw = cw + 2 * mPx, shh = ch + 2 * mPx;
+    for (int y = 0; y < ph; ++y) {
+        uint32_t* row = dst + (size_t)y * pw;
+        if (y < shh) { int n = std::min(pw, sw); memcpy(row, &sh[(size_t)y * sw], (size_t)n * 4); if (pw > n) memset(row + n, 0, (size_t)(pw - n) * 4); }
+        else memset(row, 0, (size_t)pw * 4);
+    }
+    // body: opaque, ClearType text (GDI+ on a DIB DC, exactly like the main window)
+    LayerSurf b;
+    if (!b.ensure(cw, ch)) return;
+    {
+        gp::Graphics bg(b.mem);
+        setupGraphics(bg, true);
+        gp::SolidBrush fill(C(st.bg)); bg.FillRectangle(&fill, -1, -1, cw + 2, ch + 2);
+        bg.ScaleTransform(s, s);
+        body(bg);
+    }
+    for (size_t i = 0, n = (size_t)cw * ch; i < n; ++i) b.px[i] |= 0xFF000000u;  // GDI leaves alpha undefined
+    gp::Bitmap bodyBmp(cw, ch, cw * 4, PixelFormat32bppPARGB, (BYTE*)b.px);
+    gp::Bitmap out(pw, ph, pw * 4, PixelFormat32bppPARGB, (BYTE*)dst);
+    gp::Graphics g(&out);
+    g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+    g.SetCompositingQuality(gp::CompositingQualityHighQuality);
+    if (under) {
+        gp::GraphicsState gs = g.Save();
+        g.TranslateTransform((float)mPx, (float)mPx); g.ScaleTransform(s, s);
+        under(g);
+        g.Restore(gs);
+    }
+    // card: anti-aliased rounded rect filled with the body texture (pixel-aligned: no resampling of the text)
+    gp::TextureBrush tb(&bodyBmp, gp::WrapModeClamp);
+    tb.TranslateTransform((float)mPx, (float)mPx);
+    gp::GraphicsPath path; rrPath(path, RF((float)mPx, (float)mPx, (float)cw, (float)ch), (float)radPx);
+    g.FillPath(&tb, &path);
+    // 1 px hairline border on the device pixel grid
+    gp::GraphicsPath bp; rrPath(bp, RF(mPx + 0.5f, mPx + 0.5f, cw - 1.f, ch - 1.f), std::max(0.f, radPx - 0.5f));
+    gp::Pen pen(st.border, 1.f); g.DrawPath(&pen, &bp);
+}
+// Vsync-timed animation clock: a helper thread waits on DwmFlush (the compositor's frame) and posts one
+// WM_APP_VSYNC at a time while something animates; frames are paced to ~60 Hz on high-refresh panels.
+constexpr UINT WM_APP_VSYNC = WM_APP + 77;
+std::atomic<bool> g_vsyncWant{false}, g_vsyncPosted{false};
+HANDLE g_vsyncEv = nullptr;
+void vsyncKick() {
+    if (!g.hwnd || g_renderOnly) return;
+    static bool started = false;
+    if (!started) {
+        started = true;
+        g_vsyncEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        std::thread([] {
+            LARGE_INTEGER f, last{}; QueryPerformanceFrequency(&f);
+            for (;;) {
+                if (!g_vsyncWant.load()) { WaitForSingleObject(g_vsyncEv, INFINITE); continue; }
+                if (FAILED(DwmFlush())) Sleep(8);  // composition off / remote session: plain timing
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                if (last.QuadPart && (now.QuadPart - last.QuadPart) * 1000 < f.QuadPart * 14) continue;  // <= ~60 Hz
+                last = now;
+                if (!g_vsyncPosted.exchange(true)) PostMessageW(g.hwnd, WM_APP_VSYNC, 0, 0);
+            }
+        }).detach();
+    }
+    if (!g_vsyncWant.exchange(true)) SetEvent(g_vsyncEv);
+}
+
+// Plain layered paint (preview chips): logical-unit drawing into a fresh surface.
 void ulw(HWND h, int pw, int ph, POINT* pos, BYTE alpha, const std::function<void(gp::Graphics&)>& draw) {
     if (pw <= 0 || ph <= 0) return;
-    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = pw; bi.bmiHeader.biHeight = -ph;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
-    HDC sdc = GetDC(nullptr); HDC mem = CreateCompatibleDC(sdc);
-    void* bits = nullptr;
-    HBITMAP hb = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (hb) {
-        HGDIOBJ old = SelectObject(mem, hb);
-        {
-            gp::Bitmap bmp(pw, ph, pw * 4, PixelFormat32bppPARGB, (BYTE*)bits);
-            gp::Graphics gr(&bmp);
-            gr.Clear(gp::Color(0, 0, 0, 0));
-            setupGraphics(gr, false);
-            draw(gr);
-        }
-        BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
-        POINT src{0, 0}; SIZE sz{pw, ph};
-        UpdateLayeredWindow(h, sdc, pos, &sz, mem, &src, 0, &bf, ULW_ALPHA);
-        SelectObject(mem, old); DeleteObject(hb);
+    LayerSurf sf;
+    if (!sf.ensure(pw, ph)) return;
+    memset(sf.px, 0, (size_t)pw * ph * 4);
+    {
+        gp::Bitmap bmp(pw, ph, pw * 4, PixelFormat32bppPARGB, (BYTE*)sf.px);
+        gp::Graphics gr(&bmp);
+        setupGraphics(gr, false);
+        draw(gr);
     }
-    DeleteDC(mem); ReleaseDC(nullptr, sdc);
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    POINT src{0, 0}; SIZE sz{pw, ph};
+    UpdateLayeredWindow(h, nullptr, pos, &sz, sf.mem, &src, 0, &bf, ULW_ALPHA);
 }
-void renderPopup() {
+LayerSurf g_popSurf;
+bool g_popDirty = true;  // content changed since the last compose
+void paintPopupArrow(gp::Graphics& gr) {  // mic popover: 8 px arrow pointing at the chip
+    gp::PointF tri[3] = {gp::PointF(P.w / 2 - 8, P.h - 1), gp::PointF(P.w / 2 + 8, P.h - 1), gp::PointF(P.w / 2, P.h + 7)};
+    gp::SolidBrush ab(C(T_ELEV)); gr.FillPolygon(&ab, tri, 3);
+    gp::Pen ap(WA(A_DEFAULT), 1.f); gr.DrawLine(&ap, tri[0].X, tri[0].Y + 0.5f, tri[2].X, tri[2].Y); gr.DrawLine(&ap, tri[2].X, tri[2].Y, tri[1].X, tri[1].Y + 0.5f);
+}
+CardStyle popupStyle() { CardStyle st; st.radius = 10; st.bg = T_ELEV; st.border = WA(A_DEFAULT); st.blur = 16; st.dy = 6; st.shadowA = g_light ? 0x29 : 0x66; return st; }
+// Popup card into a buffer: used by the layered window and by the headless renders (same pixels).
+void composePopup(uint32_t* dst, int pw, int ph, int mPx, float s) {
+    composeCard(dst, pw, ph, mPx, s, P.w, P.h, popupStyle(), [](gp::Graphics& gr) { paintPopupContent(gr); },
+                P.kind == PK_MIC ? std::function<void(gp::Graphics&)>(paintPopupArrow) : nullptr);
+}
+void popupFrame();
+void renderPopup() { g_popDirty = true; popupFrame(); }
+void popupFrame() {
     if (!P.hwnd || P.kind == PK_NONE || !g.hwnd) return;
-    const float s = scale(), M = kShadow;
+    const float s = scale();
+    const int mPx = (int)std::lround(kShadow * s);
     const bool up = P.kind == PK_MIC || P.above;
-    float o, ty, sy = 1.f;
+    float o, ty;
     if (P.closing) { float e = (float)ease(E_IN, P.close.progress()); o = 1 - e; ty = (up ? 4.f : -4.f) * e; }
-    else { float e = P.open.value(); o = std::max(0.f, std::min(1.f, e)); ty = (up ? 6.f : -6.f) * (1 - e); if (P.kind != PK_MIC) sy = 0.98f + 0.02f * e; }
-    int pw = (int)std::ceil((P.w + 2 * M) * s), ph = (int)std::ceil((P.h + 2 * M) * s);
-    POINT pt{(LONG)std::lround((P.x - M) * s), (LONG)std::lround((P.y - M) * s)};
+    else { float e = P.open.value(); o = std::max(0.f, std::min(1.f, e)); ty = (up ? 6.f : -6.f) * (1 - e); }
+    const int pw = (int)std::lround(P.w * s) + 2 * mPx, ph = (int)std::lround(P.h * s) + 2 * mPx;
+    POINT pt{(LONG)std::lround(P.x * s) - mPx, (LONG)std::lround((P.y + ty) * s) - mPx};
     ClientToScreen(g.hwnd, &pt);
-    ulw(P.hwnd, pw, ph, &pt, (BYTE)std::lround(255 * o), [&](gp::Graphics& gr) {
-        gr.ScaleTransform(s, s);
-        gr.TranslateTransform(M, M + ty);
-        if (sy != 1.f) { float oy = up ? P.h : 0.f; gr.TranslateTransform(0, oy); gr.ScaleTransform(1, sy); gr.TranslateTransform(0, -oy); }
-        drawPopupFrame(gr);
-    });
+    const BYTE a = (BYTE)std::lround(255 * o);
+    if (g_popDirty || g_popSurf.w != pw || g_popSurf.h != ph) {
+        if (!g_popSurf.ensure(pw, ph)) return;
+        composePopup(g_popSurf.px, pw, ph, mPx, s);
+        g_popSurf.present(P.hwnd, pt, a);
+        g_popDirty = false;
+    } else LayerSurf::move(P.hwnd, pt, a);
 }
 int popupHit(float x, float y) {  // card-local logical coords
     for (auto it = P.regs.rbegin(); it != P.regs.rend(); ++it) if (inRF(it->r, x, y)) return it->id;
@@ -2590,8 +2747,9 @@ int popupHit(float x, float y) {  // card-local logical coords
 }
 void popupSetVolFromX(float x) { setMicVolume((int)std::lround((x - 16) / 200.f * 200.f), false); }
 LRESULT CALLBACK PopupProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    const float s = scale(), M = kShadow;
-    auto local = [&](float& x, float& y) { x = GET_X_LPARAM(lp) / s - M; y = GET_Y_LPARAM(lp) / s - M; };
+    const float s = scale();
+    const int mPx = (int)std::lround(kShadow * s);
+    auto local = [&](float& x, float& y) { x = (GET_X_LPARAM(lp) - mPx) / s; y = (GET_Y_LPARAM(lp) - mPx) / s; };
     switch (msg) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_SETCURSOR: SetCursor(LoadCursor(nullptr, P.hover >= P_BASE && P.hover != P_PAD ? IDC_HAND : IDC_ARROW)); return TRUE;
@@ -2658,16 +2816,16 @@ struct Toast {
     Anim in, out;
     int hot = 0, pressed = 0;  // H_TOAST_* under the mouse
     bool testVisible = false;  // --test-toast-visible: no capture exclusion (CI control)
+    LayerSurf surf;            // composed once; animation frames only move it / change its alpha
+    bool dirty = true, animLast = false;
 };
 std::vector<std::unique_ptr<Toast>> g_toasts;
 bool g_affinityWarned = false;
 constexpr DWORD kWdaExclude = 0x11;  // WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+)
-void paintToast(gp::Graphics& gr, const Toast& t) {
-    RF r(0, 0, t.w, t.h);
-    if (t.kind == TK_TEST) { gp::SolidBrush b(gp::Color(255, 255, 0, 255)); gr.FillRectangle(&b, r); return; }
-    for (int i = 8; i >= 1; --i) fillRR(gr, RF(r.X - i, r.Y - i + 4, r.Width + 2.f * i, r.Height + 2.f * i), 14.f + i, gp::Color(g_light ? 4 : 8, 0, 0, 0));
-    fillRR(gr, r, 14, C(T_ELEV));
-    strokeRR(gr, r, 14, t.kind == TK_SAVED ? C(T_OK, 140) : t.kind == TK_ERROR ? C(T_ERR, 140) : WA(A_DEFAULT));
+// Replay / status toast (SPEC "Toasts", mockup-replay-toast.png): 32 px accent-tinted circle with the icon at
+// (16, centre), title Semibold 13 and the file name muted 12 at x 58, in-app close button 24 px centred vertically.
+void paintToastBody(gp::Graphics& gr, const Toast& t) {
+    if (t.kind == TK_TEST) { gp::SolidBrush b(gp::Color(255, 255, 0, 255)); gr.FillRectangle(&b, RF(-1, -1, t.w + 2, t.h + 2)); return; }
     if (t.kind == TK_SAVED) {
         icon(gr, G_CHECKCIRCLE, 16, 16, 20, C(T_OK));
         txt(gr, t.title, RF(46, 12, t.w - 46 - 40, 28), F.title, C(T_TEXT));
@@ -2690,26 +2848,36 @@ void paintToast(gp::Graphics& gr, const Toast& t) {
         fillCircle(gr, 32, cy, 16, C(ac, 0x29));
         int gl = t.kind == TK_REPLAY ? G_REPLAY : t.kind == TK_STARTED ? G_RECORD : t.kind == TK_STOPPED ? G_STOP : G_LOG;
         icon(gr, gl, 24, cy - 8, 16, C(t.kind == TK_ERROR ? T_ERR : T_ACC_B));
-        if (t.sub.empty()) txt(gr, t.title, RF(58, 0, t.w - 58 - 16, t.h), F.title, C(T_TEXT));
+        const float right = t.inApp ? 46.f : 16.f;
+        if (t.sub.empty()) txt(gr, t.title, RF(58, 0, t.w - 58 - right, t.h), F.title, C(T_TEXT));
         else {
-            txt(gr, t.title, RF(58, cy - 20, t.w - 58 - (t.inApp ? 40 : 16), 20), F.title, C(T_TEXT));
-            txt(gr, t.sub, RF(58, cy + 1, t.w - 58 - 16, 18), F.label, C(T_MUTED), AL_L, true, true);
+            txt(gr, t.title, RF(58, cy - 19, t.w - 58 - right, 20), F.title, C(T_TEXT));
+            txt(gr, t.sub, RF(58, cy + 1, t.w - 58 - right, 18), F.label, C(T_MUTED), AL_L, true, true);
         }
     }
     if (t.inApp) {
-        RF cb(t.w - 34, 10, 24, 24);
-        if (t.hot == H_TOAST_CLOSE) fillRR(gr, cb, 6, WA(A_PRESSED));
-        icon(gr, G_CLOSE, cb.X + 4, cb.Y + 4, 16, C(T_MUTED));
+        RF cb = t.kind == TK_SAVED ? RF(t.w - 34, 10, 24, 24) : RF(t.w - 36, (t.h - 24) / 2, 24, 24);
+        fillRR(gr, cb, 6, WA(t.hot == H_TOAST_CLOSE ? A_STRONG : A_HOVER));
+        icon(gr, G_CLOSE, cb.X + 4, cb.Y + 4, 16, C(t.hot == H_TOAST_CLOSE ? T_TEXT : T_MUTED));
     }
 }
+CardStyle toastStyle(const Toast& t) {
+    CardStyle st; st.radius = 14; st.bg = T_ELEV; st.blur = 22; st.dy = 8; st.shadowA = g_light ? 0x29 : 0x70;
+    st.border = t.kind == TK_SAVED ? C(T_OK, 140) : t.kind == TK_ERROR ? C(T_ERR, 140) : WA(A_DEFAULT);
+    if (t.kind == TK_TEST) { st.shadowA = 0; st.radius = 0; st.border = gp::Color(255, 255, 0, 255); st.bg = 0xFF00FF; }
+    return st;
+}
+// Kept for callers that paint a toast into an existing Graphics (logical units, card at 0,0): body only.
+void paintToast(gp::Graphics& gr, const Toast& t) { paintToastBody(gr, t); }
 int toastHit(const Toast& t, float x, float y) {
     if (!t.inApp) return 0;
-    if (inRF(RF(t.w - 34, 10, 24, 24), x, y)) return H_TOAST_CLOSE;
+    RF cb = t.kind == TK_SAVED ? RF(t.w - 34, 10, 24, 24) : RF(t.w - 36, (t.h - 24) / 2, 24, 24);
+    if (inRF(cb, x, y)) return H_TOAST_CLOSE;
     if (t.kind == TK_SAVED && inRF(RF(46, 70, 84, 30), x, y)) return H_TOAST_OPEN;
     if (t.kind == TK_SAVED && inRF(RF(138, 70, 148, 30), x, y)) return H_TOAST_FOLDER;
     return 0;
 }
-const float kToastM = 12.f;  // shadow margin
+const float kToastM = 32.f;  // shadow margin (blur 22 + offset 8)
 float toastScale() { return g.dpi / 96.f; }
 void layoutToasts() {
     // on-screen: primary monitor work area, top-right, stacking downward 8 px apart
@@ -2724,19 +2892,31 @@ void layoutToasts() {
         else { t->x = mi.rcWork.right / s - 16 - t->w; t->y = sy; sy += t->h + 8; }
     }
 }
-void renderToast(Toast& t) {
-    if (!t.hwnd) return;
-    const float s = toastScale(), M = kToastM;
-    float o, dx = 0, dy = 0;
-    if (t.closing) { float e = (float)ease(E_IN, t.out.progress()); o = 1 - e; dx = 28 * e; }
-    else { float e = t.in.value(); o = std::max(0.f, std::min(1.f, e)); dy = -8 * (1 - e); }
-    int pw = (int)std::ceil((t.w + 2 * M) * s), ph = (int)std::ceil((t.h + 2 * M) * s);
-    POINT pt{(LONG)std::lround((t.x - M + dx) * s), (LONG)std::lround((t.y - M + dy) * s)};
-    ulw(t.hwnd, pw, ph, &pt, (BYTE)std::lround(255 * o), [&](gp::Graphics& gr) {
-        gr.ScaleTransform(s, s); gr.TranslateTransform(M, M); paintToast(gr, t);
-    });
+void composeToast(uint32_t* dst, int pw, int ph, int mPx, float s, const Toast& t) {
+    composeCard(dst, pw, ph, mPx, s, t.w, t.h, toastStyle(t), [&](gp::Graphics& gr) { paintToastBody(gr, t); });
 }
-void dismissToast(Toast* t) { if (!t->closing) { t->closing = true; t->out.set(0); t->out.go(1, 260, E_IN); if (!t->out.ms) t->out.set(1); kickToasts(); } }
+// One animation frame: compose only when the content changed, otherwise move + fade the existing pixels.
+void toastFrame(Toast& t) {
+    if (!t.hwnd) return;
+    const float s = toastScale();
+    const int mPx = (int)std::lround(kToastM * s);
+    float o, dx = 0, dy = 0;
+    if (t.closing) {
+        float e = (float)ease(E_IN, t.out.progress()); o = 1 - e;
+        if (!t.inApp) dx = 28 * e;  // on-screen: glide out to the right (SPEC); in-app: fade (tokens toastOut)
+    } else { float e = t.in.value(); o = std::max(0.f, std::min(1.f, e)); dy = -8 * (1 - e); }
+    const int pw = (int)std::lround(t.w * s) + 2 * mPx, ph = (int)std::lround(t.h * s) + 2 * mPx;
+    POINT pt{(LONG)std::lround((t.x + dx) * s) - mPx, (LONG)std::lround((t.y + dy) * s) - mPx};
+    const BYTE a = (BYTE)std::lround(255 * o);
+    if (t.dirty || t.surf.w != pw || t.surf.h != ph) {
+        if (!t.surf.ensure(pw, ph)) return;
+        composeToast(t.surf.px, pw, ph, mPx, s, t);
+        t.surf.present(t.hwnd, pt, a);
+        t.dirty = false;
+    } else LayerSurf::move(t.hwnd, pt, a);
+}
+void renderToast(Toast& t) { t.dirty = true; toastFrame(t); }
+void dismissToast(Toast* t) { if (!t->closing) { t->closing = true; t->out.set(0); t->out.go(1, t->inApp ? 160 : 260, E_IN); if (!t->out.ms) t->out.set(1); kickToasts(); } }
 void openPath(const std::wstring& p) { ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
 void showInFolder(const std::wstring& p) {
     PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(p.c_str());
@@ -2748,7 +2928,8 @@ LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     for (auto& x : g_toasts) if (x->hwnd == h) t = x.get();
     if (!t) return DefWindowProcW(h, m, wp, lp);
     const float s = toastScale();
-    float x = GET_X_LPARAM(lp) / s - kToastM, y = GET_Y_LPARAM(lp) / s - kToastM;
+    const int mPx = (int)std::lround(kToastM * s);
+    float x = (GET_X_LPARAM(lp) - mPx) / s, y = (GET_Y_LPARAM(lp) - mPx) / s;
     switch (m) {
         case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
         case WM_NCHITTEST: return t->inApp ? HTCLIENT : HTTRANSPARENT;
@@ -2775,51 +2956,105 @@ LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, m, wp, lp);
 }
 bool captureLive() { return g.rec.isActive() || g.replay.running(); }
-Toast* showToast(int kind, const std::wstring& title, const std::wstring& sub, const std::wstring& path, bool inApp, bool testVisible = false) {
-    if (g_renderOnly) return nullptr;
+// Toast windows are created ahead of time (startup) and recycled: showing a toast is a compose + one
+// UpdateLayeredWindow, nothing is created on the save path.
+std::vector<HWND> g_toastPool;
+HWND toastWindowCreate() {
     static bool reg = false;
     if (!reg) { WNDCLASSW wc{}; wc.lpfnWndProc = ToastProc; wc.hInstance = g.inst; wc.lpszClassName = L"CastRecorderToast"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&wc); reg = true; }
+    return CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, L"CastRecorderToast", L"", WS_POPUP,
+                           0, 0, 1, 1, nullptr, nullptr, g.inst, nullptr);
+}
+void toastWindowRelease(HWND h) {
+    if (!h) return;
+    ShowWindow(h, SW_HIDE);
+    if (g_toastPool.size() < 3) g_toastPool.push_back(h); else DestroyWindow(h);
+}
+void prewarmToasts() {
+    if (g_renderOnly || !g.hwnd) return;
+    while (g_toastPool.size() < 2) { HWND h = toastWindowCreate(); if (!h) break; g_toastPool.push_back(h); }
+    // shadows for the common sizes at this DPI (the blur is the only non-trivial part of a compose)
+    const float s = toastScale(); const int mPx = (int)std::lround(kToastM * s);
+    Toast t; t.kind = TK_REPLAY; t.w = 284; t.h = 64;
+    CardStyle st = toastStyle(t);
+    shadowFor((int)std::lround(284 * s), (int)std::lround(64 * s), mPx, (int)std::lround(st.radius * s), (int)std::lround(st.blur * s), (int)std::lround(st.dy * s), st.shadowA);
+}
+Toast* showToast(int kind, const std::wstring& title, const std::wstring& sub, const std::wstring& path, bool inApp, bool testVisible = false) {
+    if (g_renderOnly) return nullptr;
     auto t = std::make_unique<Toast>();
     t->kind = kind; t->title = title; t->sub = sub; t->path = path; t->inApp = inApp; t->testVisible = testVisible;
     if (kind == TK_SAVED) { t->w = 320; t->h = inApp ? 116 : 64; t->holdMs = inApp ? 6000 : 1500; }
     else if (kind == TK_ERROR) { t->w = 320; t->h = 64; t->holdMs = inApp ? 6000 : 2500; }
     else if (kind == TK_TEST) { t->w = 240; t->h = 120; t->holdMs = 60000; }
+    else if (kind == TK_REPLAY) { t->w = 284; t->h = 64; t->holdMs = inApp ? 3000 : 1000; }  // tokens toastDurationMs.replay (in-app)
     else { t->w = sub.empty() ? 240 : 284; t->h = sub.empty() ? 52 : 64; t->holdMs = 1000; }
-    DWORD ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | (inApp ? 0 : WS_EX_TRANSPARENT);
-    t->hwnd = CreateWindowExW(ex, L"CastRecorderToast", L"", WS_POPUP, 0, 0, 1, 1, inApp ? g.hwnd : nullptr, nullptr, g.inst, nullptr);
+    if (!g_toastPool.empty() && !testVisible) { t->hwnd = g_toastPool.back(); g_toastPool.pop_back(); }
+    else t->hwnd = toastWindowCreate();
     if (!t->hwnd) return nullptr;
-    t->excluded = !testVisible && SetWindowDisplayAffinity(t->hwnd, kWdaExclude);
+    DWORD ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | (inApp ? 0 : WS_EX_TRANSPARENT);
+    SetWindowLongPtrW(t->hwnd, GWL_EXSTYLE, ex);
+    SetWindowLongPtrW(t->hwnd, GWLP_HWNDPARENT, (LONG_PTR)(inApp ? g.hwnd : nullptr));
+    t->excluded = testVisible ? (SetWindowDisplayAffinity(t->hwnd, 0), false) : SetWindowDisplayAffinity(t->hwnd, kWdaExclude) != 0;
     if (!t->excluded && !testVisible) {
         if (!g_affinityWarned) { cr::appLog(L"toast: WDA_EXCLUDEFROMCAPTURE unavailable (" + std::to_wstring(GetLastError()) + L"); toasts are skipped while capturing"); g_affinityWarned = true; }
-        if (captureLive()) { DestroyWindow(t->hwnd); return nullptr; }  // never let a toast end up in a recording
+        if (captureLive()) { toastWindowRelease(t->hwnd); return nullptr; }  // never let a toast end up in a recording
     }
-    while (g_toasts.size() >= 4) { DestroyWindow(g_toasts.front()->hwnd); g_toasts.erase(g_toasts.begin()); }
+    while (g_toasts.size() >= 4) { toastWindowRelease(g_toasts.front()->hwnd); g_toasts.erase(g_toasts.begin()); }
     t->in.set(0); t->in.go(1, 220, E_OUTEXPO); if (!t->in.ms || kind == TK_TEST) t->in.set(1);
     t->shownAt = nowMs();
     Toast* raw = t.get();
     g_toasts.push_back(std::move(t));
     layoutToasts();
-    for (auto& x : g_toasts) renderToast(*x);
+    for (auto& x : g_toasts) if (x.get() != raw) toastFrame(*x);  // others only move (stacking)
+    renderToast(*raw);
     ShowWindow(raw->hwnd, SW_SHOWNOACTIVATE);
     SetWindowPos(raw->hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     kickToasts();
     return raw;
 }
-void toastTick() {
+// Runs on vsync frames while something animates and on a one-shot timer for the hold deadlines.
+// Returns true while a toast is animating (the vsync clock keeps running).
+bool toastTick() {
     double now = nowMs();
-    bool any = false;
+    bool animating = false;
+    double nextDue = -1;
     for (size_t i = 0; i < g_toasts.size();) {
         Toast& t = *g_toasts[i];
-        if (!t.closing && !t.hover && now - t.shownAt - t.pausedMs > 220 + t.holdMs) dismissToast(&t);
-        if (t.closing && !t.out.active()) { DestroyWindow(t.hwnd); g_toasts.erase(g_toasts.begin() + i); layoutToasts(); continue; }
-        if (t.in.active() || t.out.active()) renderToast(t);
-        any = true; ++i;
+        const double due = t.shownAt + t.pausedMs + 220 + t.holdMs;
+        if (!t.closing && !t.hover && now > due) dismissToast(&t);
+        if (t.closing && !t.out.active()) { toastWindowRelease(t.hwnd); g_toasts.erase(g_toasts.begin() + i); layoutToasts(); for (auto& x : g_toasts) toastFrame(*x); continue; }
+        const bool act = t.in.active() || t.out.active();
+        if (act || t.animLast) toastFrame(t);  // one more frame after the end lands exactly on the final state
+        t.animLast = act;
+        animating |= act;
+        if (!t.closing && !t.hover) nextDue = nextDue < 0 ? due : std::min(nextDue, due);
+        ++i;
     }
-    if (!any && g.hwnd) KillTimer(g.hwnd, TIMER_TOAST);
+    if (g.hwnd) {
+        if (nextDue >= 0) SetTimer(g.hwnd, TIMER_TOAST, (UINT)std::max(10.0, nextDue - now + 1), nullptr);
+        else KillTimer(g.hwnd, TIMER_TOAST);
+    }
+    if (animating) vsyncKick();
+    return animating;
 }
-void kickToasts() { if (g.hwnd) SetTimer(g.hwnd, TIMER_TOAST, 16, nullptr); }
+void kickToasts() { vsyncKick(); }
 void relayoutToasts() { if (g_toasts.empty()) return; layoutToasts(); for (auto& t : g_toasts) renderToast(*t); }
 bool appOnScreen() { return g.hwnd && IsWindowVisible(g.hwnd) && !IsIconic(g.hwnd); }
+// Notification policy (notify_policy.h): status line only while Cast Recorder is open and in front; one on-screen
+// toast when it is minimized or another window is in front. Never a Windows notification.
+bool foregroundIsOurs() {
+    HWND f = GetForegroundWindow(); DWORD pid = 0;
+    if (f) GetWindowThreadProcessId(f, &pid);
+    return pid == GetCurrentProcessId();
+}
+void notice(int kind, const std::wstring& title, const std::wstring& sub, const std::wstring& path) {
+    if (!g.hwnd || g.quitting) return;
+    if (cr::noticeTarget(IsWindowVisible(g.hwnd) != 0, IsIconic(g.hwnd) != 0, foregroundIsOurs()) == cr::NoticeTarget::StatusOnly) {
+        cr::appLog(L"toast: \"" + title + L"\" not shown (app is open and in front; status line only)");
+        return;
+    }
+    showToast(kind, title, sub, path, false);
+}
 
 // ---------- preview chips: layered child windows above the swapchain child ----------
 HWND g_chipL = nullptr, g_chipR = nullptr;
@@ -3188,7 +3423,8 @@ void frameTick() {
     bool anim = g_view.active() || g_chan.active() || g_themeSeg.active() || g_themeAnim.active() || anyActive(g_tog) || anyActive(g_hov) || anyActive(g_press);
     if (P.kind != PK_NONE) {
         bool pa = P.open.active() || P.close.active() || anyActive(P.hov);
-        if (pa || (changed && P.kind == PK_MIC)) renderPopup();
+        if (anyActive(P.hov) || (changed && P.kind == PK_MIC)) renderPopup();      // content changed: recompose
+        else if (P.open.active() || P.close.active()) vsyncKick();                  // motion only: vsync-paced moves
         if (pa) anim = true;  // the field chevron rotates with the list
         if (P.closing && !P.close.active()) { ShowWindow(P.hwnd, SW_HIDE); P.kind = PK_NONE; P.closing = false; anim = true; }
     }
@@ -3318,7 +3554,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP + 44:  // the preview's window target is gone
         if (g.target.kind == CaptureTarget::Window && !g.rec.running()) {
-            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g_srcTitle.clear();
+            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; setSrcWindow(L"", L"", L"");
             setStatus(L"Window closed", toRef(T_WARN));
             cr::appLog(L"source: captured window closed, preview back on Full screen");
         }
@@ -3468,6 +3704,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == HK_REPLAY) saveReplay();
         if (g_hkTestHook) g_hkTestHook((int)wp);
         return 0;
+    case WM_APP_VSYNC: {
+        g_vsyncPosted = false;
+        bool more = toastTick();
+        static bool popAnimLast = false;
+        const bool pa = P.kind != PK_NONE && (P.open.active() || P.close.active());
+        if (pa || (popAnimLast && P.kind != PK_NONE)) popupFrame();
+        popAnimLast = pa;
+        more |= pa;
+        if (!more) g_vsyncWant = false;
+        return 0;
+    }
     case WM_TIMER:
         if (wp == TIMER_FRAME) { frameTick(); return 0; }
         if (wp == TIMER_TOAST) { toastTick(); return 0; }
@@ -3514,7 +3761,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         startReplayBuffer();
         return 0;
     case WM_APP_RECORDER_STARTED:
-        if (g.rec.isActive()) { playTone(IDR_SND_START); showToast(TK_STARTED, L"Recording started", L"", L"", false, false); }
+        if (g.rec.isActive()) { playTone(IDR_SND_START); notice(TK_STARTED, L"Recording started", L"", L""); }
         return 0;
     case WM_APP_REPLAY_DONE: {
         g.replay.waitUntilIdle(200);
@@ -3523,7 +3770,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         writeSessionLog(r, L"replay buffer session");
         if (!r.ok && !r.message.empty() && !g.quitting && !g.rec.running()) setStatus(L"Replay buffer stopped: " + r.message, toRef(T_WARN));
         if (r.windowClosed && !g.rec.running()) {
-            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g_srcTitle.clear(); g.gprev.setTarget(g.target);
+            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; setSrcWindow(L"", L"", L""); g.gprev.setTarget(g.target);
             startReplayBuffer();
         }
         InvalidateRect(h, nullptr, FALSE);
@@ -3539,13 +3786,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (r->ok) {
             playTone(IDR_SND_REPLAY);
             cr::appLog(L"replay saved: " + r->path + L" (" + std::to_wstring(r->secs) + L" s)");
-            showToast(TK_REPLAY, lastSavedText(r->secs), fileNameOf(r->path), r->path, false);
+            notice(TK_REPLAY, lastSavedText(r->secs), fileNameOf(r->path), r->path);
             setStatus(L"Saved " + fileNameOf(r->path), toRef(T_OK));
             scanRecordings();
         } else {
             cr::appLog(L"replay save FAILED: " + r->err);
             setStatus(L"Couldn't save the replay: " + r->err, toRef(T_ERR));
-            showToast(TK_ERROR, L"Replay not saved", r->err, L"", false);
+            notice(TK_ERROR, L"Replay not saved", r->err, L"");
         }
         if (g_hkTestHook) g_hkTestHook(r->ok ? 105 : 205);
         InvalidateRect(h, nullptr, FALSE);
@@ -3580,7 +3827,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         std::wstring fname = k == std::wstring::npos ? r.file : r.file.substr(k + 1);
         if (r.ok && r.windowClosed) {
             setStatus(L"Window closed  \u00b7  saved " + fname, toRef(T_WARN));
-            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; g_srcTitle.clear();
+            g.target = CaptureTarget{}; g.target.kind = CaptureTarget::AllDisplays; setSrcWindow(L"", L"", L"");
             g.gprev.setTarget(g.target);
         } else if (r.ok) {
             std::wstring msg2 = L"Saved " + fname + L"  \u00b7  " + r.encoderUsed;
@@ -3593,16 +3840,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             WIN32_FILE_ATTRIBUTE_DATA fa{};
             unsigned long long sz = GetFileAttributesExW(r.file.c_str(), GetFileExInfoStandard, &fa) ? (((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow) : 0;
             std::wstring sub = fname + L" \u00b7 " + sizeText(sz);
-            if (!g.quitting) {
-                if (appOnScreen()) showToast(TK_SAVED, L"Recording saved", sub, r.file, true);
-                if (!appOnScreen() || GetForegroundWindow() != h) showToast(TK_SAVED, L"Recording saved", sub, r.file, false);
-            }
+            notice(TK_SAVED, L"Recording saved", sub, r.file);
         } else if (r.abandoned) setStatus(r.file.empty() ? L"Encoder got stuck. Restart Cast Recorder to record again." : L"Encoder got stuck - kept " + fname + L". Restart Cast Recorder to record again.", toRef(T_WARN));
         else if (!r.file.empty()) setStatus(L"Saved " + fname + L" (" + r.message + L")", toRef(T_WARN));
         else if (r.timedOut) setStatus(L"Stopped (timed out): " + r.message, toRef(T_WARN));
         else {
             setStatus(r.message.empty() ? L"Recording stopped" : (L"Recording failed: " + r.message), toRef(T_ERR));
-            if (!r.message.empty() && !g.quitting) showToast(TK_ERROR, L"Recording failed", r.message, L"", appOnScreen());
+            if (!r.message.empty()) notice(TK_ERROR, L"Recording failed", r.message, L"");
         }
         g_recBytes = 0;
         if (g_hkTestHook) g_hkTestHook(r.ok ? 101 : 201);
@@ -3797,7 +4041,7 @@ void applyLongValues() {
     g.gpus.push_back(L"NVIDIA GeForce RTX 4090 Laptop GPU with Max-Q Design (Display Adapter 2)");
     g.s.gpuIndex = (int)g.gpus.size() - 1;
     g.s.outputDir = U(L"C:\\Users\\\u0410\u043b\u0435\u043a\u0441\u0430\u043d\u0434\u0440\u0430 \u041a\u043e\u043d\u0441\u0442\u0430\u043d\u0442\u0438\u043d\u043e\u0432\u0430\\Videos\\\u0417\u0430\u043f\u0438\u0441\u0438 \u044d\u043a\u0440\u0430\u043d\u0430 \u0434\u043b\u044f \u043f\u0440\u043e\u0435\u043a\u0442\u0430\\Cast Recorder");
-    g.target.kind = CaptureTarget::Window; g.target.hwnd = nullptr; g_srcTitle = kLongTitle;
+    g.target.kind = CaptureTarget::Window; g.target.hwnd = nullptr; setSrcWindow(kLongTitle, L"PowerPoint", cr::stripAppSuffix(kLongTitle, L"POWERPNT.EXE", L"Microsoft PowerPoint"));
     g.s.toggleRecord = Hotkey{MOD_CTRL_ | MOD_ALT_ | MOD_SHIFT_, 0x91};  // Scroll Lock
     g.s.saveReplay = Hotkey{MOD_CTRL_ | MOD_ALT_ | MOD_SHIFT_ | MOD_WIN_, 0x7B};
     g.s.micMute = Hotkey{MOD_CTRL_ | MOD_ALT_ | MOD_SHIFT_, 0x2D};  // Insert
@@ -3847,8 +4091,16 @@ int renderUi(const std::wstring& path, const std::wstring& state, int dpi, const
             P.open.set(1);
             P.kb = -1;
             paintAll(gr, W, H);  // field shows its open state
-            gr.TranslateTransform(P.x, P.y);
-            drawPopupFrame(gr);
+            // the same pixels the layered popup window gets (composePopup), placed on the device pixel grid
+            const int mPx = (int)std::lround(kShadow * s);
+            const int pw = (int)std::lround(P.w * s) + 2 * mPx, ph = (int)std::lround(P.h * s) + 2 * mPx;
+            std::vector<uint32_t> buf((size_t)pw * ph);
+            composePopup(buf.data(), pw, ph, mPx, s);
+            gp::Bitmap pb(pw, ph, pw * 4, PixelFormat32bppPARGB, (BYTE*)buf.data());
+            gr.ResetTransform();
+            gr.SetInterpolationMode(gp::InterpolationModeNearestNeighbor);
+            gr.DrawImage(&pb, gp::Rect((INT)std::lround(P.x * s) - mPx, (INT)std::lround(P.y * s) - mPx, pw, ph), 0, 0, pw, ph, gp::UnitPixel);
+            gr.ScaleTransform(s, s);
         }
         if (state == L"tooltip") {  // hover over the truncated source field: full-text tooltip
             g_mouseX = L.src.X + L.src.Width / 2; g_mouseY = L.src.Y + L.src.Height / 2;
@@ -3859,8 +4111,16 @@ int renderUi(const std::wstring& path, const std::wstring& state, int dpi, const
             if (state == L"replaytoast") { t.kind = TK_REPLAY; t.w = 284; t.h = 64; t.title = lastSavedText(30); t.sub = L"replay_22-10-05.mp4"; }
             else { t.kind = TK_SAVED; t.w = 320; t.h = 116; t.title = L"Recording saved"; t.sub = L"cast_2026-10-14_22-12.mp4 \u00b7 128.4 MB"; }
             if (g_renderLong) { std::lock_guard<std::mutex> l(g_itemsM); fakeRecordingsLocked(); t.sub = g_items[0].name + L".mp4 \u00b7 1.2 GB"; }
-            gr.TranslateTransform(L.surf.X + L.surf.Width - 16 - t.w, L.surf.Y + 16 + 30);
-            paintToast(gr, t);
+            const float tx = L.surf.X + L.surf.Width - 16 - t.w, ty = L.surf.Y + 16 + 30;
+            const int mPx = (int)std::lround(kToastM * s);
+            const int pw = (int)std::lround(t.w * s) + 2 * mPx, ph = (int)std::lround(t.h * s) + 2 * mPx;
+            std::vector<uint32_t> buf((size_t)pw * ph);
+            composeToast(buf.data(), pw, ph, mPx, s, t);
+            gp::Bitmap tb(pw, ph, pw * 4, PixelFormat32bppPARGB, (BYTE*)buf.data());
+            gr.ResetTransform();
+            gr.SetInterpolationMode(gp::InterpolationModeNearestNeighbor);
+            gr.DrawImage(&tb, gp::Rect((INT)std::lround(tx * s) - mPx, (INT)std::lround(ty * s) - mPx, pw, ph), 0, 0, pw, ph, gp::UnitPixel);
+            gr.ScaleTransform(s, s);
         }
     }
     CLSID cl{};
@@ -3922,6 +4182,7 @@ int runCli(int argc, wchar_t** argv) {
         "  --test-mic           synthetic noisy microphone through the real mic chain (CI)\n"
         "  --noise-suppression on|off / --noise-gate DB (-80 = off) / --mic-volume PCT / --channels 1|2\n"
         "  --list-windows       list capturable windows\n"
+        "  --test-window-picker DIR  CI: picker filtering (main vs popups) and tiny/minimized window capture sizes\n"
         "  --codec auto|h264|hevc|av1   video codec (Auto: H.264 for MP4; AV1 > HEVC > H.264 for MKV)\n"
         "  --auto-remux on|off  MKV: remux to MP4 after saving and keep the MP4\n"
         "  --separate-tracks    three audio tracks: 1 mix, 2 system, 3 mic\n"
@@ -3943,7 +4204,7 @@ int runCli(int argc, wchar_t** argv) {
     std::wstring renderPath, uiState = L"idle", uiTheme; int renderDpi = 96; float uiW = 1100, uiH = 700;
     bool containerGiven = false, replayOnly = false, testToast = false, toastVisible = false;
     int replaySecs = 0, replayMaxMb = 0; double saveReplayAt = -1;
-    std::wstring replayOut, remuxIn, remuxOut, remuxEngine, toastShot;
+    std::wstring replayOut, remuxIn, remuxOut, remuxEngine, toastShot, pickerDir;
     double pauseAt = -1, resumeAt = -1;
     DWORD latePublishMs = 0;
     RecordOptions o;
@@ -4012,7 +4273,7 @@ int runCli(int argc, wchar_t** argv) {
             && a != L"--test-hang-finalize" && a != L"--test-slow-post" && a != L"--test-late-publish" && a != L"--replay-max-mb" && a != L"--pause-at" && a != L"--resume-at" && a != L"--render-ui" && a != L"--ui-state" && a != L"--dpi" && a != L"--ui-size" && a != L"--render-pattern" && a != L"--window"
             && a != L"--source" && a != L"--noise-suppression" && a != L"--noise-gate" && a != L"--mic-volume" && a != L"--channels"
             && a != L"--codec" && a != L"--auto-remux" && a != L"--replay" && a != L"--save-replay-at" && a != L"--replay-out" && a != L"--remux"
-            && a != L"--remux-engine" && a != L"--test-toast" && a != L"--test-toast-visible" && a != L"--ui-theme")
+            && a != L"--remux-engine" && a != L"--test-toast" && a != L"--test-toast-visible" && a != L"--ui-theme" && a != L"--test-window-picker")
             return bad("unknown option " + U(a));
         if (!value(v)) return bad(U(a) + " needs a value");
         if (a == L"--codec") {
@@ -4040,6 +4301,7 @@ int runCli(int argc, wchar_t** argv) {
             if (v != "mf" && v != "ffmpeg") return bad("--remux-engine must be mf or ffmpeg");
             remuxEngine = W(v);
         } else if (a == L"--test-toast" || a == L"--test-toast-visible") { testToast = true; toastVisible = a == L"--test-toast-visible"; toastShot = W(v);
+        } else if (a == L"--test-window-picker") { pickerDir = W(v);
         } else if (a == L"--ui-theme") {
             if (v != "dark" && v != "light") return bad("--ui-theme must be dark or light");
             uiTheme = W(v);
@@ -4184,6 +4446,65 @@ int runCli(int argc, wchar_t** argv) {
         bool ok = remuxFile(remuxIn, remuxOut, err, remuxEngine, 120000);
         char b[160]; snprintf(b, sizeof b, "ok=%d remux_ms=%llu engine=%s\n", ok ? 1 : 0, GetTickCount64() - t0, remuxEngine.empty() ? "auto" : U(remuxEngine).c_str());
         emit(std::string(b) + "file=" + U(remuxOut) + "\nmessage=" + U(err) + "\n", stdout);
+        return ok ? 0 : 1;
+    }
+    if (!pickerDir.empty()) {  // CI: real app window vs. popups in the window picker; tiny / minimized window capture sizes
+        g.inst = GetModuleHandleW(nullptr);
+        SHCreateDirectoryExW(nullptr, pickerDir.c_str(), nullptr);
+        auto pump = [](DWORD ms) { ULONGLONG end = GetTickCount64() + ms; while (GetTickCount64() < end) { MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m); Sleep(5); } };
+        WNDCLASSW wc{}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = g.inst; wc.lpszClassName = L"CRPickerTest";
+        wc.hbrBackground = CreateSolidBrush(RGB(40, 160, 90)); wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassW(&wc);
+        HWND mainW = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Main - Brave", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 80, 80, 801, 601, nullptr, nullptr, g.inst, nullptr);
+        // what Brave/Chrome put on screen next to the real window: a bare topmost popup (media / hover strip) ...
+        HWND popup = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"CR Picker Popup", WS_POPUP | WS_VISIBLE, 300, 300, 146, 21, nullptr, nullptr, g.inst, nullptr);
+        // ... a tool-window hover card, and an owned dialog
+        HWND hover = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"CR Picker Hover", WS_POPUP | WS_VISIBLE, 320, 340, 300, 120, nullptr, nullptr, g.inst, nullptr);
+        HWND owned = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Owned", WS_POPUP | WS_CAPTION | WS_VISIBLE, 400, 200, 400, 300, mainW, nullptr, g.inst, nullptr);
+        HWND minW = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Minimized", WS_OVERLAPPEDWINDOW, 120, 120, 641, 481, nullptr, nullptr, g.inst, nullptr);
+        ShowWindow(minW, SW_SHOWMINNOACTIVE);
+        pump(800);
+        includeOwnWindowsForTest(true);
+        auto ws = listCaptureWindows();
+        std::string out;
+        bool ok = true;
+        struct Case { const char* name; HWND h; bool expect; } cases[] = {{"main", mainW, true}, {"popup", popup, false}, {"hover", hover, false}, {"owned", owned, false}, {"minimized", minW, true}};
+        for (auto& c : cases) {
+            const CaptureWindow* f = nullptr;
+            for (auto& w : ws) if (w.hwnd == c.h) f = &w;
+            const char* why = captureRejectReason(c.h);
+            char b[200]; snprintf(b, sizeof b, "picker %s listed=%d expect=%d reason=%s\n", c.name, f ? 1 : 0, c.expect ? 1 : 0, why ? why : "-");
+            out += b;
+            if ((f != nullptr) != c.expect) ok = false;
+            if (f && c.h == mainW) out += "label=" + U(f->label()) + "\napp=" + U(f->app) + "\npage=" + U(f->page) + "\n";
+        }
+        // a saved source whose title now matches only the popup must come back as the app's real window
+        HWND r = resolveSavedWindow(windowExe(mainW), L"CR Picker Popup");
+        out += std::string("resolve_saved=") + (r == mainW ? "main" : r == popup ? "popup" : r == minW ? "minimized" : r ? "other" : "none") + "\n";
+        if (r != mainW) ok = false;
+        includeOwnWindowsForTest(false);
+        // capture: the 146x21 popup and a window minimized at start must give an even, >= 128 px encode
+        for (auto& c : {std::make_pair("tiny", popup), std::make_pair("minimized", minW)}) {
+            Recorder rec; RecordOptions ro = o;
+            ro.window = c.second; ro.monitor = nullptr; ro.allDisplays = false;
+            ro.encoder = Encoder::Software; ro.container = Container::MP4; ro.systemAudio = false; ro.mic = false; ro.testTone = false;
+            ro.outputPath = pickerDir + L"\\picker-" + W(c.first) + L".mp4";
+            rec.start(ro);
+            ULONGLONG until = GetTickCount64() + 5000;
+            while (rec.running() && !rec.started() && GetTickCount64() < until) pump(5);
+            if (std::string(c.first) == "minimized") { pump(1200); ShowWindow(minW, SW_RESTORE); pump(1200); }  // restored mid-recording
+            else pump(2000);
+            rec.stop(); rec.waitUntilIdle(15000);
+            const RecordResult& rr = rec.result();
+            std::string el = U(rr.encoderLog); std::string size = "?";
+            size_t k = el.find("window capture output ");
+            if (k != std::string::npos) size = el.substr(k + 22, el.find('\n', k) - (k + 22));
+            out += std::string("capture_") + c.first + " ok=" + (rr.ok ? "1" : "0") + " output=" + size + " file=" + U(rr.file) + " message=" + U(rr.message) + "\n";
+            if (!rr.ok) ok = false;
+        }
+        out += std::string("picker_ok=") + (ok ? "1" : "0") + "\n";
+        DestroyWindow(owned); DestroyWindow(hover); DestroyWindow(popup); DestroyWindow(minW); DestroyWindow(mainW);
+        emit(out, stdout);
         return ok ? 0 : 1;
     }
     if (testToast) {  // CI: is a toast window kept out of what we capture?
@@ -4444,6 +4765,8 @@ if (!g_selftest && wcscmp(argv[i], L"--minimized") != 0 && (argv[i][0] == L'-' |
     if (!IsWindowVisible(g.hwnd)) g.gprev.setVisible(false);
     restartMeter();
     startWatcher();
+    ensurePopupWindow();  // dropdown + toast windows exist before they are needed (no creation on the save path)
+    prewarmToasts();
     if (!g.warm.running()) startReplayBuffer();  // otherwise when the warm-up finishes
 
     MSG msg;

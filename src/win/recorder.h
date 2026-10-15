@@ -42,6 +42,7 @@ public:
     void addVideo(IMFSample* s);
     void addAudio(long long t100ns, const std::vector<short>* const pcm[3]);
     void detach();
+    std::wstring stats() const;  // arena / packet counters (perf log)
     struct Impl;
 private:
     std::unique_ptr<Impl> p_;
