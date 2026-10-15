@@ -693,6 +693,40 @@ jobs:
           "format=$fmt"
           if ($fmt -notmatch 'matroska') { throw "not MKV: $fmt" }
           Copy-Item evil-path\y.txt rec\hijack-path-probe.txt
+      - name: Live encoder switch (encoder stalls 3 s in; recording and replay buffer keep going)
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $o = "$PWD\rec\switch"; New-Item -ItemType Directory $o -Force | Out-Null
+          $log = "$o\switch.txt"
+          $p = Start-Process $exe -ArgumentList "--record 10 --fps 30 --replay 30 --save-replay-at 9.5 --test-encoder-stall 3 --encoder software --moving-pattern --test-tone --out `"$o\main.mp4`" --replay-out `"$o\replay.mp4`" --log `"$log`"" -Wait -PassThru
+          $txt = Get-Content $log -Raw
+          ($txt -split "`n" | Select-String -Pattern '^(ok|replay_|encoder=|frames|message|codec)|encoder switch|stall injected|replay ring:') | ForEach-Object { $_.Line }
+          if ($p.ExitCode -ne 0) { throw "exit $($p.ExitCode): the session ended instead of switching encoder" }
+          if ($txt -notmatch '(?m)^ok=1') { throw "recording not ok" }
+          if ($txt -notmatch 'stall injected') { throw "stall was not injected" }
+          if ($txt -notmatch 'encoder_switches=1') { throw "expected exactly one live encoder switch" }
+          if ($txt -notmatch 'encoder switch: now Software') { throw "no switch to the software encoder logged" }
+          if ($txt -match 'stopped responding') { throw "session reported the encoder as stopped" }
+          function Clean($f) { $d = & ffmpeg -hide_banner -v error -xerror -i $f -map 0 -f null - 2>&1; if ($LASTEXITCODE -ne 0 -or $d) { $d; throw "$f does not decode cleanly" } }
+          foreach ($f in "$o\main.mp4", "$o\replay.mp4") {
+            Clean $f
+            $dur = [double](ffprobe -v error -show_entries format=duration -of csv=p=0 $f)
+            $n = [int](ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 $f)
+            $last = [double]((ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 $f | ForEach-Object { [double]$_ } | Measure-Object -Maximum).Maximum)
+            $aud = ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 $f
+            "$(Split-Path $f -Leaf): duration=$dur s frames=$n last_video_pts=$last audio=$aud"
+            if ($dur -lt 8.5) { throw "$f is $dur s: footage before or after the switch is missing" }
+            if ($last -lt 8) { throw "$f video ends at $last s: nothing encoded after the switch" }
+            if ($n -lt 150) { throw "$f has only $n frames" }
+            if (-not ($aud -match 'aac')) { throw "$f lost its audio" }
+          }
+          $k0 = ffprobe -v error -select_streams v:0 -show_entries frame=key_frame -of csv=p=0 -read_intervals "%+#1" "$o\replay.mp4" | Select-Object -First 1
+          if ($k0 -ne '1') { throw "replay does not start on a key frame" }
+          $rs = [double]([regex]::Match($txt, 'replay_seconds=([\d.]+)').Groups[1].Value)
+          if ($rs -lt 8.5) { throw "replay buffer lost the footage from before the switch ($rs s)" }
+          Remove-Item "$o\main.mp4", "$o\replay.mp4"
       - name: Replay ring wraps (moving content, 60 fps, 15 s buffer, 55 s run, save mid-run)
         if: matrix.fps == 60
         shell: pwsh
