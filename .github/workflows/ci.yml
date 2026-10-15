@@ -687,6 +687,53 @@ jobs:
           "format=$fmt"
           if ($fmt -notmatch 'matroska') { throw "not MKV: $fmt" }
           Copy-Item evil-path\y.txt rec\hijack-path-probe.txt
+      - name: Replay ring wraps (moving content, 60 fps, 15 s buffer, 55 s run, save mid-run)
+        if: matrix.fps == 60
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $o = "$PWD\rec\ring"; New-Item -ItemType Directory $o -Force | Out-Null
+          $log = "$o\ring.txt"
+          $a = "--record 55 --replay 15 --replay-only --save-replay-at 40 --moving-pattern --encoder software --fps 60 --out `"$o\ring-main.mp4`" --replay-out `"$o\ring-replay.mp4`" --log `"$log`""
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $p = Start-Process $exe -ArgumentList $a -PassThru
+          $null = $p.Handle
+          $mem = @()
+          while (-not $p.HasExited) {
+            try { $p.Refresh(); $mem += [pscustomobject]@{ t = $sw.Elapsed.TotalSeconds; mb = $p.PrivateMemorySize64 / 1MB } } catch {}
+            Start-Sleep -Milliseconds 500
+          }
+          $p.WaitForExit()
+          $txt = Get-Content $log -Raw
+          ($txt -split "`n" | Select-String -Pattern '^(ok|replay_|capture|encoder=|frames|message)|replay ring:|software encode:') | ForEach-Object { $_.Line }
+          if ($p.ExitCode -ne 0) { throw "exit $($p.ExitCode)" }
+          if ($txt -notmatch 'capture=Synthetic') { throw "moving pattern not used" }
+          $m = [regex]::Match($txt, 'replay_ok=1 replay_seconds=([\d.]+) replay_buffered=([\d.]+)')
+          if (-not $m.Success) { throw "replay save failed" }
+          $rs = [double]$m.Groups[1].Value
+          if ($rs -lt 13.5 -or $rs -gt 16.5) { throw "replay length $rs s, expected about 15 s" }
+          $rg = [regex]::Match($txt, 'replay ring: (\d+) packets, \d+ audio chunks, ([\d.]+) MB held, arena (\d+) x 4 MB blocks \((\d+) allocated, (\d+) reused, (\d+) released\)')
+          if (-not $rg.Success) { throw "no replay ring stats" }
+          $held = [double]$rg.Groups[2].Value; $blocks = [int]$rg.Groups[3].Value; $alloc = [int]$rg.Groups[4].Value; $reused = [int]$rg.Groups[5].Value
+          "ring: held=$held MB blocks=$blocks allocated=$alloc reused=$reused"
+          if ($reused -le 0) { throw "the ring never wrapped (0 blocks reused)" }
+          if ($blocks * 4 -gt $held + 24) { throw "arena ($blocks x 4 MB) is far above what it holds ($held MB)" }
+          # memory levels off once the buffer is full: compare 20-35 s with 45 s to the end
+          $mid = ($mem | Where-Object { $_.t -ge 20 -and $_.t -lt 35 } | Measure-Object mb -Maximum).Maximum
+          $end = ($mem | Where-Object { $_.t -ge 45 } | Measure-Object mb -Maximum).Maximum
+          "private MB: 20-35 s max=$([math]::Round($mid,1)) 45 s+ max=$([math]::Round($end,1))"
+          if ($end - $mid -gt 40) { throw "memory kept growing after the buffer filled ($mid -> $end MB)" }
+          $f = "$o\ring-replay.mp4"
+          $d = & ffmpeg -hide_banner -v error -xerror -i $f -map 0 -f null - 2>&1
+          if ($LASTEXITCODE -ne 0 -or $d) { $d; throw "replay does not decode cleanly" }
+          $k0 = (ffprobe -v error -select_streams v:0 -read_intervals "%+#1" -show_entries frame=key_frame -of csv=p=0 $f | Select-Object -First 1)
+          if ($k0 -ne '1') { throw "replay does not start on a key frame" }
+          $hashes = & ffmpeg -hide_banner -v error -i $f -map 0:v -frames:v 60 -f framemd5 - 2>$null | Where-Object { $_ -notmatch '^#' } | ForEach-Object { ($_ -split ',')[-1].Trim() }
+          $uniq = ($hashes | Sort-Object -Unique).Count
+          "distinct frames in the first 60: $uniq"
+          if ($uniq -lt 30) { throw "replay content is not moving ($uniq distinct of 60)" }
+          $mem | ConvertTo-Json | Set-Content "$o\mem.json"
+          Remove-Item "$o\ring-replay.mp4"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
