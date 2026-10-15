@@ -607,6 +607,28 @@ jobs:
         with:
           name: ui-v1-screenshots
           path: rec/v1/ui-v1-*.png
+      - name: Window picker (Brave-style popup vs main window) and tiny / minimized window capture size
+        if: matrix.fps == 30
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $d = "$PWD\rec\picker"; New-Item -ItemType Directory $d -Force | Out-Null
+          $p = Start-Process $exe -ArgumentList "--test-window-picker `"$d`" --log `"$d\picker.txt`"" -Wait -PassThru
+          Get-Content "$d\picker.txt"
+          if ($p.ExitCode -ne 0) { throw "window picker test failed (exit $($p.ExitCode))" }
+          foreach ($n in 'popup','hover','owned') { if (-not (Select-String -Path "$d\picker.txt" -Pattern "^picker $n listed=0" -Quiet)) { throw "$n is selectable" } }
+          if (-not (Select-String -Path "$d\picker.txt" -Pattern '^label=Cast Recorder . CR Picker Main$' -Quiet)) { throw "main window label is not 'app · page' with the ' - Brave' suffix stripped" }
+          if (-not (Select-String -Path "$d\picker.txt" -Pattern '^resolve_saved=main' -Quiet)) { throw "a saved popup title did not resolve to the real window" }
+          foreach ($n in 'tiny','minimized') {
+            $f = "$d\picker-$n.mp4"
+            if (-not (Test-Path $f)) { throw "$f missing" }
+            $wh = (ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 $f) -split ','
+            $w = [int]$wh[0]; $h = [int]$wh[1]; "$n window -> encoded ${w}x${h}"
+            if ($w -lt 128 -or $h -lt 128 -or ($w % 2) -or ($h % 2)) { throw "$n: ${w}x${h} is not even and >= 128" }
+            $dec = & ffmpeg -hide_banner -v error -xerror -i $f -map 0 -f null - 2>&1
+            if ($LASTEXITCODE -ne 0 -or $dec) { $dec; throw "$f does not decode cleanly" }
+            if ($n -eq 'minimized' -and ($w -lt 560 -or $h -lt 400)) { throw "minimized-at-start window encoded at ${w}x${h}, not near its restored 641x481" }
+          }
       - name: Persistence through %APPDATA% (non-default values, Cyrillic path, close via WM_CLOSE)
         if: matrix.fps == 15
         shell: pwsh
@@ -706,3 +728,88 @@ jobs:
         with:
           name: ui-audit
           path: audit/*.png
+
+  replay-perf:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cast-recorder-windows
+          path: art
+      - name: Get the published v1.0 build (before)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory old -Force | Out-Null
+          gh release download v1.0 --repo ${{ github.repository }} --pattern CastRecorder.exe --dir old
+          Get-ChildItem old
+      - name: Replay buffer cost, v1.0 vs this build (60 fps, 30 s buffer, 20 s, replay-only, software encoder)
+        shell: pwsh
+        run: |
+          $new = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $old = (Resolve-Path old\CastRecorder.exe).Path
+          $o = "$PWD\perf"; New-Item -ItemType Directory $o -Force | Out-Null
+          function Perf($exe, $tag) {
+            $log = "$o\$tag.txt"
+            $a = "--record 20 --replay 30 --replay-only --save-replay-at 18 --encoder software --allow-synthetic --fps 60 --out `"$o\$tag-main.mp4`" --replay-out `"$o\$tag-replay.mp4`" --log `"$log`""
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process $exe -ArgumentList $a -PassThru
+            $null = $p.Handle
+            $peak = 0; $ws = @(); $cpuPrev = 0; $t0 = 0; $cpuMax = 0
+            while (-not $p.HasExited) {
+              try {
+                $p.Refresh()
+                $ws += $p.PrivateMemorySize64
+                if ($p.PeakWorkingSet64 -gt $peak) { $peak = $p.PeakWorkingSet64 }
+                $c = $p.TotalProcessorTime.TotalMilliseconds; $t = $sw.ElapsedMilliseconds
+                if ($t0 -gt 0 -and $t -gt $t0) { $u = ($c - $cpuPrev) / ($t - $t0) * 100; if ($u -gt $cpuMax) { $cpuMax = $u } }
+                $cpuPrev = $c; $t0 = $t
+              } catch {}
+              Start-Sleep -Milliseconds 500
+            }
+            $p.WaitForExit()
+            $cpu = $p.TotalProcessorTime.TotalSeconds; $wall = $sw.Elapsed.TotalSeconds
+            $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
+            $ok = $txt -match 'replay_ok=1'
+            $ring = ([regex]::Match($txt, 'replay ring:[^\r\n]*')).Value
+            $sws = ([regex]::Match($txt, 'software encode:[^\r\n]*')).Value
+            $privMax = if ($ws.Count) { ($ws | Measure-Object -Maximum).Maximum } else { 0 }
+            $privEnd = if ($ws.Count) { $ws[-1] } else { 0 }
+            [pscustomobject]@{ build = $tag; replay_ok = $ok; exit = $p.ExitCode; cpu_s = [math]::Round($cpu, 2); wall_s = [math]::Round($wall, 1)
+              cpu_pct_1core = [math]::Round($cpu / $wall * 100, 1); cpu_peak_pct = [math]::Round($cpuMax, 1)
+              peak_ws_mb = [math]::Round($peak / 1MB, 1); private_max_mb = [math]::Round($privMax / 1MB, 1); private_end_mb = [math]::Round($privEnd / 1MB, 1)
+              ring = $ring; sw = $sws }
+          }
+          $rows = @()
+          foreach ($i in 1..2) { $rows += Perf $old "v1.0-run$i"; $rows += Perf $new "new-run$i" }
+          $rows | Format-Table build, replay_ok, exit, cpu_s, wall_s, cpu_pct_1core, cpu_peak_pct, peak_ws_mb, private_max_mb, private_end_mb -AutoSize | Out-String -Width 220 | Tee-Object "$o\perf.txt"
+          $rows | ConvertTo-Json | Set-Content "$o\perf.json"
+          $md = "### Replay buffer cost (60 fps, 30 s buffer, 20 s run, replay-only, software encoder)`n`n| build | replay ok | CPU s | CPU % of 1 core | peak CPU % | peak working set MB | max private MB |`n|---|---|---|---|---|---|---|`n"
+          foreach ($r in $rows) { $md += "| $($r.build) | $($r.replay_ok) | $($r.cpu_s) | $($r.cpu_pct_1core) | $($r.cpu_peak_pct) | $($r.peak_ws_mb) | $($r.private_max_mb) |`n" }
+          foreach ($r in $rows) { if ($r.ring) { $md += "`n$($r.build): $($r.ring)" }; if ($r.sw) { $md += "`n$($r.build): $($r.sw)" } }
+          $md | Add-Content $env:GITHUB_STEP_SUMMARY
+          $md
+          foreach ($r in $rows | Where-Object { $_.build -like 'new*' }) { if (-not $r.replay_ok) { throw "$($r.build): replay save failed" } }
+      - name: Dropdown and source label renders, v1.0 vs this build
+        shell: pwsh
+        run: |
+          $new = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $old = (Resolve-Path old\CastRecorder.exe).Path
+          $o = "$PWD\perf\renders"; New-Item -ItemType Directory $o -Force | Out-Null
+          foreach ($b in @(@('before', $old), @('after', $new))) {
+            foreach ($st in 'source','dropdown','replaytoast') {
+              foreach ($d in 96,144,192) {
+                $f = "$o\$($b[0])-$st-$d.png"
+                $p = Start-Process $b[1] -ArgumentList "--render-ui `"$f`" --ui-state $st --ui-size 1100x700 --dpi $d --ui-long --log `"$o\log.txt`"" -Wait -PassThru
+                "$($b[0]) $st $d -> exit $($p.ExitCode) $(Test-Path $f)"
+              }
+            }
+          }
+          if (-not (Get-ChildItem $o -Filter after-*.png)) { throw "no renders" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: replay-perf-and-renders
+          path: perf/
