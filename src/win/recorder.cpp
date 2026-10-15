@@ -1230,6 +1230,9 @@ void Recorder::run() {
         std::vector<HwEncoderInfo> hwCands;
         bool hwSys = false;          // hardware MFT fed CPU NV12 (kCfgSysMem): same buffer path as the software MFT
         bool needRetype = false;     // replay ring takes the new encoder's type (keeping its packets) on its next packet
+        LONGLONG lastMuxT = -1;      // sample time of the last encoded frame that reached the file / ring
+        long long next = 0;          // frame index (paced loop)
+        long long refillTo = -1;     // after a switch: re-encode [next, refillTo) (lost in the stalled encoder) first
         auto swBuffer = [&](DWORD bytes) -> ComPtr<IMFMediaBuffer> {
             for (auto& b : swPool) {
                 if (b == swLast) continue;
@@ -1248,6 +1251,7 @@ void Recorder::run() {
         HRESULT muxHr = S_OK;
         auto resetWriter = [&] { bool wa = wr.wantAudio, fr = wr.fragmented; int tr = wr.tracks; UINT32 ch = wr.achannels; wr = Writer{}; wr.wantAudio = wa; wr.tracks = tr; wr.achannels = ch; wr.fragmented = fr; };
         auto muxOut = [&](IMFSample* es) -> HRESULT {
+            { LONGLONG st = 0; if (SUCCEEDED(es->GetSampleTime(&st)) && st > lastMuxT) lastMuxT = st; }
             if (replay) {
                 if (!ringAttached) { ComPtr<IMFMediaType> ot = hw->muxType(); replay->attach(ot.Get(), opt_.fps, (int)wr.achannels, wr.tracks, wr.wantAudio); ringAttached = true; needRetype = false; }
                 else if (needRetype) { ComPtr<IMFMediaType> ot = hw->muxType(); replay->retype(ot.Get()); needRetype = false; }
@@ -1474,6 +1478,14 @@ void Recorder::run() {
             lastOutTick = 0; lastOutCount = 0;
             latestDirty = true; swLast.Reset();
             ++switches; r.encoderSwitches = switches;
+            // Frames the stalled encoder swallowed are gone: re-encode that interval with the current picture so the
+            // video timeline has no hole (a fragmented MP4 would collapse it and the audio would drift 2 s ahead).
+            {
+                const LONGLONG d1 = 10000000LL / opt_.fps;
+                long long resume = lastMuxT >= 0 ? (long long)((lastMuxT + d1 / 2) / d1) + 1 : 0;
+                if (resume < next - (long long)opt_.fps * 10) resume = next - (long long)opt_.fps * 10;
+                if (resume < next) { elog += L"encoder switch: re-encoding " + std::to_wstring(next - resume) + L" lost frame(s) with the current picture\n"; refillTo = next; next = resume; }
+            }
             r.encoderUsed = used + L", switched from " + oldLabel + L" (stalled)";
             elog += L"encoder switch: now " + used + L"\n";
             if (opt_.notify) {
@@ -1501,7 +1513,6 @@ void Recorder::run() {
         LARGE_INTEGER freq, t0{};
         QueryPerformanceFrequency(&freq);
         const LONGLONG dur = 10000000LL / opt_.fps;  // 100 ns units
-        long long next = 0;  // frame index
         bool haveFrame = false;
         for (int warm = 0; warm < 60 && !stop_ && !haveFrame; ++warm) {
             bool got = false;
@@ -1587,7 +1598,10 @@ void Recorder::run() {
                 latestDirty = true;
                 next = backlog[bi].idx; ++bi;
                 if (bi == backlog.size()) { slots.clear(); }
+            } else if (refillTo >= 0 && next < refillTo) {
+                // catch-up after a live encoder switch: no pacing, the same picture (one readback, then reused)
             } else {
+            refillTo = -1;
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             long long due = (now.QuadPart - t0.QuadPart) * opt_.fps / freq.QuadPart;
