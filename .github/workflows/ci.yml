@@ -70,6 +70,9 @@ jobs:
           $p = Start-Process $exe -ArgumentList "--help --log `"$env:RUNNER_TEMP\help.txt`"" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "--help exit $($p.ExitCode)" }
           if (-not (Select-String -Path "$env:RUNNER_TEMP\help.txt" -Pattern 'Usage:' -Quiet)) { throw "--help printed no usage" }
+          if (Select-String -Path "$env:RUNNER_TEMP\help.txt" -Pattern 'screenshot FILE|--screenshot' -Quiet) { throw "--help still lists --screenshot (removed in v1.1)" }
+          $p = Start-Process $exe -ArgumentList "--screenshot `"$env:RUNNER_TEMP\x.png`"" -Wait -PassThru
+          if ($p.ExitCode -ne 2) { throw "--screenshot should be rejected as an unknown option (exit 2), got $($p.ExitCode)" }
           $cases = @('--record 0', '--record -3', '--record abc', '--record 100000', '--record 2 --fps 25',
                      '--record 2 --container avi', '--record 2 --encoder foo', '--record 2 --quality max',
                      '--record 2 --bogus', '--record', '--fps 30', '--record 2 --out "Q:\nope\x.mp4"')
@@ -249,9 +252,8 @@ jobs:
           if ($j.accent -ne 'blue') { throw "accent not persisted: $($j.accent)" }
           if ($j.separateTracks -ne $true) { throw "separateTracks not persisted" }
           if ($j.fileNamePattern -ne 'date_time') { throw "fileNamePattern not persisted" }
-          if ($j.screenshotFormat -ne 'jpg') { throw "screenshotFormat not persisted" }
+          if ($j.PSObject.Properties.Name -match 'creenshot') { throw "screenshot keys still written (removed in v1.1)" }
           if ($j.hotkeySaveReplay -ne 'Ctrl+Alt+F7') { throw "save-replay hotkey not persisted: $($j.hotkeySaveReplay)" }
-          if ($j.hotkeyScreenshot -ne 'Ctrl+Alt+F6') { throw "screenshot hotkey not persisted: $($j.hotkeyScreenshot)" }
           if ($j.systemAudio -ne $false) { throw "systemAudio not persisted" }
           if ($j.micEnabled -ne $true) { throw "micEnabled not persisted" }
           if ($j.hotkeyMicMute -ne 'Ctrl+Alt+F12') { throw "mic hotkey not persisted: $($j.hotkeyMicMute)" }
@@ -376,7 +378,7 @@ jobs:
         with:
           name: ui-v2-screenshots
           path: rec/v2/ui-v2-*.png
-      - name: v1.0 features (replay, remux, screenshots, separate tracks, toasts excluded from capture, HEVC, hotkeys)
+      - name: v1.0 features (replay, remux, separate tracks, toasts excluded from capture, HEVC, hotkeys)
         if: matrix.fps == 30
         shell: pwsh
         run: |
@@ -521,16 +523,6 @@ jobs:
           $rc = Run "--record 2 --container mkv --auto-remux on --encoder software --allow-synthetic --test-tone --out `"$v\am.mkv`"" "$v\am.txt"
           if (-not (Test-Path "$v\am.mp4") -or (Test-Path "$v\am.mkv")) { throw "auto-remux did not leave just am.mp4" }
           Clean "$v\am.mp4"
-          # --- screenshots
-          foreach ($f in 'png','jpg') {
-            $rc = Run "--screenshot `"$v\shot.$f`"" "$v\shot-$f.txt"
-            if ($rc -ne 0) { throw "screenshot $f failed" }
-            $si = ffprobe -v error -show_entries stream=codec_name,width,height -of default=nw=1 "$v\shot.$f"; $si
-            $want = if ($f -eq 'png') { 'png' } else { 'mjpeg' }
-            if (-not ($si -match "codec_name=$want")) { throw "shot.$f is not $want" }
-            $m = (Select-String -Path "$v\shot-$f.txt" -Pattern 'screenshot=(\d+)x(\d+)').Matches[0].Groups
-            if (-not ($si -match "width=$($m[1].Value)")) { throw "screenshot size mismatch" }
-          }
           # --- separate audio tracks: 1 mix, 2 system, 3 mic (MP4 and MKV)
           foreach ($c in 'mp4','mkv') {
             $o = "$v\tracks.$c"
@@ -581,8 +573,9 @@ jobs:
           # --- every hotkey through the real global-hotkey path (SendInput -> RegisterHotKey), with non-default combos
           $sf = "$env:RUNNER_TEMP\hotkeys.json"
           New-Item -ItemType Directory "$v\hk" -Force | Out-Null
+          # v1.0 keys (hotkeyScreenshot / screenshotFormat) are included on purpose: v1.1 must load and ignore them
           @{version=3; fps=30; encoder="software"; outputDir="$v\hk"; systemAudio=$false; micEnabled=$false; replayEnabled=$true; replaySeconds=10;
-            hotkeyToggleRecord="Ctrl+Alt+F9"; hotkeyPause="Ctrl+Alt+F10"; hotkeyMicMute="Ctrl+Alt+F11"; hotkeySaveReplay="Ctrl+Alt+F7"; hotkeyScreenshot="Ctrl+Alt+F6"} | ConvertTo-Json | Set-Content $sf
+            hotkeyToggleRecord="Ctrl+Alt+F9"; hotkeyPause="Ctrl+Alt+F10"; hotkeyMicMute="Ctrl+Alt+F11"; hotkeySaveReplay="Ctrl+Alt+F7"; hotkeyScreenshot="Ctrl+Alt+F6"; screenshotFormat="jpg"} | ConvertTo-Json | Set-Content $sf
           $p = Start-Process $exe -ArgumentList "--selftest-hotkeys --settings-file `"$sf`"" -PassThru
           if (-not $p.WaitForExit(150000)) { $p.Kill(); throw "hotkey selftest hung" }
           $applog = "$env:APPDATA\Cast Recorder\CastRecorder.log"
@@ -592,15 +585,16 @@ jobs:
           if ($res.Matches[0].Groups[1].Value -ne $res.Matches[0].Groups[2].Value) { throw "hotkeys: $($res.Matches[0].Value)" }
           Get-ChildItem "$v\hk" | Format-Table Name, Length
           if (-not (Get-ChildItem "$v\hk" -Filter 'replay_*.mp4')) { throw "save-replay hotkey wrote no replay" }
-          if (-not (Get-ChildItem "$v\hk" -Filter 'screenshot_*.png')) { throw "screenshot hotkey wrote no PNG" }
+          if (Get-ChildItem "$v\hk" -Filter 'screenshot_*') { throw "a screenshot was written (feature removed in v1.1)" }
+          if ($res.Matches[0].Groups[2].Value -ne '7') { throw "expected 7 hotkey steps, got $($res.Matches[0].Groups[2].Value)" }
           $recf = Get-ChildItem "$v\hk" -Filter 'cast_*.mp4' | Select-Object -First 1
           if (-not $recf) { throw "start/stop hotkey wrote no recording (auto-remuxed MP4)" }
           Clean $recf.FullName
           Start-Process $exe -ArgumentList "--print-settings --settings-file `"$sf`" --log `"$v\hk-settings.json`"" -Wait
           $j = Get-Content "$v\hk-settings.json" -Raw | ConvertFrom-Json
-          if ($j.hotkeySaveReplay -ne 'Ctrl+Alt+F7' -or $j.hotkeyScreenshot -ne 'Ctrl+Alt+F6' -or $j.hotkeyToggleRecord -ne 'Ctrl+Alt+F9' -or $j.hotkeyPause -ne 'Ctrl+Alt+F10' -or $j.hotkeyMicMute -ne 'Ctrl+Alt+F11') { throw "hotkeys not persisted" }
+          if ($j.hotkeySaveReplay -ne 'Ctrl+Alt+F7' -or ($j.PSObject.Properties.Name -match 'creenshot') -or $j.hotkeyToggleRecord -ne 'Ctrl+Alt+F9' -or $j.hotkeyPause -ne 'Ctrl+Alt+F10' -or $j.hotkeyMicMute -ne 'Ctrl+Alt+F11') { throw "hotkeys not persisted" }
           # --- UI v1.0 renders (2x, like the mockups)
-          foreach ($st in 'idle','recording','settings','recordings','replaytoast','savedtoast','source','micpop','ctxmenu','replaycap') {
+          foreach ($st in 'idle','recording','settings','recordings','replaytoast','savedtoast','source','micpop','ctxmenu','replaycap','tooltip') {
             Start-Process $exe -ArgumentList "--render-ui `"$v\ui-v1-$st.png`" --ui-state $st --dpi 192 --log `"$v\ui-$st.txt`"" -Wait
             if (-not (Test-Path "$v\ui-v1-$st.png")) { throw "ui-v1-$st.png missing" }
           }
@@ -676,3 +670,39 @@ jobs:
         with:
           name: smoke-recordings-${{ matrix.fps }}fps
           path: rec/
+
+  ui-audit:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cast-recorder-windows
+          path: art
+      - name: Render every view at default / minimum / maximized sizes, 100-200 % DPI, both themes, long values
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem art -Recurse -Filter CastRecorder.exe | Select-Object -First 1).FullName
+          $o = "$PWD\audit"; New-Item -ItemType Directory $o -Force | Out-Null
+          $states = 'idle','recording','settings','recordings','micpop','source','dropdown','ctxmenu','savedtoast','replaytoast','replaycap','tooltip'
+          $jobs = @()
+          foreach ($st in $states) {
+            $jobs += ,@($st, '1100x700', 96, 'dark', $false)
+            foreach ($sz in '1100x700','960x620','1920x1040') { $jobs += ,@($st, $sz, 96, 'dark', $true) }
+            foreach ($d in 120,144,192) { $jobs += ,@($st, '960x620', $d, 'dark', $true) }
+            $jobs += ,@($st, '960x620', 96, 'light', $true)
+          }
+          $fail = 0
+          foreach ($j in $jobs) {
+            $name = "ui-$($j[0])-$($j[1])-$($j[2])-$($j[3])$(if ($j[4]) { '-long' } else { '' }).png"
+            $a2 = "--render-ui `"$o\$name`" --ui-state $($j[0]) --ui-size $($j[1]) --dpi $($j[2]) --ui-theme $($j[3]) --log `"$o\log.txt`""
+            if ($j[4]) { $a2 += " --ui-long" }
+            $p = Start-Process $exe -ArgumentList $a2 -Wait -PassThru
+            if ($p.ExitCode -ne 0 -or -not (Test-Path "$o\$name")) { "FAILED: $name"; $fail++ }
+          }
+          "rendered $((Get-ChildItem $o -Filter *.png).Count) of $($jobs.Count)"
+          if ($fail) { throw "$fail renders failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-audit
+          path: audit/*.png
