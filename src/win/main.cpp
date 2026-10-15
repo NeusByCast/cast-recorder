@@ -4463,6 +4463,8 @@ int runCli(int argc, wchar_t** argv) {
         HWND owned = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Owned", WS_POPUP | WS_CAPTION | WS_VISIBLE, 400, 200, 400, 300, mainW, nullptr, g.inst, nullptr);
         HWND minW = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Minimized", WS_OVERLAPPEDWINDOW, 120, 120, 641, 481, nullptr, nullptr, g.inst, nullptr);
         ShowWindow(minW, SW_SHOWMINNOACTIVE);
+        // a real but tiny captioned window (Windows clamps it to its minimum track size, ~146x39)
+        HWND tinyW = CreateWindowExW(0, wc.lpszClassName, L"CR Picker Tiny", WS_CAPTION | WS_SYSMENU | WS_VISIBLE, 500, 500, 146, 21, nullptr, nullptr, g.inst, nullptr);
         pump(800);
         includeOwnWindowsForTest(true);
         auto ws = listCaptureWindows();
@@ -4484,7 +4486,7 @@ int runCli(int argc, wchar_t** argv) {
         if (r != mainW) ok = false;
         includeOwnWindowsForTest(false);
         // capture: the 146x21 popup and a window minimized at start must give an even, >= 128 px encode
-        for (auto& c : {std::make_pair("tiny", popup), std::make_pair("minimized", minW)}) {
+        for (auto& c : {std::make_pair("tiny", tinyW), std::make_pair("minimized", minW)}) {
             Recorder rec; RecordOptions ro = o;
             ro.window = c.second; ro.monitor = nullptr; ro.allDisplays = false;
             ro.encoder = Encoder::Software; ro.container = Container::MP4; ro.systemAudio = false; ro.mic = false; ro.testTone = false;
@@ -4503,7 +4505,7 @@ int runCli(int argc, wchar_t** argv) {
             if (!rr.ok) ok = false;
         }
         out += std::string("picker_ok=") + (ok ? "1" : "0") + "\n";
-        DestroyWindow(owned); DestroyWindow(hover); DestroyWindow(popup); DestroyWindow(minW); DestroyWindow(mainW);
+        DestroyWindow(tinyW); DestroyWindow(owned); DestroyWindow(hover); DestroyWindow(popup); DestroyWindow(minW); DestroyWindow(mainW);
         emit(out, stdout);
         return ok ? 0 : 1;
     }

@@ -29,6 +29,7 @@ struct WgcCapture::Impl {
     HWND hwnd = nullptr;
     std::atomic<bool> isClosed{false};
     bool wasIconic = false;
+    bool anyFrame = false;  // window mode: something (a real frame, or black while minimized at start) was delivered
     int lastCw = 0, lastCh = 0;
     double intervalMs = 0;
     // window mode: content size != output size -> copy to `scaleIn`, GPU-scale (letterbox) into the output
@@ -245,8 +246,16 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
             bool ic = IsIconic(p_->hwnd) != 0;
             if (ic != p_->wasIconic) { p_->wasIconic = ic; p_->event(ic ? L"minimized (holding last frame)" : L"restored"); }
         }
-        if (!frame) return true;
-        if (p_->hwnd && p_->wasIconic) { frame.Close(); return true; }  // minimized: only the caption is rendered; hold the last frame
+        if (p_->hwnd && p_->wasIconic) {
+            if (frame) frame.Close();
+            if (!p_->anyFrame) {  // minimized at start: begin on black at the restored size; content follows on restore
+                if (!p_->rtv || p_->rtvFor != dst) { p_->rtv = nullptr; p_->dev->CreateRenderTargetView(dst, nullptr, p_->rtv.put()); p_->rtvFor = dst; }
+                const float black[4] = {0, 0, 0, 1};
+                if (p_->rtv) { ctx->ClearRenderTargetView(p_->rtv.get(), black); p_->anyFrame = true; gotNew = true; }
+            }
+            return true;  // minimized: only the caption is rendered; hold the last frame
+        }
+        if (!frame) return true;  // minimized: only the caption is rendered; hold the last frame
         auto cs = frame.ContentSize();
         bool contentChanged = false;
         if (p_->hwnd && (cs.Width != p_->lastCw || cs.Height != p_->lastCh)) {
@@ -281,6 +290,7 @@ bool WgcCapture::copyLatest(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, UINT
         }
         frame.Close();
         gotNew = true;
+        p_->anyFrame = true;
         return true;
     } catch (...) {
         return false;
