@@ -617,7 +617,13 @@ jobs:
           Get-Content "$d\picker.txt"
           if ($p.ExitCode -ne 0) { throw "window picker test failed (exit $($p.ExitCode))" }
           foreach ($n in 'popup','hover','owned') { if (-not (Select-String -Path "$d\picker.txt" -Pattern "^picker $n listed=0" -Quiet)) { throw "$n is selectable" } }
-          if (-not (Select-String -Path "$d\picker.txt" -Pattern '^label=Cast Recorder . CR Picker Main$' -Quiet)) { throw "main window label is not 'app · page' with the ' - Brave' suffix stripped" }
+          # main + duplicate share a title: both stay listed; the later one in z-order is numbered "(2)"
+          $lm = (Select-String -Path "$d\picker.txt" -Pattern '^label=(.*)$').Matches[0].Groups[1].Value
+          $ld = (Select-String -Path "$d\picker.txt" -Pattern '^label_duplicate=(.*)$').Matches[0].Groups[1].Value
+          "main label: $lm | duplicate label: $ld"
+          $plain = @($lm, $ld) | Where-Object { $_ -match '^Cast Recorder . CR Picker Main$' }
+          $num = @($lm, $ld) | Where-Object { $_ -match '^Cast Recorder . CR Picker Main \(2\)$' }
+          if (@($plain).Count -ne 1 -or @($num).Count -ne 1) { throw "main window label is not 'app · page' with the ' - Brave' suffix stripped, or same-title windows are not kept apart as '(2)'" }
           if (-not (Select-String -Path "$d\picker.txt" -Pattern '^resolve_saved=main' -Quiet)) { throw "a saved popup title did not resolve to the real window" }
           foreach ($n in 'tiny','minimized') {
             $f = "$d\picker-$n.mp4"
