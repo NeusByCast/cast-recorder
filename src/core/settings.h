@@ -54,8 +54,6 @@ struct Settings {
     bool replayEnabled = false;
     int replaySeconds = 30;            // 5..600 typed; 10/15 min presets only when memory allows (<= 900)
     Hotkey saveReplay{MOD_CTRL_ | MOD_SHIFT_, 0x77};  // Ctrl+Shift+F8
-    Hotkey screenshot{MOD_CTRL_ | MOD_SHIFT_, 0x7B};  // Ctrl+Shift+F12
-    std::string screenshotFormat = "png";  // png | jpg
     bool separateTracks = false;       // 1 mix, 2 system, 3 mic
     std::string theme = "auto";        // auto (follow system) | dark | light
     std::string accent = "red";        // red orange green blue purple pink

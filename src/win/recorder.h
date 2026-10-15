@@ -197,9 +197,9 @@ std::wstring findFfmpeg();
 // pass-through sink writer). engine: L"" auto, L"ffmpeg", L"mf". trackNames: title metadata for the audio tracks.
 bool remuxFile(const std::wstring& in, const std::wstring& out, std::wstring& err, const std::wstring& engine = L"",
                DWORD timeoutMs = 0, const std::vector<std::wstring>& trackNames = {});
-// Screenshot of a capture target (GDI; windows via PrintWindow PW_RENDERFULLCONTENT). jpg: quality 92.
-// Windows excluded from capture (WDA_EXCLUDEFROMCAPTURE, our toasts) never appear.
-bool saveScreenshot(HWND window, HMONITOR monitor, bool allDisplays, const std::wstring& path, bool jpg, std::wstring& err, int* outW = nullptr, int* outH = nullptr);
+// Test-only (CLI --test-toast): GDI grab of the desktop to a PNG. Windows excluded from capture
+// (WDA_EXCLUDEFROMCAPTURE, our toasts) never appear.
+bool captureForTest(HWND window, HMONITOR monitor, bool allDisplays, const std::wstring& path, bool jpg, std::wstring& err, int* outW = nullptr, int* outH = nullptr);
 // Test hook: delay before IMFSinkWriter::Finalize (simulates a stuck Finalize). 0 = off.
 void setTestHangFinalizeMs(DWORD ms);
 // Abandoned Finalize helper threads still running.

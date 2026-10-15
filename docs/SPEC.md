@@ -21,12 +21,12 @@ Mockups (2200×1400, 2x): `mockup-main.png` (idle), `mockup-recording.png`, `moc
 - **x20, status:** Idle shows a green dot and "Ready". Recording shows a pulsing accent dot, the timer `00:01:24` (Semibold) and the file size `48 MB` (muted, updated every second).
 - **x170, replay pill** (138×30): `replay` icon, "Replay · 30s", and a green dot that pulses while the buffer is live (`replayPillDot`). The pill only shows when the replay buffer is on; clicking it saves a replay.
 - **x420 / x570, audio chips** (136×40): Mic and System, each with an icon and meter. Clicking the icon mutes; clicking the chip body opens the v2 mic popover.
-- **x850, Screenshot** (44, `screenshot`) and **x904, Pause** (44, disabled when idle).
+- **x904, Pause** (44, disabled when idle). (v1.1 removed the Screenshot button and its hotkey.)
 - **x958, Record** (122×44, accent fill, white dot). While recording it becomes **Stop**: `surface2` fill, 2 px accent outline, accent `stop` glyph, soft glow halo.
 
 ## Toasts
 Each toast is its **own top-level layered window** (`WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED`). Call **`SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)`** on it (Win10 2004+) so it never shows up in a recording or replay. Position: in-app toasts sit 16 px inside the top-right of the preview; on-screen toasts (`WS_EX_TRANSPARENT`, click-through) go to the top-right of the **primary** monitor's work area. Toasts stack downward with a 8 px gap. Hover pauses auto-dismiss (in-app only). If capture exclusion fails while a capture is live, the on-screen toast is skipped.
-On-screen status toasts — "Last N seconds saved", "Recording started", "Recording stopped", "Screenshot saved" — hold **1 s**, then glide out (260 ms, +28 px x, fade).
+On-screen status toasts — "Last N seconds saved", "Recording started", "Recording stopped" — hold **1 s**, then glide out (260 ms, +28 px x, fade).
 
 | Toast | Size | Content | Auto-dismiss |
 |---|---|---|---|
@@ -43,7 +43,7 @@ Recordings are written once, straight to a **fragmented MP4** (crash-safe: a cra
 
 ## Recordings tab
 - Toolbar (y56): search field (w320, `search` icon), then on the right **Auto-remux** label + toggle (the same setting as in Settings), and a **Remux all** button (w132, `remux` icon) that converts every MKV.
-- List card 20,104 · 1060×496, r12. Column headers (11 Semibold, muted) at y130: NAME x40, DURATION x560, SIZE x660, DATE x760, FORMAT x900.
+- List card 20,104 · 1060×496, r12. Column headers (11 Semibold, muted) at y130, laid out from the right edge R = W − 20 so the actions never overlap the badge: actions [R − 150, R], FORMAT R − 200, DATE − 150, SIZE − 90, DURATION − 90 (at 1100 px: NAME x40, DURATION x560, SIZE x650, DATE x740, FORMAT x880). The name takes the remaining width and uses a middle ellipsis.
 - Rows h56, 62 px apart. Each row has:
   - a 64×36 thumbnail (r6; first frame, generated on save; replays get a `replay` overlay),
   - the name (13/500) and a detail line (12, muted),
@@ -53,15 +53,18 @@ Recordings are written once, straight to a **fragmented MP4** (crash-safe: a cra
 - Remux uses a stream copy (no re-encode), so it is fast. Row hover: `hover` bg, r10, 90 ms. Double-click opens the file. Right-click menu: Open, Show in folder, Remux, Rename, Delete (to Recycle Bin, with confirmation).
 - The list comes from scanning the output folder (`.mp4`, `.mkv`), sorted newest first. A `ReadDirectoryChangesW` watcher refreshes it.
 
-## Settings view (3 columns, each 340 wide, 20 px gaps)
+## Settings view (3 columns, 20 px gaps)
+Column width = clamp((W − 80) / 3, 280, 340): 340 at the default 1100 px, 280 at the 960 px minimum; wider windows centre the three columns. Rows are laid out relative to the column (label at +18, control at +118 with width cw − 136, toggles right-aligned), so nothing runs past the card edge at any width or DPI.
+
+**Long values:** every single-line text that can be user- or system-supplied (device and GPU names, window titles, hotkeys, paths, file names, status) is fitted with an ellipsis instead of being clipped; paths and file names use a middle ellipsis so the end (folder / date / size) stays visible. Hovering any truncated text in the main window shows the full string in a tooltip.
 | Card | Rect | Controls |
 |---|---|---|
 | Video | 20,60 · 340×268 | **Encoder**: lists only what the selected GPU supports (see below). **GPU**. **Resolution** (Native/1440p/1080p/720p). **Container** (MKV default, MP4). **Auto-remux to MP4** toggle |
 | Instant replay | 20,340 · 340×122 | Replay buffer toggle, Length dropdown (with Custom) |
 | Appearance | 20,474 · 340×126 | **Theme** segmented control (Dark `moon` / Light `sun`; follows the system on first run). **Accent**: 6 swatches (r8, 32 px apart); the selected one gets a 2 px ring at r12 |
 | Audio | 380,60 · 340×540 | System audio (toggle + device + meter) · divider · Microphone (toggle + device + meter) · Volume slider · Noise suppression · Noise gate slider · Monitoring · Push-to-talk (key field + toggle) · Channels Mono/Stereo · divider · **Separate audio tracks** toggle, with the caption "Track 1 mix · 2 system · 3 mic" |
-| Hotkeys | 740,60 · 340×284 | Press-to-set fields (w190) for **Start/Stop** (Ctrl+Shift+F9), **Pause** (F10), **Mic mute** (F11), **Save replay** (Ctrl+Shift+F8), **Screenshot** (F12). Fields are 46 px apart, and a field that is capturing gets an accent border and shows "Press a key…". A conflict shows a red border and the tooltip "Already used by …" |
-| Output | 740,356 · 340×244 | Folder path + Browse / Log, **File name** pattern (`cast_date_time`, …), **Screenshots** format (PNG/JPG) |
+| Hotkeys | 740,60 · 340×260 | Press-to-set fields (x+132, w cw − 150) for **Start/Stop** (Ctrl+Shift+F9), **Pause** (F10), **Mic mute** (F11), **Save replay** (Ctrl+Shift+F8). Fields are 50 px apart; a combo too wide for the field drops the spaces around "+" and then ellipsizes, and a field that is capturing gets an accent border and shows "Press a key…". A conflict shows a red border and the tooltip "Already used by …" |
+| Output | 740,332 · 340×268 | Folder path (middle ellipsis) + Browse / Log, **File name** pattern (`cast_date_time`, …) |
 
 **Encoder filtering:** at startup and whenever the GPU changes, probe each codec × vendor pair: NVENC (`NvEncGetEncodeGUIDs`), AMF and QSV (Media Foundation `MFTEnumEx` hardware encoders for H.264/HEVC/AV1), plus x264 in software. Only codecs that are present are listed: **H.264**, **HEVC**, **AV1**, each written as `codec · vendor`. Unsupported ones are left out. The default is **Auto**, which picks the best supported codec in the order AV1 > HEVC > H.264 for MKV, or H.264 for maximum compatibility in MP4.
 - AV1 can't go into MP4 with every player, so warn when the user picks it: a muted caption under Container saying "AV1 plays best in MKV".
@@ -88,8 +91,8 @@ Recordings are written once, straight to a **fragmented MP4** (crash-safe: a cra
 
 Implementation: Direct2D + DirectComposition (`IDCompositionAnimation` for opacity, scale and translate), or a 16 ms timer and redraw with a float `t` per element. Scaling a press only needs a D2D transform; no HWND resize happens. Respect `SPI_GETCLIENTAREAANIMATION`: when it's off, every change is instant.
 
-## Icons (`icons/`, 27 glyphs)
-Same rules as v2: 24 grid, 1.75 stroke, round caps and joins, white SVG plus 16/20/24/32 PNGs. **New in v1.1:** `replay`, `remux`, `screenshot`, `check-circle`, `sun`, `moon`, plus `play` and `search`. `_sheet.png` is a preview sheet.
+## Icons (`res/icons/`, 26 glyphs)
+24 grid, round caps and joins, white SVG. `scripts/gen_icons.py` pre-renders every glyph at each device size the UI draws (16/20/24 px × 100–250 % DPI: 16, 20, 24, 25, 28, 30, 32, 35, 40, 48, 50, 60) as PNGs that are converted to premultiplied-alpha (PARGB) bitmaps on load, with the stroke tuned per device size (max(1.5, 0.075·px) rounded to ¼ px) so weight looks the same at every scale. At draw time the exact-size bitmap is placed on whole device pixels (no resampling); any other size uses the next larger bitmap with high-quality bicubic. v1.1 removed `screenshot`.
 
 ## States
 - Idle, Recording, Paused (amber status, Pause becomes resume).

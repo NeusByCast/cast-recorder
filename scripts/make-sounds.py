@@ -43,4 +43,3 @@ save(f"{out}/tick.wav", swoosh(0.16, 1400, 1100, -38, tone=0.5, shape=0.35))  # 
 # replay saved: two quick rising glides
 r = np.concatenate([swoosh(0.18, 700, 2000, -34), np.zeros(int(SR * 0.02)), swoosh(0.22, 900, 2600, -34)])
 save(f"{out}/replay.wav", r)
-save(f"{out}/shot.wav", swoosh(0.14, 3200, 1600, -36, tone=0.15, shape=0.2))  # screenshot: short airy swish

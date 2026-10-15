@@ -182,21 +182,29 @@ static void testSettingsV2() {
 static void testSettingsV11() {
     cr::Settings d;
     CHECK(d.container == cr::Container::MP4 && d.autoRemux && !d.replayEnabled && d.replaySeconds == 30 && !d.separateTracks);
-    CHECK(cr::format(d.saveReplay) == "Ctrl+Shift+F8" && cr::format(d.screenshot) == "Ctrl+Shift+F12");
-    CHECK(d.codec == cr::Codec::Auto && d.theme == "auto" && d.accent == "red" && d.screenshotFormat == "png");
+    CHECK(cr::format(d.saveReplay) == "Ctrl+Shift+F8");
+    CHECK(d.codec == cr::Codec::Auto && d.theme == "auto" && d.accent == "red");
     cr::Settings a; a.codec = cr::Codec::HEVC; a.autoRemux = false; a.replayEnabled = true; a.replaySeconds = 600;
-    a.saveReplay = cr::Hotkey{cr::MOD_CTRL_ | cr::MOD_ALT_, 0x52}; a.screenshot = cr::Hotkey{cr::MOD_CTRL_ | cr::MOD_ALT_, 0x53};
-    a.screenshotFormat = "jpg"; a.separateTracks = true; a.theme = "light"; a.accent = "purple"; a.fileNamePattern = "source_date_time";
+    a.saveReplay = cr::Hotkey{cr::MOD_CTRL_ | cr::MOD_ALT_, 0x52};
+    a.separateTracks = true; a.theme = "light"; a.accent = "purple"; a.fileNamePattern = "source_date_time";
     a.scale = cr::OutputScale::P1440;
     cr::Settings b; CHECK(cr::fromJson(cr::toJson(a), b));
     CHECK(b.codec == cr::Codec::HEVC && !b.autoRemux && b.replayEnabled && b.replaySeconds == 600);
-    CHECK(b.saveReplay == a.saveReplay && b.screenshot == a.screenshot && b.screenshotFormat == "jpg" && b.separateTracks);
+    CHECK(b.saveReplay == a.saveReplay && b.separateTracks);
     CHECK(b.theme == "light" && b.accent == "purple" && b.fileNamePattern == "source_date_time" && b.scale == cr::OutputScale::P1440);
     cr::Settings c;
     CHECK(cr::fromJson("{\"replaySeconds\": 2, \"accent\": \"teal\", \"theme\": \"x\", \"codec\": \"vp9\", \"screenshotFormat\": \"gif\","
                        " \"hotkeyToggleRecord\": \"Ctrl+Shift+F9\", \"hotkeySaveReplay\": \"Ctrl+Shift+F9\", \"fileNamePattern\": \"../x\"}", c));
-    CHECK(c.replaySeconds == 30 && c.accent == "red" && c.theme == "auto" && c.codec == cr::Codec::Auto && c.screenshotFormat == "png");
+    CHECK(c.replaySeconds == 30 && c.accent == "red" && c.theme == "auto" && c.codec == cr::Codec::Auto);
     CHECK(c.saveReplay.empty() && c.fileNamePattern == "cast_date_time");  // duplicate of Start/Stop is cleared
+    {   // v1.0 settings with the removed screenshot keys: still load, other values kept, keys dropped on save
+        cr::Settings m;
+        CHECK(cr::fromJson("{\"version\": 3, \"fps\": 60, \"hotkeyScreenshot\": \"Ctrl+Shift+F12\", \"screenshotFormat\": \"jpg\","
+                           " \"hotkeySaveReplay\": \"Ctrl+Shift+F12\"}", m));
+        CHECK(m.fps == 60 && cr::format(m.saveReplay) == "Ctrl+Shift+F12");
+        std::string j = cr::toJson(m);
+        CHECK(j.find("creenshot") == std::string::npos);
+    }
     CHECK_EQ(cr::fileNameFor("cast_date_time", 2026, 10, 14, 9, 5, 7, "", 1), std::string("cast_2026-10-14_09-05-07"));
     CHECK_EQ(cr::fileNameFor("date_time", 2026, 10, 14, 9, 5, 7, "", 1), std::string("2026-10-14_09-05-07"));
     CHECK_EQ(cr::fileNameFor("source_date_time", 2026, 1, 2, 3, 4, 5, "Note:pad?.", 1), std::string("Notepad_2026-01-02_03-04-05"));

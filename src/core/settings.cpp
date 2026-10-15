@@ -313,8 +313,6 @@ std::string toJson(const Settings& s) {
       << "  \"replayEnabled\": " << (s.replayEnabled ? "true" : "false") << ",\n"
       << "  \"replaySeconds\": " << s.replaySeconds << ",\n"
       << "  \"hotkeySaveReplay\": \"" << esc(format(s.saveReplay)) << "\",\n"
-      << "  \"hotkeyScreenshot\": \"" << esc(format(s.screenshot)) << "\",\n"
-      << "  \"screenshotFormat\": \"" << esc(s.screenshotFormat) << "\",\n"
       << "  \"separateTracks\": " << (s.separateTracks ? "true" : "false") << ",\n"
       << "  \"theme\": \"" << esc(s.theme) << "\",\n"
       << "  \"accent\": \"" << esc(s.accent) << "\",\n"
@@ -389,18 +387,17 @@ bool fromJson(const std::string& json, Settings& out, std::string* err) {
         else if (parse(v, hk) && validate(hk).severity != Severity::Error) dst = hk;
     };
     hkOpt("hotkeySaveReplay", s.saveReplay);
-    hkOpt("hotkeyScreenshot", s.screenshot);
-    for (Hotkey* x : {&s.saveReplay, &s.screenshot})  // never two actions on one combo
-        if (!x->empty() && (*x == s.toggleRecord || *x == s.pauseToggle || *x == s.micMute || *x == s.openFolder)) *x = Hotkey{};
-    if (!s.screenshot.empty() && s.screenshot == s.saveReplay) s.screenshot = Hotkey{};
+    // v1.0 "hotkeyScreenshot" / "screenshotFormat" (screenshots were removed in v1.1) are ignored like any
+    // unknown key and dropped on the next save.
+    if (!s.saveReplay.empty() && (s.saveReplay == s.toggleRecord || s.saveReplay == s.pauseToggle || s.saveReplay == s.micMute || s.saveReplay == s.openFolder))
+        s.saveReplay = Hotkey{};  // never two actions on one combo
     // Push-to-talk can't share a combo with an action: fall back to the default, or clear it if that clashes too.
     auto pttClash = [&](const Hotkey& k) {
-        for (const Hotkey* x : {&s.toggleRecord, &s.pauseToggle, &s.micMute, &s.openFolder, &s.saveReplay, &s.screenshot})
+        for (const Hotkey* x : {&s.toggleRecord, &s.pauseToggle, &s.micMute, &s.openFolder, &s.saveReplay})
             if (!x->empty() && *x == k) return true;
         return false;
     };
     if (!s.pttKey.empty() && pttClash(s.pttKey)) s.pttKey = pttClash(Settings{}.pttKey) ? Hotkey{} : Settings{}.pttKey;
-    if (str("screenshotFormat", v) && (v == "png" || v == "jpg")) s.screenshotFormat = v;
     boo("separateTracks", s.separateTracks);
     if (str("theme", v) && (v == "auto" || v == "dark" || v == "light")) s.theme = v;
     if (str("accent", v) && validAccent(v)) s.accent = v;
