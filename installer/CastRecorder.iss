@@ -1,6 +1,6 @@
 ; Inno Setup 6. CI passes /DAppVersion from src/win/version.h; the fallback below must match it.
 #ifndef AppVersion
-  #define AppVersion "1.1"
+  #define AppVersion "1.0"
 #endif
 #ifndef BinDir
   #define BinDir "..\build\Release"

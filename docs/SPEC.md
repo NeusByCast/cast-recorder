@@ -21,7 +21,7 @@ Mockups (2200×1400, 2x): `mockup-main.png` (idle), `mockup-recording.png`, `moc
 - **x20, status:** Idle shows a green dot and "Ready". Recording shows a pulsing accent dot, the timer `00:01:24` (Semibold) and the file size `48 MB` (muted, updated every second).
 - **x170, replay pill** (138×30): `replay` icon, "Replay · 30s", and a green dot that pulses while the buffer is live (`replayPillDot`). The pill only shows when the replay buffer is on; clicking it saves a replay.
 - **x420 / x570, audio chips** (136×40): Mic and System, each with an icon and meter. Clicking the icon mutes; clicking the chip body opens the v2 mic popover.
-- **x904, Pause** (44, disabled when idle). (v1.1 removed the Screenshot button and its hotkey.)
+- **x904, Pause** (44, disabled when idle).
 - **x958, Record** (122×44, accent fill, white dot). While recording it becomes **Stop**: `surface2` fill, 2 px accent outline, accent `stop` glyph, soft glow halo.
 
 ## Toasts
@@ -92,7 +92,7 @@ Column width = clamp((W − 80) / 3, 280, 340): 340 at the default 1100 px, 280 
 Implementation: Direct2D + DirectComposition (`IDCompositionAnimation` for opacity, scale and translate), or a 16 ms timer and redraw with a float `t` per element. Scaling a press only needs a D2D transform; no HWND resize happens. Respect `SPI_GETCLIENTAREAANIMATION`: when it's off, every change is instant.
 
 ## Icons (`res/icons/`, 26 glyphs)
-24 grid, round caps and joins, white SVG. `scripts/gen_icons.py` pre-renders every glyph at each device size the UI draws (16/20/24 px × 100–250 % DPI: 16, 20, 24, 25, 28, 30, 32, 35, 40, 48, 50, 60) as PNGs that are converted to premultiplied-alpha (PARGB) bitmaps on load, with the stroke tuned per device size (max(1.5, 0.075·px) rounded to ¼ px) so weight looks the same at every scale. At draw time the exact-size bitmap is placed on whole device pixels (no resampling); any other size uses the next larger bitmap with high-quality bicubic. v1.1 removed `screenshot`.
+24 grid, round caps and joins, white SVG. `scripts/gen_icons.py` pre-renders every glyph at each device size the UI draws (16/20/24 px × 100–250 % DPI: 16, 20, 24, 25, 28, 30, 32, 35, 40, 48, 50, 60) as PNGs that are converted to premultiplied-alpha (PARGB) bitmaps on load, with the stroke tuned per device size (max(1.5, 0.075·px) rounded to ¼ px) so weight looks the same at every scale. At draw time the exact-size bitmap is placed on whole device pixels (no resampling); any other size uses the next larger bitmap with high-quality bicubic.
 
 ## States
 - Idle, Recording, Paused (amber status, Pause becomes resume).
